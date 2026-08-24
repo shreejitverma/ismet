@@ -12,7 +12,7 @@
 ## Installation
 
 ```bash
-pip install isme
+pip install ismet
 ```
 
 ## Quick Start

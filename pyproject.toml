@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "isme"
+name = "ismet"
 version = "0.1.0"
 description = "International Stock Market Engine: A unified Python package to connect to major stock exchanges."
 readme = "README.md"
