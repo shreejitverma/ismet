@@ -21,9 +21,10 @@ pip install isme
 import asyncio
 from isme import IsmeClient
 
+
 async def main():
     client = IsmeClient()
-    
+
     # Get quote from NYSE
     quote = await client.get_quote("AAPL", exchange="NYSE")
     print(f"{quote.symbol}: {quote.price}")
@@ -31,6 +32,7 @@ async def main():
     # Stream real-time data
     async for trade in client.stream_trades(["AAPL", "TSLA"]):
         print(f"New trade: {trade.symbol} @ {trade.price}")
+
 
 if __name__ == "__main__":
     asyncio.run(main())

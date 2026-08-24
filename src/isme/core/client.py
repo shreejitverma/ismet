@@ -1,8 +1,9 @@
-from typing import AsyncIterable, Dict, List, Optional, Type
+from collections.abc import AsyncIterable
 from datetime import datetime
 
 from isme.exchanges.base import BaseExchange
-from isme.models.market_data import Quote, Trade, HistoricalBar
+from isme.models.market_data import HistoricalBar, Quote, Trade
+
 
 class IsmeClient:
     """
@@ -11,7 +12,7 @@ class IsmeClient:
     """
 
     def __init__(self):
-        self._exchanges: Dict[str, BaseExchange] = {}
+        self._exchanges: dict[str, BaseExchange] = {}
 
     def register_exchange(self, exchange: BaseExchange):
         """Register an exchange implementation."""
@@ -21,7 +22,9 @@ class IsmeClient:
         """Get a registered exchange by name."""
         name = exchange_name.upper()
         if name not in self._exchanges:
-            raise ValueError(f"Exchange '{exchange_name}' is not registered or supported.")
+            raise ValueError(
+                f"Exchange '{exchange_name}' is not registered or supported."
+            )
         return self._exchanges[name]
 
     async def get_quote(self, symbol: str, exchange: str) -> Quote:
@@ -30,24 +33,28 @@ class IsmeClient:
         return await handler.get_quote(symbol)
 
     async def get_historical_data(
-        self, 
-        symbol: str, 
+        self,
+        symbol: str,
         exchange: str,
-        start: datetime, 
-        end: datetime, 
-        interval: str = "1d"
-    ) -> List[HistoricalBar]:
+        start: datetime,
+        end: datetime,
+        interval: str = "1d",
+    ) -> list[HistoricalBar]:
         """Fetch historical data from a specific exchange."""
         handler = self._get_exchange(exchange)
         return await handler.get_historical_data(symbol, start, end, interval)
 
-    async def stream_quotes(self, symbols: List[str], exchange: str) -> AsyncIterable[Quote]:
+    async def stream_quotes(
+        self, symbols: list[str], exchange: str
+    ) -> AsyncIterable[Quote]:
         """Stream real-time quotes from a specific exchange."""
         handler = self._get_exchange(exchange)
         async for quote in handler.stream_quotes(symbols):
             yield quote
 
-    async def stream_trades(self, symbols: List[str], exchange: str) -> AsyncIterable[Trade]:
+    async def stream_trades(
+        self, symbols: list[str], exchange: str
+    ) -> AsyncIterable[Trade]:
         """Stream real-time trades from a specific exchange."""
         handler = self._get_exchange(exchange)
         async for trade in handler.stream_trades(symbols):

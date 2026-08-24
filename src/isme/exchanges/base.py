@@ -1,8 +1,9 @@
 from abc import ABC, abstractmethod
-from typing import AsyncIterable, List, Optional
+from collections.abc import AsyncIterable
 from datetime import datetime
 
-from isme.models.market_data import Quote, Trade, HistoricalBar
+from isme.models.market_data import HistoricalBar, Quote, Trade
+
 
 class BaseExchange(ABC):
     """
@@ -17,22 +18,18 @@ class BaseExchange(ABC):
 
     @abstractmethod
     async def get_historical_data(
-        self, 
-        symbol: str, 
-        start: datetime, 
-        end: datetime, 
-        interval: str = "1d"
-    ) -> List[HistoricalBar]:
+        self, symbol: str, start: datetime, end: datetime, interval: str = "1d"
+    ) -> list[HistoricalBar]:
         """Fetch historical OHLCV data."""
         pass
 
     @abstractmethod
-    async def stream_quotes(self, symbols: List[str]) -> AsyncIterable[Quote]:
+    async def stream_quotes(self, symbols: list[str]) -> AsyncIterable[Quote]:
         """Stream real-time quotes via WebSockets."""
         pass
 
     @abstractmethod
-    async def stream_trades(self, symbols: List[str]) -> AsyncIterable[Trade]:
+    async def stream_trades(self, symbols: list[str]) -> AsyncIterable[Trade]:
         """Stream real-time trades via WebSockets."""
         pass
 

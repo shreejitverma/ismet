@@ -36,6 +36,15 @@ dependencies = [
 Homepage = "https://github.com/shreejitverma/isme"
 Issues = "https://github.com/shreejitverma/isme/issues"
 
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+  "pytest-asyncio>=0.23.0",
+  "ruff>=0.4.0",
+  "build>=1.0.0",
+  "twine>=5.0.0",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/isme"]
 
@@ -48,5 +57,6 @@ select = ["E", "F", "I", "N", "UP", "B", "C4", "SIM", "ARG", "PTH", "RET"]
 ignore = []
 
 [tool.pytest.ini_options]
+pythonpath = ["src"]
 testpaths = ["tests"]
 asyncio_mode = "auto"

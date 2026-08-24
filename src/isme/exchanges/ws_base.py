@@ -1,9 +1,12 @@
-import asyncio
 import json
-import websockets
 from abc import ABC, abstractmethod
-from typing import AsyncIterable, List, Optional, Dict, Any
+from collections.abc import AsyncIterable
+from typing import Any, Optional
+
+import websockets
+
 from isme.exchanges.base import BaseExchange
+
 
 class GenericWebSocketExchange(BaseExchange, ABC):
     """
@@ -26,12 +29,12 @@ class GenericWebSocketExchange(BaseExchange, ABC):
         """Hook for post-connection logic (e.g., authentication)."""
         pass
 
-    async def _send(self, message: Dict[str, Any]):
+    async def _send(self, message: dict[str, Any]):
         """Send a JSON message over the WebSocket."""
         conn = await self._get_connection()
         await conn.send(json.dumps(message))
 
-    async def _listen(self) -> AsyncIterable[Dict[str, Any]]:
+    async def _listen(self) -> AsyncIterable[dict[str, Any]]:
         """Listen for incoming messages."""
         conn = await self._get_connection()
         async for message in conn:
@@ -43,6 +46,6 @@ class GenericWebSocketExchange(BaseExchange, ABC):
             await self._conn.close()
 
     @abstractmethod
-    def _parse_message(self, message: Dict[str, Any]) -> Optional[Any]:
+    def _parse_message(self, message: dict[str, Any]) -> Optional[Any]:
         """Convert a raw WebSocket message into a standardized model."""
         pass
