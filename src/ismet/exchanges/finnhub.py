@@ -1,8 +1,8 @@
 from collections.abc import AsyncIterable
 from datetime import datetime, timezone
 
-from isme.exchanges.rest_base import GenericRestExchange
-from isme.models.market_data import HistoricalBar, Quote, Trade
+from ismet.exchanges.rest_base import GenericRestExchange
+from ismet.models.market_data import HistoricalBar, Quote, Trade
 
 
 class FinnHubExchange(GenericRestExchange):

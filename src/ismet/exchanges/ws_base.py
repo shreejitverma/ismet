@@ -5,7 +5,7 @@ from typing import Any, Optional
 
 import websockets
 
-from isme.exchanges.base import BaseExchange
+from ismet.exchanges.base import BaseExchange
 
 
 class GenericWebSocketExchange(BaseExchange, ABC):

@@ -8,10 +8,13 @@ on:
 
 jobs:
   build-n-publish:
-    name: Build and publish Python 🐍 distributions 📦 to PyPI
+    name: Build and publish distributions to PyPI
     runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/ismet/
     permissions:
-      # IMPORTANT: this permission is mandatory for trusted publishing
+      # Mandatory for PyPI trusted publishing (OIDC)
       id-token: write
       contents: read
 
@@ -21,12 +24,12 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.x"
-      
+
       - name: Install build dependencies
         run: python -m pip install build
 
       - name: Build a binary wheel and a source tarball
         run: python -m build
 
-      - name: Publish distribution 📦 to PyPI
+      - name: Publish distribution to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1

@@ -2,14 +2,14 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from isme import IsmeClient
-from isme.exchanges.mock import MockExchange
-from isme.models.market_data import HistoricalBar
+from ismet import IsmetClient
+from ismet.exchanges.mock import MockExchange
+from ismet.models.market_data import HistoricalBar
 
 
 @pytest.mark.asyncio
 async def test_client_registration():
-    client = IsmeClient()
+    client = IsmetClient()
     mock_exchange = MockExchange()
     client.register_exchange(mock_exchange)
 
@@ -21,7 +21,7 @@ async def test_client_registration():
 
 @pytest.mark.asyncio
 async def test_client_historical_data():
-    client = IsmeClient()
+    client = IsmetClient()
     mock_exchange = MockExchange()
     client.register_exchange(mock_exchange)
 
@@ -38,6 +38,6 @@ async def test_client_historical_data():
 
 @pytest.mark.asyncio
 async def test_client_invalid_exchange():
-    client = IsmeClient()
+    client = IsmetClient()
     with pytest.raises(ValueError, match="Exchange 'INVALID' is not registered"):
         await client.get_quote("AAPL", exchange="INVALID")

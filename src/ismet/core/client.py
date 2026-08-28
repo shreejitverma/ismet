@@ -1,13 +1,13 @@
 from collections.abc import AsyncIterable
 from datetime import datetime
 
-from isme.exchanges.base import BaseExchange
-from isme.models.market_data import HistoricalBar, Quote, Trade
+from ismet.exchanges.base import BaseExchange
+from ismet.models.market_data import HistoricalBar, Quote, Trade
 
 
-class IsmeClient:
+class IsmetClient:
     """
-    The main entry point for the International Stock Market Engine.
+    The main entry point for the International Stock Market Engine and Toolkit.
     Handles exchange registration and provides a unified interface for data fetching.
     """
 

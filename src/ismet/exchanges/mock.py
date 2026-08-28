@@ -3,8 +3,8 @@ import random
 from collections.abc import AsyncIterable
 from datetime import datetime, timedelta, timezone
 
-from isme.exchanges.base import BaseExchange
-from isme.models.market_data import HistoricalBar, Quote, Trade
+from ismet.exchanges.base import BaseExchange
+from ismet.models.market_data import HistoricalBar, Quote, Trade
 
 
 class MockExchange(BaseExchange):

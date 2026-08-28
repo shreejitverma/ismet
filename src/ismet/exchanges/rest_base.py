@@ -2,7 +2,7 @@ from typing import Any, Optional
 
 import httpx
 
-from isme.exchanges.base import BaseExchange
+from ismet.exchanges.base import BaseExchange
 
 
 class GenericRestExchange(BaseExchange):
