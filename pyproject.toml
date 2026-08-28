@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ismet"
-version = "0.1.0"
-description = "International Stock Market Engine: A unified Python package to connect to major stock exchanges."
+version = "0.2.0"
+description = "International Stock Market Engine and Toolkit: A unified Python package to connect to major stock exchanges."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
@@ -33,8 +33,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/shreejitverma/isme"
-Issues = "https://github.com/shreejitverma/isme/issues"
+Homepage = "https://github.com/shreejitverma/ismet"
+Issues = "https://github.com/shreejitverma/ismet/issues"
 
 [project.optional-dependencies]
 dev = [
@@ -46,7 +46,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/isme"]
+packages = ["src/ismet"]
 
 [tool.ruff]
 line-length = 88

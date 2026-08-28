@@ -1,6 +1,6 @@
-# ISME: International Stock Market Engine
+# ISMET: International Stock Market Engine and Toolkit
 
-`isme` is a high-performance, unified Python package designed to connect to major global stock exchanges. It provides a standardized interface for fetching historical data and streaming real-time market data.
+`ismet` is a high-performance, unified Python package designed to connect to major global stock exchanges. It provides a standardized interface for fetching historical data and streaming real-time market data.
 
 ## Features
 
@@ -19,11 +19,11 @@ pip install ismet
 
 ```python
 import asyncio
-from isme import IsmeClient
+from ismet import IsmetClient
 
 
 async def main():
-    client = IsmeClient()
+    client = IsmetClient()
 
     # Get quote from NYSE
     quote = await client.get_quote("AAPL", exchange="NYSE")

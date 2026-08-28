@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterable
 from datetime import datetime
 
-from isme.models.market_data import HistoricalBar, Quote, Trade
+from ismet.models.market_data import HistoricalBar, Quote, Trade
 
 
 class BaseExchange(ABC):
