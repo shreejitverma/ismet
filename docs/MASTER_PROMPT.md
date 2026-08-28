@@ -88,7 +88,8 @@ Know these facts:
 - `src/ismet/exchanges/rest_base.py` sends both `Authorization: Bearer` and `X-API-Key` headers for every provider, wraps all HTTP errors in `RuntimeError`, and has no retry, backoff, rate limiting, or circuit breaking.
 - `IsmetClient` is a dict of adapters with no lifecycle management, no capability discovery, no config, and no sync facade.
 - Tests cover only the mock adapter.
-- `.github/workflows/publish.yml` publishes on tag but there is no test workflow and no OS matrix.
+- `.github/workflows/publish.yml` publishes on tag.
+- `.github/workflows/workflow.yml` runs ruff lint, ruff format check, and pytest on Python 3.9-3.13 on ubuntu-latest only; there is no macOS or Windows matrix yet.
 
 ## Target architecture
 
