@@ -1,4 +1,4 @@
-# ISMET: International Stock Market Engine and Toolkit
+# ISMET: International Stock Market Engine Tool
 
 `ismet` is a high-performance, unified Python package designed to connect to major global stock exchanges. It provides a standardized interface for fetching historical data and streaming real-time market data.
 
