@@ -51,7 +51,7 @@ Precedence: explicit argument, environment, config file, default.
 
 ```bash
 export ISMET_PROVIDERS=alpaca
-export ISMET_ALPACA_API_KEY=...      # keys containing KEY/SECRET/TOKEN/PASSWORD are credentials
+export ISMET_ALPACA_API_KEY=...      # keys containing KEY/SECRET/TOKEN/PASSWORD/PASSPHRASE are credentials
 export ISMET_ALPACA_PAPER=true       # anything else is an option
 ```
 
