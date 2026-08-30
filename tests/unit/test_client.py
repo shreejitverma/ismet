@@ -1,43 +1,134 @@
+from __future__ import annotations
+
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from ismet import IsmetClient
-from ismet.exchanges.mock import MockExchange
-from ismet.models.market_data import HistoricalBar
+from ismet import IsmetClient, Symbol
+from ismet.capabilities import Capability
+from ismet.config import Settings
+from ismet.errors import ConfigError, NotSupported, ValidationError
+from ismet.models import Quote
+from ismet.providers import Provider, ProviderRegistry
+from ismet.providers.mock import MockProvider
+
+UTC = timezone.utc
 
 
-@pytest.mark.asyncio
-async def test_client_registration():
-    client = IsmetClient()
-    mock_exchange = MockExchange()
-    client.register_exchange(mock_exchange)
+class QuoteOnly(Provider):
+    name = "quoteonly"
+    venues = frozenset({"XQOT"})
 
-    quote = await client.get_quote("AAPL", exchange="MOCK")
-    assert quote.symbol == "AAPL"
-    assert quote.exchange == "MOCK"
-    assert isinstance(quote.bid_price, float)
+    async def quote(self, symbol: Symbol) -> Quote:
+        now = datetime.now(UTC)
+        return Quote(symbol=symbol, exchange_ts=now, received_ts=now, last="1")
+
+    async def order_book(self, symbol: Symbol, depth: int = 10):  # type: ignore[no-untyped-def]
+        raise AssertionError("unused")
 
 
-@pytest.mark.asyncio
-async def test_client_historical_data():
-    client = IsmetClient()
-    mock_exchange = MockExchange()
-    client.register_exchange(mock_exchange)
+class MockTwin(MockProvider):
+    name = "twin"
 
-    start = datetime.now(timezone.utc) - timedelta(days=5)
-    end = datetime.now(timezone.utc)
 
-    bars = await client.get_historical_data(
-        "AAPL", exchange="MOCK", start=start, end=end
+async def test_quick_start_against_mock() -> None:
+    async with IsmetClient([MockProvider()]) as client:
+        q = await client.quote("ACME", venue="XMOK")
+        assert q.bid is not None and q.symbol.key == ("XMOK", "ACME")
+        q2 = await client.quote("ACME@xmok")
+        assert q2.sequence == 2
+        q3 = await client.quote(Symbol(venue="XMOK", ticker="ACME"), provider="mock")
+        assert q3.sequence == 3
+        book = await client.order_book("ACME@XMOK", depth=2)
+        assert len(book.bids) == 2
+        end = datetime(2026, 1, 5, tzinfo=UTC)
+        bars = await client.bars(
+            "ACME@XMOK", interval="1h", start=end - timedelta(hours=3), end=end
+        )
+        assert len(bars) == 3
+        inst = await client.instrument("ACME", venue="XMOK")
+        assert inst.name == "Acme Corporation"
+        assert [i.symbol.ticker for i in await client.search("acme", venue="XMOK")] == [
+            "ACME"
+        ]
+        n = 0
+        async for _ in client.stream_quotes(["ACME", "WAYNE"], venue="XMOK"):
+            n += 1
+            if n == 2:
+                break
+        async for _ in client.stream_trades(["ACME@XMOK"], provider="mock"):
+            break
+        assert client.capabilities("mock") == MockProvider().capabilities()
+        assert client.providers["mock"].opened
+    assert not client.providers["mock"].opened
+
+
+async def test_routing_errors() -> None:
+    client = IsmetClient([MockProvider(), QuoteOnly()])
+    with pytest.raises(ValidationError, match="no registered provider serves"):
+        await client.quote("AAPL", venue="XNAS")
+    with pytest.raises(ValidationError, match="either venue or provider"):
+        client.resolve()
+    with pytest.raises(ValidationError, match="has no venue"):
+        await client.quote("ACME")
+    with pytest.raises(ValidationError, match="does not serve venue"):
+        await client.quote("ACME", venue="XMOK", provider="quoteonly")
+    with pytest.raises(ValidationError, match="does not match venue="):
+        await client.quote(Symbol(venue="XMOK", ticker="ACME"), venue="XQOT")
+    with pytest.raises(ConfigError, match="not registered"):
+        client.provider("nope")
+    with pytest.raises(ConfigError, match="already registered"):
+        client.register(MockProvider())
+    with pytest.raises(ValidationError, match="unknown interval"):
+        await client.bars(
+            "ACME@XMOK", interval="2m", start=datetime.now(UTC), end=datetime.now(UTC)
+        )
+    with pytest.raises(ValidationError, match="at least one symbol"):
+        async for _ in client.stream_quotes([], venue="XMOK"):
+            pass
+    with pytest.raises(ValidationError, match="span venues"):
+        async for _ in client.stream_quotes(["ACME@XMOK", "X@XQOT"]):
+            pass
+    with pytest.raises(ValidationError, match="does not serve"):
+        async for _ in client.stream_quotes(["ACME@XMOK", "X@XQOT"], provider="mock"):
+            pass
+
+
+async def test_ambiguous_venue_requires_explicit_provider() -> None:
+    client = IsmetClient([MockProvider(), MockTwin()])
+    with pytest.raises(ValidationError, match="several providers"):
+        await client.quote("ACME@XMOK")
+    assert (await client.quote("ACME@XMOK", provider="twin")).symbol.ticker == "ACME"
+
+
+async def test_missing_capability_raises_not_supported() -> None:
+    client = IsmetClient([QuoteOnly()])
+    assert client.capabilities("quoteonly") == {Capability.MARKET_DATA}
+    assert (await client.quote("X@XQOT")).last is not None
+    with pytest.raises(NotSupported, match="historical"):
+        await client.bars(
+            "X@XQOT", interval="1d", start=datetime.now(UTC), end=datetime.now(UTC)
+        )
+    with pytest.raises(NotSupported, match="reference_data"):
+        await client.search("x", venue="XQOT")
+    with pytest.raises(NotSupported, match="streaming"):
+        async for _ in client.stream_trades(["X@XQOT"]):
+            pass
+
+
+async def test_from_env_builds_configured_providers() -> None:
+    settings = Settings.load(
+        env={"ISMET_PROVIDERS": "mock", "ISMET_MOCK_SEED": "9"}, use_file=False
     )
-    assert len(bars) > 0
-    assert isinstance(bars[0], HistoricalBar)
-    assert bars[0].symbol == "AAPL"
-
-
-@pytest.mark.asyncio
-async def test_client_invalid_exchange():
-    client = IsmetClient()
-    with pytest.raises(ValueError, match="Exchange 'INVALID' is not registered"):
-        await client.get_quote("AAPL", exchange="INVALID")
+    client = IsmetClient.from_env(
+        settings=settings, registry=ProviderRegistry.discover()
+    )
+    mock = client.providers["mock"]
+    assert isinstance(mock, MockProvider) and mock.seed == 9
+    with pytest.raises(ConfigError, match="no providers configured"):
+        IsmetClient.from_env(settings=Settings.load(env={}, use_file=False))
+    with pytest.raises(ConfigError, match="unknown provider"):
+        IsmetClient.from_env(
+            settings=Settings.load(env={"ISMET_PROVIDERS": "ghost"}, use_file=False),
+            registry=ProviderRegistry(),
+        )

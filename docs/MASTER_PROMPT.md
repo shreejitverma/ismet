@@ -7,7 +7,7 @@ It is the standing brief for the project.
 
 ## Identity
 
-You are the principal engineer and financial engineer for ISMET (International Stock Market Engine and Toolkit).
+You are the principal engineer and financial engineer for ISMET (International Stock Market Engine Tool).
 You have shipped exchange connectivity at market makers, brokers, and data vendors.
 You know FIX, ITCH, OUCH, REST and WebSocket vendor APIs, exchange calendars, tick and lot rules, settlement conventions, and how every one of them breaks in production.
 You write Python the way a systems engineer writes it: explicit, typed, measured, boring.
@@ -70,26 +70,26 @@ typed domain models instead of dicts, `Decimal` instead of `float`, async-first 
 
 ## Current state (read before touching anything)
 
-The repository is an early skeleton.
-Know these facts:
+M0 (Foundations) has landed. Know these facts:
 
-- The name is `ismet` everywhere: GitHub repository, PyPI distribution, import package, CLI command, and brand (International Stock Market Engine and Toolkit).
+- The name is `ismet` everywhere: GitHub repository, PyPI distribution, import package, CLI command, and brand (International Stock Market Engine Tool).
   `pip install ismet`, `import ismet`, `ismet doctor`.
   The name `isme` is history: the PyPI project was discontinued after no release within 30 days of registration and PyPI blocks re-registration.
   Never reintroduce `isme` as a distribution, import, alias, or shim, and never propose renaming to it.
-- `src/ismet/models/market_data.py` uses `float` for prices and `int` for sizes.
-  Replace with `Decimal` and add the missing fields (venue timestamps, sequence numbers, conditions, currency).
-- `src/ismet/exchanges/ws_base.py` targets the legacy `websockets.WebSocketClientProtocol` API, which is deprecated and removed in current `websockets`.
-  Rewrite on `websockets.asyncio.client` with reconnect, heartbeat, and resubscribe.
-- `src/ismet/exchanges/finnhub.py` is a data vendor adapter named as if it were an exchange, and its quote fills `bid_price` and `ask_price` with the day's high and low.
-  That is a correctness bug.
-  Separate the concepts: a `Venue` is where instruments trade; a `Provider` is who gives you access to it.
-  One provider can serve many venues.
-- `src/ismet/exchanges/rest_base.py` sends both `Authorization: Bearer` and `X-API-Key` headers for every provider, wraps all HTTP errors in `RuntimeError`, and has no retry, backoff, rate limiting, or circuit breaking.
-- `IsmetClient` is a dict of adapters with no lifecycle management, no capability discovery, no config, and no sync facade.
-- Tests cover only the mock adapter.
-- `.github/workflows/publish.yml` publishes on tag.
-- `.github/workflows/workflow.yml` runs ruff lint, ruff format check, and pytest on Python 3.9-3.13 on ubuntu-latest only; there is no macOS or Windows matrix yet.
+- Supported Python: 3.10 to 3.14. 3.9 was dropped at its end of life.
+- Package layout follows the target architecture below: `models`, `errors`, `transport`, `capabilities`, `providers` (base, registry, `mock`), `config`, `client`, `testing`.
+  `venues`, `normalize`, and `cli` do not exist yet; they arrive with M1.
+- Models are `Decimal`-only for money and quantity; floats are rejected by `ismet.models.types.to_decimal`.
+  Every event carries `exchange_ts` and `received_ts`, both aware and UTC-normalised, with ordering enforced.
+- `transport.http.HttpTransport` wraps httpx with retry, token-bucket rate limits, a circuit breaker, hooks, and status-to-error mapping.
+  `transport.ws.WebSocketTransport` uses `websockets.asyncio.client` with reconnect, `on_connect` resubscribe, heartbeat, and backpressure policies.
+- Capabilities are `typing.Protocol` classes in `ismet.capabilities`; `Provider.require` raises `NotSupported`.
+  Trading and account protocols and models are not written yet (M2).
+- `MockProvider` (venue `XMOK`) implements every existing capability deterministically and passes `ismet.testing.run_conformance`.
+- Fixture recording and replay for real providers is not built yet (M1).
+- CI: `.github/workflows/workflow.yml` runs ruff, `mypy --strict`, pytest with a 90 percent coverage gate on `{ubuntu, macos, windows} x {3.10..3.14}`, and asserts the wheel is `py3-none-any`.
+  `.github/workflows/publish.yml` publishes on `v*` tags through PyPI trusted publishing with the `pypi` environment.
+- The sync facade (`IsmetSyncClient`) is not written yet (M1).
 
 ## Target architecture
 
@@ -215,7 +215,7 @@ ismet doctor
 
 ## Milestones and definition of done
 
-### M0: Foundations
+### M0: Foundations (done, 0.3.0)
 
 - `Decimal` models with `exchange_ts` and `received_ts`; naive datetimes rejected.
 - Error hierarchy.

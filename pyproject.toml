@@ -4,12 +4,12 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ismet"
-version = "0.2.0"
-description = "International Stock Market Engine and Toolkit: A unified Python package to connect to major stock exchanges."
+version = "0.3.0"
+description = "International Stock Market Engine Tool: one typed, async, venue-agnostic Python interface to exchanges, brokers, and market-data providers."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = "MIT"
-keywords = ["stock-market", "trading", "finance", "nyse", "nasdaq", "nse", "bse", "lse"]
+keywords = ["stock-market", "trading", "finance", "market-data", "exchange", "broker", "nyse", "nasdaq", "nse", "bse", "lse", "crypto"]
 authors = [
   { name = "Shreejit Verma" },
 ]
@@ -18,45 +18,88 @@ classifiers = [
   "Intended Audience :: Developers",
   "Intended Audience :: Financial and Insurance Industry",
   "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.9",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Office/Business :: Financial :: Investment",
   "Topic :: Software Development :: Libraries :: Python Modules",
+  "Typing :: Typed",
 ]
 dependencies = [
   "httpx>=0.27.0",
-  "websockets>=12.0",
-  "pydantic>=2.0.0",
+  "websockets>=13.0",
+  "pydantic>=2.6.0",
+  "platformdirs>=4.0.0",
+  "tzdata>=2024.1",
+  "tomli>=2.0.0; python_version < '3.11'",
 ]
 
 [project.urls]
 Homepage = "https://github.com/shreejitverma/ismet"
 Issues = "https://github.com/shreejitverma/ismet/issues"
+Changelog = "https://github.com/shreejitverma/ismet/releases"
 
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0.0",
   "pytest-asyncio>=0.23.0",
+  "pytest-cov>=5.0.0",
+  "hypothesis>=6.100.0",
+  "mypy>=1.10.0",
   "ruff>=0.4.0",
   "build>=1.0.0",
-  "twine>=5.0.0",
 ]
+
+[project.entry-points."ismet.providers"]
+mock = "ismet.providers.mock:MockProvider"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ismet"]
 
 [tool.ruff]
 line-length = 88
-target-version = "py39"
+target-version = "py310"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "N", "UP", "B", "C4", "SIM", "ARG", "PTH", "RET"]
+select = ["E", "F", "I", "N", "UP", "B", "C4", "SIM", "ARG", "PTH", "RET", "RUF"]
 ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ARG001", "ARG002"]
+"src/ismet/errors/__init__.py" = ["N818"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+plugins = ["pydantic.mypy"]
+files = ["src/ismet"]
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+module = ["tomli"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+filterwarnings = ["error"]
+
+[tool.coverage.run]
+source = ["ismet"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+exclude_also = [
+  "if TYPE_CHECKING:",
+  "@overload",
+  "raise NotImplementedError",
+  "\\.\\.\\.$",
+]
