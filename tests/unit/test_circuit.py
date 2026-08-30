@@ -40,6 +40,27 @@ def test_half_open_failure_reopens() -> None:
     assert cb.state is CircuitState.CLOSED
 
 
+def test_release_probe_frees_half_open_slot_only() -> None:
+    clock = ManualClock()
+    cb = CircuitBreaker("api", failure_threshold=1, recovery_timeout=1, clock=clock)
+    cb.release_probe()
+    cb.check()
+    cb.record_failure()
+    cb.release_probe()
+    assert cb.state is CircuitState.OPEN
+    with pytest.raises(CircuitOpen):
+        cb.check()
+    clock.advance(1)
+    cb.check()
+    with pytest.raises(CircuitOpen):
+        cb.check()
+    cb.release_probe()
+    assert cb.state is CircuitState.HALF_OPEN
+    cb.check()
+    cb.record_success()
+    assert cb.state is CircuitState.CLOSED
+
+
 def test_invalid_parameters() -> None:
     with pytest.raises(ValueError):
         CircuitBreaker("x", failure_threshold=0)

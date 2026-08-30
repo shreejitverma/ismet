@@ -388,6 +388,7 @@ async def test_restart_after_failure_starts_clean(server_factory) -> None:  # ty
         handler, process_request=reject_with(401, times=1, seen=[])
     )
     ws = make(url)
+    stats = ws.stats
     with pytest.raises(AuthError):
         await ws.start(timeout=10)
     await ws.close()
@@ -395,14 +396,28 @@ async def test_restart_after_failure_starts_clean(server_factory) -> None:  # ty
     await ws.start(timeout=10)
     assert ws.state is ConnectionState.CONNECTED
     assert await asyncio.wait_for(ws.messages().__anext__(), 5) == {"ok": 1}
-    assert ws.stats.connects == 1 and ws.stats.received == 1
+    assert ws.stats is stats
+    assert stats.connects == 1 and stats.received == 1
     await ws.close()
 
     await ws.start(timeout=10)
     assert await asyncio.wait_for(ws.messages().__anext__(), 5) == {"ok": 1}
-    assert ws.stats.connects == 1 and ws.stats.received == 1
+    assert ws.stats is stats
+    assert stats.connects == 1 and stats.received == 1
     await ws.close()
     assert [m async for m in ws.messages()] == []
+
+
+async def test_wait_connected_timeout_keeps_stored_failure_cause() -> None:
+    ws = make("ws://127.0.0.1:1")
+    cause = InvalidURI("ws://127.0.0.1:1", "bad")
+    failure = TransportError("terminal", retryable=False)
+    failure.__cause__ = cause
+    ws._failure = failure
+    with pytest.raises(TransportError) as info:
+        await ws.wait_connected(0)
+    assert info.value is failure
+    assert info.value.__cause__ is cause
 
 
 async def test_send_before_connect_raises() -> None:

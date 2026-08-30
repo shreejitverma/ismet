@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from decimal import Decimal
 
 import httpx
@@ -14,7 +15,7 @@ from ismet.errors import (
     VenueError,
 )
 from ismet.transport.backoff import NO_RETRY, ExponentialBackoff, RetryPolicy
-from ismet.transport.circuit import CircuitBreaker
+from ismet.transport.circuit import CircuitBreaker, CircuitState
 from ismet.transport.clock import ManualClock
 from ismet.transport.http import (
     BearerAuth,
@@ -188,6 +189,73 @@ async def test_open_circuit_is_checked_before_rate_limit_tokens() -> None:
         with pytest.raises(CircuitOpen):
             await t.request("GET", "/x")
     assert slept == []
+
+
+async def test_cancelled_half_open_probe_releases_breaker() -> None:
+    clock = ManualClock()
+    blocked = asyncio.Event()
+    release = asyncio.Event()
+
+    async def sleep(d: float) -> None:
+        blocked.set()
+        await release.wait()
+        clock.advance(d)
+
+    limiter = RateLimiter(
+        default=RateLimitSpec(rate=1, capacity=1), clock=clock, sleep=sleep
+    )
+    breaker = CircuitBreaker(
+        "api", failure_threshold=1, recovery_timeout=0, clock=clock
+    )
+    statuses = [500, 200]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(statuses.pop(0), json={})
+
+    t = make(
+        handler,
+        breaker=breaker,
+        rate_limiter=limiter,
+        clock=clock,
+        retry_policy=NO_RETRY,
+    )
+    with pytest.raises(TransportError):
+        await t.request("GET", "/x")
+    assert breaker.state is CircuitState.HALF_OPEN
+
+    probe = asyncio.create_task(t.request("GET", "/x"))
+    await asyncio.wait_for(blocked.wait(), 5)
+    probe.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await probe
+
+    assert breaker.state is CircuitState.HALF_OPEN
+    breaker.check()
+    breaker.release_probe()
+    clock.advance(1)
+    assert (await t.request("GET", "/x")).status == 200
+    assert breaker.state is CircuitState.CLOSED
+
+
+async def test_uncounted_half_open_failure_releases_breaker() -> None:
+    clock = ManualClock()
+    statuses = [500, 401, 200]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(statuses.pop(0), json={})
+
+    breaker = CircuitBreaker(
+        "api", failure_threshold=1, recovery_timeout=1, clock=clock
+    )
+    t = make(handler, breaker=breaker, clock=clock, retry_policy=NO_RETRY)
+    with pytest.raises(TransportError):
+        await t.request("GET", "/x")
+    clock.advance(1)
+    with pytest.raises(AuthError):
+        await t.request("GET", "/x")
+    assert breaker.state is CircuitState.HALF_OPEN
+    assert (await t.request("GET", "/x")).status == 200
+    assert breaker.state is CircuitState.CLOSED
 
 
 async def test_auth_and_venue_errors_do_not_trip_breaker() -> None:

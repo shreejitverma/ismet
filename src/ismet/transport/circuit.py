@@ -19,7 +19,9 @@ class CircuitBreaker:
 
     While open, :meth:`check` raises :class:`CircuitOpen` without calling out.
     After ``recovery_timeout`` seconds one probe call is allowed (half-open);
-    success closes the circuit, failure re-opens it.
+    success closes the circuit, failure re-opens it. A probe that ends without
+    a recorded outcome (cancelled, or failed in a way the caller does not
+    count) must call :meth:`release_probe` so the next call may probe again.
     """
 
     def __init__(
@@ -82,6 +84,11 @@ class CircuitBreaker:
         ):
             self._state = CircuitState.OPEN
             self._opened_at = self._clock.monotonic()
+            self._probing = False
+
+    def release_probe(self) -> None:
+        """Give up the half-open probe slot without recording an outcome."""
+        if self._state is CircuitState.HALF_OPEN:
             self._probing = False
 
     def reset(self) -> None:

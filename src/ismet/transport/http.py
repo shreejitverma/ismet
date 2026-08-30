@@ -2,8 +2,8 @@
 
 Every provider REST call goes through :class:`HttpTransport.request`, which:
 
-1. waits for the rate-limit bucket for ``rate_key``,
-2. checks the circuit breaker,
+1. checks the circuit breaker,
+2. waits for the rate-limit bucket for ``rate_key``,
 3. sends the request with the configured auth,
 4. maps the status code to the ismet error hierarchy,
 5. retries per the :class:`RetryPolicy` for retryable failures,
@@ -243,37 +243,57 @@ class HttpTransport:
         async def once() -> Response:
             nonlocal attempt
             attempt += 1
-            if self.breaker is not None:
-                self.breaker.check()
-            if self.rate_limiter is not None:
-                await self.rate_limiter.acquire(rate_key)
-            assert self._client is not None
-            started = self._clock.monotonic()
-            try:
-                raw = await self._client.request(
-                    method, path, params=params, json=json_body, headers=headers
+            if self.breaker is None:
+                return await self._send(
+                    method, path, params, json_body, headers, rate_key, attempt
                 )
-            except httpx.TimeoutException as exc:
-                latency = self._clock.monotonic() - started
-                err = TransportError(f"timeout: {exc}", retryable=True)
-                self._fail(method, path, attempt, latency, err)
-                raise err from exc
-            except httpx.HTTPError as exc:
-                latency = self._clock.monotonic() - started
-                err = TransportError(f"transport failure: {exc}", retryable=True)
-                self._fail(method, path, attempt, latency, err)
-                raise err from exc
-            latency = self._clock.monotonic() - started
-            if not 200 <= raw.status_code < 300:
-                mapped = map_response_error(raw.status_code, raw.content, raw.headers)
-                self._fail(method, path, attempt, latency, mapped, raw.status_code)
-                raise mapped
-            if self.breaker is not None:
-                self.breaker.record_success()
-            self._emit(RequestInfo(method, path, attempt, latency, raw.status_code))
-            return Response(raw.status_code, dict(raw.headers), raw.content, latency)
+            self.breaker.check()
+            try:
+                return await self._send(
+                    method, path, params, json_body, headers, rate_key, attempt
+                )
+            finally:
+                self.breaker.release_probe()
 
         return await retry(once, policy)
+
+    async def _send(
+        self,
+        method: str,
+        path: str,
+        params: Mapping[str, Any] | None,
+        json_body: Any,
+        headers: Mapping[str, str] | None,
+        rate_key: str | None,
+        attempt: int,
+    ) -> Response:
+        if self.rate_limiter is not None:
+            await self.rate_limiter.acquire(rate_key)
+        assert self._client is not None
+        started = self._clock.monotonic()
+        try:
+            raw = await self._client.request(
+                method, path, params=params, json=json_body, headers=headers
+            )
+        except httpx.TimeoutException as exc:
+            latency = self._clock.monotonic() - started
+            err = TransportError(f"timeout: {exc}", retryable=True)
+            self._fail(method, path, attempt, latency, err)
+            raise err from exc
+        except httpx.HTTPError as exc:
+            latency = self._clock.monotonic() - started
+            err = TransportError(f"transport failure: {exc}", retryable=True)
+            self._fail(method, path, attempt, latency, err)
+            raise err from exc
+        latency = self._clock.monotonic() - started
+        if not 200 <= raw.status_code < 300:
+            mapped = map_response_error(raw.status_code, raw.content, raw.headers)
+            self._fail(method, path, attempt, latency, mapped, raw.status_code)
+            raise mapped
+        if self.breaker is not None:
+            self.breaker.record_success()
+        self._emit(RequestInfo(method, path, attempt, latency, raw.status_code))
+        return Response(raw.status_code, dict(raw.headers), raw.content, latency)
 
     def _fail(
         self,

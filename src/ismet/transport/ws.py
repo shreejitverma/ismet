@@ -70,6 +70,14 @@ class WsStats:
     dropped: int = 0
     sent: int = 0
 
+    def reset(self) -> None:
+        """Zero every counter in place so held references stay live."""
+        self.connects = 0
+        self.reconnects = 0
+        self.received = 0
+        self.dropped = 0
+        self.sent = 0
+
 
 class _Closed:
     pass
@@ -166,7 +174,7 @@ class WebSocketTransport:
         self._connected.clear()
         self._failure = None
         self._last_error = None
-        self.stats = WsStats()
+        self.stats.reset()
         self._drain_queue()
         self._task = asyncio.create_task(self._run(), name=f"ismet-ws:{self.url}")
         if not wait_connected:
@@ -185,7 +193,7 @@ class WebSocketTransport:
             await asyncio.wait_for(self._connected.wait(), timeout)
         except asyncio.TimeoutError as exc:
             if self._failure is not None:
-                raise self._failure from None
+                raise self._failure from self._failure.__cause__
             cause = self._last_error if self._last_error is not None else exc
             raise TransportError(
                 f"websocket {self.url} not connected within {timeout}s"
