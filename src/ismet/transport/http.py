@@ -243,10 +243,10 @@ class HttpTransport:
         async def once() -> Response:
             nonlocal attempt
             attempt += 1
-            if self.rate_limiter is not None:
-                await self.rate_limiter.acquire(rate_key)
             if self.breaker is not None:
                 self.breaker.check()
+            if self.rate_limiter is not None:
+                await self.rate_limiter.acquire(rate_key)
             assert self._client is not None
             started = self._clock.monotonic()
             try:

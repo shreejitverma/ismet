@@ -83,6 +83,7 @@ M0 (Foundations) has landed. Know these facts:
   Every event carries `exchange_ts` and `received_ts`, both aware and UTC-normalised, with ordering enforced.
 - `transport.http.HttpTransport` wraps httpx with retry, token-bucket rate limits, a circuit breaker, hooks, and status-to-error mapping.
   `transport.ws.WebSocketTransport` uses `websockets.asyncio.client` with reconnect, `on_connect` resubscribe, heartbeat, and backpressure policies.
+  Malformed URLs and 4xx handshake rejections other than 429 are terminal (`AuthError` for 401/403); a failed or timed-out `start()` never leaks its reconnect task.
 - Capabilities are `typing.Protocol` classes in `ismet.capabilities`; `Provider.require` raises `NotSupported`.
   Trading and account protocols and models are not written yet (M2).
 - `MockProvider` (venue `XMOK`) implements every existing capability deterministically and passes `ismet.testing.run_conformance`.

@@ -43,6 +43,8 @@ DEFAULT_UNIVERSE: tuple[tuple[str, str], ...] = (
     ("WAYNE", "Wayne Enterprises"),
 )
 MAX_BARS = 100_000
+MAX_DEPTH = 100
+MIN_TICKS = MAX_DEPTH + 1
 T = TypeVar("T")
 
 
@@ -87,7 +89,11 @@ def _option(
 
 
 class _Walk:
-    """Random walk in integer ticks for one ticker."""
+    """Random walk in integer ticks for one ticker.
+
+    The walk never drops below ``MIN_TICKS`` so that an order book of
+    ``MAX_DEPTH`` levels below the mid always has positive, distinct prices.
+    """
 
     def __init__(self, ticker: str, seed: int) -> None:
         digest = hashlib.sha256(f"{seed}:{ticker}".encode()).digest()
@@ -96,7 +102,7 @@ class _Walk:
         self.sequence = 0
 
     def step(self) -> int:
-        self.ticks = max(100, self.ticks + self.rng.randint(-5, 5))
+        self.ticks = max(MIN_TICKS, self.ticks + self.rng.randint(-5, 5))
         self.sequence += 1
         return self.ticks
 
@@ -182,9 +188,12 @@ class MockProvider(Provider):
         )
 
     async def order_book(self, symbol: Symbol, depth: int = 10) -> OrderBook:
+        """Snapshot with ``depth`` levels per side; ``depth`` is 1..MAX_DEPTH."""
         self._check(symbol)
         if depth < 1:
             raise ValidationError("depth must be >= 1")
+        if depth > MAX_DEPTH:
+            raise ValidationError(f"depth must be <= {MAX_DEPTH}, got {depth}")
         walk = self._walk(symbol)
         px = walk.step() * TICK
         now = self._now()

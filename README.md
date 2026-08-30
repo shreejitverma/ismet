@@ -110,6 +110,7 @@ myvenue = "my_package:MyVenueProvider"
 - HTTP calls get jittered exponential retry, per-endpoint token-bucket rate limits, and a circuit breaker.
   Status codes map to `AuthError`, `RateLimited` (with `retry_after`), `TransportError`, and `VenueError` (raw vendor code preserved).
 - WebSocket streams reconnect with backoff, resubscribe through an `on_connect` hook, heartbeat, and apply an explicit backpressure policy (block, drop oldest, drop newest).
+- Handshake rejections that cannot succeed on retry (malformed URL, 4xx other than 429) fail fast with `AuthError` for 401/403 or a non-retryable `TransportError`; 429 and 5xx keep reconnecting.
 - No shell-outs, no OS-specific paths, no event-loop policy changes.
 
 ## Development

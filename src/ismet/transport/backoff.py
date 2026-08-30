@@ -31,8 +31,15 @@ class ExponentialBackoff:
             raise ValueError("base >= 0, factor >= 1, maximum >= 0 required")
 
     def delay(self, attempt: int, rng: random.Random | None = None) -> float:
-        """Delay before retry number ``attempt`` (0-based)."""
-        raw = min(self.maximum, self.base * (self.factor**attempt))
+        """Delay before retry number ``attempt`` (0-based).
+
+        Never raises: once ``factor**attempt`` exceeds float range the delay
+        is simply ``maximum``.
+        """
+        try:
+            raw = min(self.maximum, self.base * (self.factor**attempt))
+        except OverflowError:
+            raw = self.maximum if self.base else 0.0
         if not self.jitter:
             return raw
         return (rng or random).uniform(0.0, raw)

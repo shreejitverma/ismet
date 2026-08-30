@@ -8,8 +8,10 @@ from decimal import Decimal
 
 import pytest
 from websockets.asyncio.server import Server, ServerConnection, serve
+from websockets.exceptions import InvalidStatus, InvalidURI
+from websockets.http11 import Request, Response
 
-from ismet.errors import TransportError
+from ismet.errors import AuthError, TransportError
 from ismet.transport.backoff import ExponentialBackoff
 from ismet.transport.ws import (
     BackpressurePolicy,
@@ -19,15 +21,16 @@ from ismet.transport.ws import (
 )
 
 Handler = Callable[[ServerConnection], Awaitable[None]]
+ProcessRequest = Callable[[ServerConnection, Request], Response | None]
 FAST = ExponentialBackoff(base=0.01, maximum=0.02, jitter=False)
 
 
 @pytest.fixture
-async def server_factory() -> AsyncIterator[Callable[[Handler], Awaitable[str]]]:
+async def server_factory() -> AsyncIterator[Callable[..., Awaitable[str]]]:
     servers: list[Server] = []
 
-    async def start(handler: Handler) -> str:
-        srv = await serve(handler, "127.0.0.1", 0)
+    async def start(handler: Handler, **serve_kwargs: object) -> str:
+        srv = await serve(handler, "127.0.0.1", 0, **serve_kwargs)  # type: ignore[arg-type]
         servers.append(srv)
         port = next(iter(srv.sockets)).getsockname()[1]
         return f"ws://127.0.0.1:{port}"
@@ -36,6 +39,23 @@ async def server_factory() -> AsyncIterator[Callable[[Handler], Awaitable[str]]]
     for srv in servers:
         srv.close()
         await srv.wait_closed()
+
+
+async def idle(conn: ServerConnection) -> None:
+    await conn.wait_closed()
+
+
+def reject_with(
+    status: int, times: int | None = None, seen: list[int] | None = None
+) -> ProcessRequest:
+    def process_request(conn: ServerConnection, request: Request) -> Response | None:
+        if times is not None and seen is not None and len(seen) >= times:
+            return None
+        if seen is not None:
+            seen.append(status)
+        return conn.respond(status, "rejected")
+
+    return process_request
 
 
 def make(url: str, **kw: object) -> WebSocketTransport:
@@ -248,7 +268,102 @@ async def test_wait_connected_times_out() -> None:
     ws = make("ws://127.0.0.1:1")
     with pytest.raises(TransportError, match="not connected within"):
         await ws.start(timeout=0.05)
+    assert ws._task is None
+    assert ws.state is ConnectionState.CLOSED
+    assert not any(t.get_name().startswith("ismet-ws:") for t in asyncio.all_tasks())
+    assert [m async for m in ws.messages()] == []
     await ws.close()
+
+
+async def test_timed_out_start_carries_last_connect_error(server_factory) -> None:  # type: ignore[no-untyped-def]
+    url = await server_factory(idle, process_request=reject_with(503))
+    ws = make(url)
+    with pytest.raises(TransportError, match="not connected within") as info:
+        await ws.start(timeout=0.5)
+    assert isinstance(info.value.__cause__, InvalidStatus)
+    assert info.value.__cause__.response.status_code == 503
+    assert ws._task is None and ws.state is ConnectionState.CLOSED
+
+
+@pytest.mark.parametrize(
+    ("status", "exc_type"),
+    [(401, AuthError), (403, AuthError), (404, TransportError)],
+)
+async def test_terminal_handshake_rejection_fails_fast(  # type: ignore[no-untyped-def]
+    server_factory, status: int, exc_type: type[Exception]
+) -> None:
+    url = await server_factory(idle, process_request=reject_with(status))
+    ws = make(url)
+    started = time.monotonic()
+    with pytest.raises(exc_type, match=f"HTTP {status}") as info:
+        await ws.start(timeout=10)
+    assert time.monotonic() - started < 2.0
+    assert url in str(info.value)
+    assert isinstance(info.value.__cause__, InvalidStatus)
+    assert isinstance(info.value, AuthError | TransportError)
+    assert info.value.status == status
+    if isinstance(info.value, TransportError):
+        assert info.value.retryable is False
+    assert ws.state is ConnectionState.FAILED
+    assert ws.stats.connects == 0 and ws._task is None
+    with pytest.raises(exc_type):
+        async for _ in ws.messages():
+            pass
+    await ws.close()
+
+
+@pytest.mark.parametrize("status", [429, 503])
+async def test_retryable_handshake_rejection_reconnects(  # type: ignore[no-untyped-def]
+    server_factory, status: int
+) -> None:
+    seen: list[int] = []
+    url = await server_factory(
+        idle, process_request=reject_with(status, times=2, seen=seen)
+    )
+    ws = make(url)
+    await ws.start(timeout=10)
+    assert ws.state is ConnectionState.CONNECTED
+    assert seen == [status, status]
+    assert ws.stats.connects == 1 and ws.stats.reconnects == 1
+    await ws.close()
+
+
+async def test_invalid_uri_fails_fast() -> None:
+    ws = make("http://127.0.0.1:1")
+    started = time.monotonic()
+    with pytest.raises(TransportError, match="invalid URI") as info:
+        await ws.start(timeout=10)
+    assert time.monotonic() - started < 2.0
+    assert isinstance(info.value.__cause__, InvalidURI)
+    assert info.value.retryable is False
+    assert ws.state is ConnectionState.FAILED and ws._task is None
+    await ws.close()
+
+
+async def test_restart_after_failure_starts_clean(server_factory) -> None:  # type: ignore[no-untyped-def]
+    async def handler(conn: ServerConnection) -> None:
+        await conn.send(json.dumps({"ok": 1}))
+        await conn.wait_closed()
+
+    url = await server_factory(
+        handler, process_request=reject_with(401, times=1, seen=[])
+    )
+    ws = make(url)
+    with pytest.raises(AuthError):
+        await ws.start(timeout=10)
+    await ws.close()
+
+    await ws.start(timeout=10)
+    assert ws.state is ConnectionState.CONNECTED
+    assert await asyncio.wait_for(ws.messages().__anext__(), 5) == {"ok": 1}
+    assert ws.stats.connects == 1 and ws.stats.received == 1
+    await ws.close()
+
+    await ws.start(timeout=10)
+    assert await asyncio.wait_for(ws.messages().__anext__(), 5) == {"ok": 1}
+    assert ws.stats.connects == 1 and ws.stats.received == 1
+    await ws.close()
+    assert [m async for m in ws.messages()] == []
 
 
 async def test_send_before_connect_raises() -> None:

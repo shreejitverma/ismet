@@ -10,7 +10,7 @@ from ismet.capabilities import Capability
 from ismet.config import ProviderSettings
 from ismet.errors import ConfigError, NotSupported, ValidationError, VenueError
 from ismet.models import Interval, Symbol
-from ismet.providers.mock import TICK, MockProvider
+from ismet.providers.mock import MAX_DEPTH, TICK, MockProvider
 from ismet.transport.clock import ManualClock
 
 UTC = timezone.utc
@@ -64,6 +64,20 @@ async def test_quote_and_book_are_tick_aligned(sym: Symbol) -> None:
     assert book.sequence == 2
     with pytest.raises(ValidationError, match="depth"):
         await p.order_book(sym, depth=0)
+
+
+async def test_order_book_depth_is_capped_and_prices_stay_positive(
+    sym: Symbol,
+) -> None:
+    p = MockProvider()
+    with pytest.raises(ValidationError, match=f"depth must be <= {MAX_DEPTH}"):
+        await p.order_book(sym, depth=MAX_DEPTH + 1)
+    p._walk(sym).ticks = 0
+    book = await p.order_book(sym, depth=MAX_DEPTH)
+    assert len(book.bids) == len(book.asks) == MAX_DEPTH
+    assert all(lvl.price > 0 for lvl in book.bids)
+    assert book.bids[-1].price == TICK
+    assert len({lvl.price for lvl in book.bids}) == MAX_DEPTH
 
 
 async def test_symbol_validation(sym: Symbol) -> None:

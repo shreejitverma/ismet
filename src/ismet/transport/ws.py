@@ -11,6 +11,17 @@ example a send on a socket that just dropped) counts as one more attempt; any
 other error outside the socket layer (decoding, a non-retryable error from
 ``on_connect``) is terminal: the transport moves to ``FAILED`` and surfaces it
 from ``wait_connected`` and ``messages``.
+
+Handshake failures that cannot succeed on retry are terminal too, because the
+URL and connect options are fixed at construction: a malformed URL raises
+:class:`TransportError` (not retryable), and a 4xx rejection other than 429
+raises :class:`AuthError` for 401/403 or a non-retryable
+:class:`TransportError` otherwise, each naming the URL and status with the
+``websockets`` exception as ``__cause__``. 429 and 5xx rejections reconnect
+with backoff like any socket error. ``start`` never leaks its task: if the
+first connect fails or times out the task is cancelled before the error is
+raised, and a fresh ``start`` after ``close`` begins with clean failure state,
+stats, and queue.
 """
 
 from __future__ import annotations
@@ -27,7 +38,7 @@ from typing import Any
 import websockets
 from websockets.asyncio.client import ClientConnection, connect
 
-from ismet.errors import TransportError
+from ismet.errors import AuthError, IsmetError, TransportError
 from ismet.transport.backoff import ExponentialBackoff
 
 DEFAULT_WS_BACKOFF = ExponentialBackoff(base=0.5, maximum=30.0)
@@ -119,12 +130,14 @@ class WebSocketTransport:
         self._policy = backpressure
         self._decode = decode or (lambda raw: json.loads(raw, parse_float=Decimal))
         self._connect_kwargs = connect_kwargs or {}
+        self._queue_size = queue_size
         self._queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=queue_size)
         self._conn: ClientConnection | None = None
         self._task: asyncio.Task[None] | None = None
         self._connected = asyncio.Event()
         self._stop = asyncio.Event()
-        self._failure: TransportError | None = None
+        self._failure: IsmetError | None = None
+        self._last_error: BaseException | None = None
 
     def _set_state(self, state: ConnectionState) -> None:
         self.state = state
@@ -141,13 +154,31 @@ class WebSocketTransport:
     async def start(
         self, *, wait_connected: bool = True, timeout: float = 30.0
     ) -> None:
-        """Start the connection loop; by default wait for the first connect."""
+        """Start the connection loop; by default wait for the first connect.
+
+        If the first connect fails or does not complete within ``timeout`` the
+        background task is stopped before the error propagates, so a failed
+        start never leaves a reconnect loop running.
+        """
         if self._task is not None:
             return
         self._stop.clear()
+        self._connected.clear()
+        self._failure = None
+        self._last_error = None
+        self.stats = WsStats()
+        self._queue = asyncio.Queue(maxsize=self._queue_size)
         self._task = asyncio.create_task(self._run(), name=f"ismet-ws:{self.url}")
-        if wait_connected:
+        if not wait_connected:
+            return
+        try:
             await self.wait_connected(timeout)
+        except BaseException:
+            await self._shutdown()
+            if self.state is not ConnectionState.FAILED:
+                self._set_state(ConnectionState.CLOSED)
+            self._enqueue(_CLOSED, force=True)
+            raise
 
     async def wait_connected(self, timeout: float = 30.0) -> None:
         try:
@@ -155,14 +186,14 @@ class WebSocketTransport:
         except asyncio.TimeoutError as exc:
             if self._failure is not None:
                 raise self._failure from None
+            cause = self._last_error if self._last_error is not None else exc
             raise TransportError(
                 f"websocket {self.url} not connected within {timeout}s"
-            ) from exc
+            ) from cause
         if self._failure is not None:
             raise self._failure
 
-    async def close(self) -> None:
-        """Stop reconnecting, close the socket, and end :meth:`messages`."""
+    async def _shutdown(self) -> None:
         self._stop.set()
         task, self._task = self._task, None
         if self._conn is not None:
@@ -172,6 +203,10 @@ class WebSocketTransport:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
+
+    async def close(self) -> None:
+        """Stop reconnecting, close the socket, and end :meth:`messages`."""
+        await self._shutdown()
         self._set_state(ConnectionState.CLOSED)
         self._enqueue(_CLOSED, force=True)
 
@@ -224,10 +259,25 @@ class WebSocketTransport:
         else:
             self._enqueue(item)
 
-    def _fail(self, failure: TransportError) -> None:
+    def _fail(self, failure: IsmetError) -> None:
         self._failure = failure
         self._set_state(ConnectionState.FAILED)
         self._connected.set()
+
+    def _handshake_failure(
+        self, exc: websockets.exceptions.InvalidStatus
+    ) -> IsmetError | None:
+        status = exc.response.status_code
+        if not 400 <= status < 500 or status == 429:
+            return None
+        message = f"websocket {self.url} handshake rejected with HTTP {status}"
+        failure: IsmetError
+        if status in (401, 403):
+            failure = AuthError(message, status=status)
+        else:
+            failure = TransportError(message, retryable=False, status=status)
+        failure.__cause__ = exc
+        return failure
 
     async def _run(self) -> None:
         attempt = 0
@@ -236,7 +286,7 @@ class WebSocketTransport:
                 ConnectionState.RECONNECTING if attempt else ConnectionState.CONNECTING
             )
             reason: object = "server closed the connection"
-            fatal: TransportError | None = None
+            fatal: IsmetError | None = None
             try:
                 async with connect(
                     self.url,
@@ -258,15 +308,28 @@ class WebSocketTransport:
                         await self._put(self._decode(raw))
             except asyncio.CancelledError:
                 raise
+            except websockets.exceptions.InvalidURI as exc:
+                fatal = TransportError(
+                    f"websocket {self.url} has an invalid URI: {exc}",
+                    retryable=False,
+                )
+                fatal.__cause__ = exc
+            except websockets.exceptions.InvalidStatus as exc:
+                self._last_error = exc
+                fatal = self._handshake_failure(exc)
+                if fatal is None:
+                    reason = exc
             except (
                 websockets.exceptions.WebSocketException,
                 OSError,
                 TimeoutError,
                 asyncio.TimeoutError,
             ) as exc:
+                self._last_error = exc
                 reason = exc
             except TransportError as exc:
                 if exc.retryable:
+                    self._last_error = exc
                     reason = exc
                 else:
                     fatal = exc

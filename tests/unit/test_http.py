@@ -156,6 +156,40 @@ async def test_circuit_breaker_opens_and_blocks() -> None:
         await t.request("GET", "/x")
 
 
+async def test_open_circuit_is_checked_before_rate_limit_tokens() -> None:
+    clock = ManualClock()
+    slept: list[float] = []
+
+    async def sleep(d: float) -> None:
+        slept.append(d)
+        clock.advance(d)
+
+    limiter = RateLimiter(
+        default=RateLimitSpec(rate=1, capacity=1), clock=clock, sleep=sleep
+    )
+    breaker = CircuitBreaker(
+        "api", failure_threshold=1, recovery_timeout=60, clock=clock
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500)
+
+    t = make(
+        handler,
+        breaker=breaker,
+        rate_limiter=limiter,
+        clock=clock,
+        retry_policy=NO_RETRY,
+    )
+    with pytest.raises(TransportError):
+        await t.request("GET", "/x")
+    assert slept == []
+    for _ in range(2):
+        with pytest.raises(CircuitOpen):
+            await t.request("GET", "/x")
+    assert slept == []
+
+
 async def test_auth_and_venue_errors_do_not_trip_breaker() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(401)

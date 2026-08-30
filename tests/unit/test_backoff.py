@@ -29,6 +29,22 @@ def test_jittered_delay_within_bounds(attempt: int, seed: int) -> None:
     assert 0 <= d <= min(10, 0.5 * 2**attempt)
 
 
+@given(st.integers(min_value=0, max_value=10**6))
+def test_delay_never_overflows_for_large_attempts(attempt: int) -> None:
+    b = ExponentialBackoff(base=0.5, factor=2.0, maximum=30.0, jitter=False)
+    assert 0.0 <= b.delay(attempt) <= 30.0
+    assert 0.0 <= b.delay(attempt, random.Random(attempt)) <= 30.0
+
+
+def test_huge_attempt_is_capped_at_maximum() -> None:
+    b = ExponentialBackoff(base=0.5, factor=2.0, maximum=30.0, jitter=False)
+    assert b.delay(10_000) == 30.0
+    it = ExponentialBackoff(base=0.5, factor=2.0, maximum=30.0).delays()
+    assert all(0.0 <= next(it) <= 30.0 for _ in range(2_000))
+    zero = ExponentialBackoff(base=0, factor=2.0, maximum=30.0, jitter=False)
+    assert zero.delay(10_000) == 0.0
+
+
 def test_invalid_parameters() -> None:
     with pytest.raises(ValueError):
         ExponentialBackoff(base=-1)
