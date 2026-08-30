@@ -340,6 +340,45 @@ async def test_invalid_uri_fails_fast() -> None:
     await ws.close()
 
 
+async def test_consumer_attached_before_start_keeps_receiving(server_factory) -> None:  # type: ignore[no-untyped-def]
+    async def handler(conn: ServerConnection) -> None:
+        await conn.send(json.dumps({"n": 1}))
+        await conn.wait_closed()
+
+    url = await server_factory(handler)
+    ws = make(url)
+    received: list[object] = []
+
+    async def collect() -> None:
+        async for msg in ws.messages():
+            received.append(msg)
+
+    consumer = asyncio.create_task(collect())
+    await asyncio.sleep(0)
+    await ws.start(timeout=10)
+    for _ in range(50):
+        if received:
+            break
+        await asyncio.sleep(0.02)
+    assert received == [{"n": 1}]
+    await ws.close()
+    await asyncio.wait_for(consumer, 5)
+    assert consumer.done() and consumer.exception() is None
+
+    assert [m async for m in ws.messages()] == []
+    restarted = asyncio.create_task(collect())
+    await asyncio.sleep(0)
+    await ws.start(timeout=10)
+    for _ in range(50):
+        if len(received) == 2:
+            break
+        await asyncio.sleep(0.02)
+    assert received == [{"n": 1}, {"n": 1}]
+    await ws.close()
+    await asyncio.wait_for(restarted, 5)
+    assert restarted.exception() is None
+
+
 async def test_restart_after_failure_starts_clean(server_factory) -> None:  # type: ignore[no-untyped-def]
     async def handler(conn: ServerConnection) -> None:
         await conn.send(json.dumps({"ok": 1}))

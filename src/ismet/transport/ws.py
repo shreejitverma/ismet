@@ -20,8 +20,9 @@ raises :class:`AuthError` for 401/403 or a non-retryable
 ``websockets`` exception as ``__cause__``. 429 and 5xx rejections reconnect
 with backoff like any socket error. ``start`` never leaks its task: if the
 first connect fails or times out the task is cancelled before the error is
-raised, and a fresh ``start`` after ``close`` begins with clean failure state,
-stats, and queue.
+raised, and a fresh ``start`` after ``close`` begins with clean failure state
+and stats and an emptied queue; the queue object itself never changes, so a
+consumer already waiting in ``messages`` keeps receiving across restarts.
 """
 
 from __future__ import annotations
@@ -130,7 +131,6 @@ class WebSocketTransport:
         self._policy = backpressure
         self._decode = decode or (lambda raw: json.loads(raw, parse_float=Decimal))
         self._connect_kwargs = connect_kwargs or {}
-        self._queue_size = queue_size
         self._queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=queue_size)
         self._conn: ClientConnection | None = None
         self._task: asyncio.Task[None] | None = None
@@ -167,7 +167,7 @@ class WebSocketTransport:
         self._failure = None
         self._last_error = None
         self.stats = WsStats()
-        self._queue = asyncio.Queue(maxsize=self._queue_size)
+        self._drain_queue()
         self._task = asyncio.create_task(self._run(), name=f"ismet-ws:{self.url}")
         if not wait_connected:
             return
@@ -232,6 +232,13 @@ class WebSocketTransport:
                     raise self._failure
                 return
             yield item
+
+    def _drain_queue(self) -> None:
+        while True:
+            try:
+                self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
 
     def _enqueue(self, item: Any, *, force: bool = False) -> bool:
         if force or self._policy is BackpressurePolicy.BLOCK:
