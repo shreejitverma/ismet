@@ -143,11 +143,35 @@ def test_from_settings() -> None:
 
 
 @pytest.mark.parametrize(
+    ("options", "seed", "tick_interval"),
+    [
+        ({"seed": 5.0, "tick_interval": 0}, 5, 0.0),
+        ({"seed": " 7 ", "tick_interval": "0.25"}, 7, 0.25),
+        ({"seed": Decimal(9), "tick_interval": Decimal("0.5")}, 9, 0.5),
+    ],
+)
+def test_from_settings_accepts_integral_seed_and_finite_interval(
+    options: dict[str, object], seed: int, tick_interval: float
+) -> None:
+    p = MockProvider.from_settings(ProviderSettings(name="mock", options=options))
+    assert (p.seed, p.tick_interval) == (seed, tick_interval)
+    assert type(p.seed) is int and type(p.tick_interval) is float
+
+
+@pytest.mark.parametrize(
     ("options", "message"),
     [
         ({"seed": "abc"}, "option 'seed' must be an integer, got 'abc'"),
         ({"seed": None}, "option 'seed' must be an integer, got None"),
-        ({"tick_interval": "fast"}, "option 'tick_interval' must be a number"),
+        ({"seed": True}, "option 'seed' must be an integer, got True"),
+        ({"seed": 3.7}, "option 'seed' must be an integer, got 3.7"),
+        ({"seed": "3.7"}, "option 'seed' must be an integer, got '3.7'"),
+        ({"tick_interval": "fast"}, "option 'tick_interval' must be a finite"),
+        ({"tick_interval": "inf"}, "got 'inf'"),
+        ({"tick_interval": "nan"}, "got 'nan'"),
+        ({"tick_interval": float("inf")}, "got inf"),
+        ({"tick_interval": -1}, "got -1"),
+        ({"tick_interval": True}, "got True"),
     ],
 )
 def test_from_settings_rejects_bad_options_with_config_error(

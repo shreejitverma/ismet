@@ -6,9 +6,11 @@ that :meth:`WebSocketTransport.messages` drains. When the connection drops the
 task backs off, reconnects, and calls ``on_connect`` again so the provider can
 re-authenticate and resubscribe. ``max_reconnects`` bounds consecutive attempts
 that deliver no message, however the connection ended; it resets once a message
-arrives. Any error outside the socket layer (decoding, ``on_connect``) is
-terminal: the transport moves to ``FAILED`` and surfaces it from
-``wait_connected`` and ``messages``.
+arrives. A retryable :class:`TransportError` raised by ``on_connect`` (for
+example a send on a socket that just dropped) counts as one more attempt; any
+other error outside the socket layer (decoding, a non-retryable error from
+``on_connect``) is terminal: the transport moves to ``FAILED`` and surfaces it
+from ``wait_connected`` and ``messages``.
 """
 
 from __future__ import annotations
@@ -263,6 +265,11 @@ class WebSocketTransport:
                 asyncio.TimeoutError,
             ) as exc:
                 reason = exc
+            except TransportError as exc:
+                if exc.retryable:
+                    reason = exc
+                else:
+                    fatal = exc
             except Exception as exc:
                 fatal = TransportError(
                     f"websocket {self.url} failed: {exc!r}", retryable=False

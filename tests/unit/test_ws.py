@@ -172,28 +172,75 @@ async def test_on_connect_exception_fails_start_with_cause(server_factory) -> No
     await ws.close()
 
 
-async def test_send_on_closed_socket_raises_transport_error(server_factory) -> None:  # type: ignore[no-untyped-def]
+async def test_send_on_dropped_socket_reconnects(server_factory) -> None:  # type: ignore[no-untyped-def]
+    connections = 0
+
     async def handler(conn: ServerConnection) -> None:
-        await conn.close()
+        nonlocal connections
+        connections += 1
+        if connections == 1:
+            await conn.close()
+            return
+        async for raw in conn:
+            await conn.send(json.dumps({"ack": json.loads(raw)}))
 
     url = await server_factory(handler)
     errors: list[TransportError] = []
 
     async def on_connect(t: WebSocketTransport) -> None:
-        assert t._conn is not None
-        await t._conn.wait_closed()
+        if connections == 1:
+            assert t._conn is not None
+            await t._conn.wait_closed()
         try:
             await t.send_json({"sub": "ACME"})
         except TransportError as exc:
             errors.append(exc)
+            raise
 
-    ws = make(url, on_connect=on_connect, max_reconnects=0)
+    ws = make(url, on_connect=on_connect)
     await ws.start(wait_connected=False)
-    with pytest.raises(TransportError, match="failed after 0 reconnects"):
-        async for _ in ws.messages():
-            pass
+    msg = await asyncio.wait_for(ws.messages().__anext__(), 5)
+    assert msg == {"ack": {"sub": "ACME"}}
+    assert ws.state is ConnectionState.CONNECTED
+    assert ws.stats.connects == 2 and ws.stats.reconnects == 1
+    assert ws.stats.sent == 1
     assert len(errors) == 1 and "closed while sending" in str(errors[0])
-    assert ws.stats.sent == 0
+    assert errors[0].retryable is True
+    await ws.close()
+
+
+async def test_retryable_on_connect_error_counts_attempts(server_factory) -> None:  # type: ignore[no-untyped-def]
+    async def handler(conn: ServerConnection) -> None:
+        await conn.wait_closed()
+
+    async def on_connect(t: WebSocketTransport) -> None:
+        raise TransportError("token fetch timed out", retryable=True)
+
+    url = await server_factory(handler)
+    ws = make(url, on_connect=on_connect, max_reconnects=1)
+    with pytest.raises(TransportError, match="failed after 1 reconnects") as info:
+        await ws.start(timeout=10)
+    assert "token fetch timed out" in str(info.value)
+    assert isinstance(info.value.__cause__, TransportError)
+    assert ws.stats.connects == 2 and ws.state is ConnectionState.FAILED
+    await ws.close()
+
+
+async def test_non_retryable_error_from_on_connect_is_terminal(server_factory) -> None:  # type: ignore[no-untyped-def]
+    async def handler(conn: ServerConnection) -> None:
+        await conn.wait_closed()
+
+    err = TransportError("credentials rejected", retryable=False)
+
+    async def on_connect(t: WebSocketTransport) -> None:
+        raise err
+
+    url = await server_factory(handler)
+    ws = make(url, on_connect=on_connect)
+    with pytest.raises(TransportError) as info:
+        await ws.start(timeout=10)
+    assert info.value is err
+    assert ws.stats.connects == 1 and ws.state is ConnectionState.FAILED
     await ws.close()
 
 

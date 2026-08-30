@@ -82,12 +82,23 @@ class IsmetClient:
         self._opened = True
 
     async def close(self) -> None:
-        """Close every provider opened by :meth:`open`; no-op otherwise."""
+        """Close every provider opened by :meth:`open`; no-op otherwise.
+
+        Every provider gets a close attempt even if an earlier one raises; the
+        first exception is re-raised once all closes have run.
+        """
         if not self._opened:
             return
         self._opened = False
+        first: BaseException | None = None
         for provider in reversed(list(self._providers.values())):
-            await provider.close()
+            try:
+                await provider.close()
+            except BaseException as exc:
+                if first is None:
+                    first = exc
+        if first is not None:
+            raise first
 
     # Registry
 

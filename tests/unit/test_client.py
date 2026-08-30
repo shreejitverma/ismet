@@ -55,6 +55,20 @@ class Broken(Provider):
         raise RuntimeError("boom")
 
 
+class Last(Counting):
+    name = "last"
+    venues = frozenset({"XLST"})
+
+
+class BrokenClose(Counting):
+    name = "brokenclose"
+    venues = frozenset({"XBRC"})
+
+    async def close(self) -> None:
+        await super().close()
+        raise RuntimeError(f"close failed {self.closes}")
+
+
 async def test_open_and_close_are_idempotent_and_paired() -> None:
     counting = Counting()
     client = IsmetClient([counting])
@@ -83,6 +97,21 @@ async def test_open_failure_closes_already_opened_providers() -> None:
         async with client:
             raise AssertionError("unreachable")
     assert (counting.opens, counting.closes) == (2, 2)
+
+
+async def test_close_attempts_every_provider_and_reraises_first_error() -> None:
+    first, middle, last = Counting(), BrokenClose(), Last()
+    client = IsmetClient([first, middle, last])
+    await client.open()
+    with pytest.raises(RuntimeError, match="close failed 1"):
+        await client.close()
+    assert (first.closes, middle.closes, last.closes) == (1, 1, 1)
+    await client.close()
+    assert (first.closes, middle.closes, last.closes) == (1, 1, 1)
+    with pytest.raises(RuntimeError, match="close failed 2"):
+        async with client:
+            pass
+    assert (first.closes, middle.closes, last.closes) == (2, 2, 2)
 
 
 async def test_quick_start_against_mock() -> None:

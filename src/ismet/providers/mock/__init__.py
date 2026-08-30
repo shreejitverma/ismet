@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
 import random
 from collections.abc import AsyncIterator, Callable, Sequence
 from datetime import datetime, timedelta
@@ -43,6 +44,27 @@ DEFAULT_UNIVERSE: tuple[tuple[str, str], ...] = (
 )
 MAX_BARS = 100_000
 T = TypeVar("T")
+
+
+def _as_seed(value: Any) -> int:
+    if isinstance(value, bool):
+        raise ValueError(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise ValueError(value)
+        return int(value)
+    return int(str(value).strip())
+
+
+def _as_interval(value: Any) -> float:
+    if isinstance(value, bool):
+        raise ValueError(value)
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds < 0:
+        raise ValueError(value)
+    return seconds
 
 
 def _option(
@@ -103,9 +125,13 @@ class MockProvider(Provider):
     @classmethod
     def from_settings(cls, settings: ProviderSettings) -> MockProvider:
         return cls(
-            seed=_option(settings, "seed", 42, int, "an integer"),
+            seed=_option(settings, "seed", 42, _as_seed, "an integer"),
             tick_interval=_option(
-                settings, "tick_interval", 0.01, float, "a number of seconds"
+                settings,
+                "tick_interval",
+                0.01,
+                _as_interval,
+                "a finite number of seconds, zero or more",
             ),
         )
 
