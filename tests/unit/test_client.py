@@ -31,6 +31,60 @@ class MockTwin(MockProvider):
     name = "twin"
 
 
+class Counting(Provider):
+    name = "counting"
+    venues = frozenset({"XCNT"})
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.opens = 0
+        self.closes = 0
+
+    async def open(self) -> None:
+        self.opens += 1
+
+    async def close(self) -> None:
+        self.closes += 1
+
+
+class Broken(Provider):
+    name = "broken"
+    venues = frozenset({"XBRK"})
+
+    async def open(self) -> None:
+        raise RuntimeError("boom")
+
+
+async def test_open_and_close_are_idempotent_and_paired() -> None:
+    counting = Counting()
+    client = IsmetClient([counting])
+    await client.close()
+    assert counting.closes == 0
+    await client.open()
+    await client.open()
+    assert counting.opens == 1
+    await client.close()
+    await client.close()
+    assert counting.closes == 1
+    async with client:
+        assert counting.opens == 2
+    assert counting.closes == 2
+
+
+async def test_open_failure_closes_already_opened_providers() -> None:
+    counting = Counting()
+    client = IsmetClient([counting, Broken()])
+    with pytest.raises(RuntimeError, match="boom"):
+        await client.open()
+    assert (counting.opens, counting.closes) == (1, 1)
+    await client.close()
+    assert counting.closes == 1
+    with pytest.raises(RuntimeError, match="boom"):
+        async with client:
+            raise AssertionError("unreachable")
+    assert (counting.opens, counting.closes) == (2, 2)
+
+
 async def test_quick_start_against_mock() -> None:
     async with IsmetClient([MockProvider()]) as client:
         q = await client.quote("ACME", venue="XMOK")

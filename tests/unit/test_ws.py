@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from decimal import Decimal
 
@@ -104,6 +105,95 @@ async def test_gives_up_after_max_reconnects() -> None:
     assert ws.state is ConnectionState.FAILED
     with pytest.raises(TransportError):
         await ws.wait_connected(1)
+    await ws.close()
+
+
+async def test_max_reconnects_exhaustion_fails_start_promptly() -> None:
+    ws = make("ws://127.0.0.1:1", max_reconnects=1)
+    started = time.monotonic()
+    with pytest.raises(TransportError, match="failed after 1 reconnects") as info:
+        await ws.start(timeout=10)
+    assert time.monotonic() - started < 2.0
+    assert ws.state is ConnectionState.FAILED
+    assert isinstance(info.value.__cause__, OSError)
+    await ws.close()
+
+
+async def test_clean_server_close_respects_max_reconnects(server_factory) -> None:  # type: ignore[no-untyped-def]
+    async def handler(conn: ServerConnection) -> None:
+        await conn.close()
+
+    url = await server_factory(handler)
+    ws = make(url, max_reconnects=1)
+    await ws.start(wait_connected=False)
+    with pytest.raises(TransportError, match="failed after 1 reconnects") as info:
+        async for _ in ws.messages():
+            pass
+    assert "server closed the connection" in str(info.value)
+    assert ws.state is ConnectionState.FAILED
+    assert ws.stats.connects == 2 and ws.stats.reconnects == 1
+    await ws.close()
+
+
+async def test_undecodable_frame_fails_instead_of_hanging(server_factory) -> None:  # type: ignore[no-untyped-def]
+    async def handler(conn: ServerConnection) -> None:
+        await conn.send("ping")
+        await conn.wait_closed()
+
+    url = await server_factory(handler)
+    ws = make(url)
+    await ws.start()
+    with pytest.raises(TransportError, match="JSONDecodeError") as info:
+        async for _ in ws.messages():
+            pass
+    assert info.value.retryable is False
+    assert isinstance(info.value.__cause__, json.JSONDecodeError)
+    assert ws.state is ConnectionState.FAILED
+    with pytest.raises(TransportError, match="JSONDecodeError"):
+        await ws.wait_connected(1)
+    await ws.close()
+
+
+async def test_on_connect_exception_fails_start_with_cause(server_factory) -> None:  # type: ignore[no-untyped-def]
+    async def handler(conn: ServerConnection) -> None:
+        await conn.wait_closed()
+
+    async def on_connect(t: WebSocketTransport) -> None:
+        raise ValueError("bad handshake reply")
+
+    url = await server_factory(handler)
+    ws = make(url, on_connect=on_connect)
+    started = time.monotonic()
+    with pytest.raises(TransportError, match="bad handshake reply") as info:
+        await ws.start(timeout=10)
+    assert time.monotonic() - started < 2.0
+    assert isinstance(info.value.__cause__, ValueError)
+    assert ws.state is ConnectionState.FAILED
+    await ws.close()
+
+
+async def test_send_on_closed_socket_raises_transport_error(server_factory) -> None:  # type: ignore[no-untyped-def]
+    async def handler(conn: ServerConnection) -> None:
+        await conn.close()
+
+    url = await server_factory(handler)
+    errors: list[TransportError] = []
+
+    async def on_connect(t: WebSocketTransport) -> None:
+        assert t._conn is not None
+        await t._conn.wait_closed()
+        try:
+            await t.send_json({"sub": "ACME"})
+        except TransportError as exc:
+            errors.append(exc)
+
+    ws = make(url, on_connect=on_connect, max_reconnects=0)
+    await ws.start(wait_connected=False)
+    with pytest.raises(TransportError, match="failed after 0 reconnects"):
+        async for _ in ws.messages():
+            pass
+    assert len(errors) == 1 and "closed while sending" in str(errors[0])
+    assert ws.stats.sent == 0
     await ws.close()
 
 

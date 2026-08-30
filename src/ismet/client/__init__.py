@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from datetime import datetime
 from types import MappingProxyType
@@ -65,14 +66,28 @@ class IsmetClient:
         await self.close()
 
     async def open(self) -> None:
-        for provider in self._providers.values():
-            await provider.open()
+        """Open every provider; on failure close the ones already opened."""
+        if self._opened:
+            return
+        opened: list[Provider] = []
+        try:
+            for provider in self._providers.values():
+                await provider.open()
+                opened.append(provider)
+        except BaseException:
+            for provider in reversed(opened):
+                with contextlib.suppress(Exception):
+                    await provider.close()
+            raise
         self._opened = True
 
     async def close(self) -> None:
+        """Close every provider opened by :meth:`open`; no-op otherwise."""
+        if not self._opened:
+            return
+        self._opened = False
         for provider in reversed(list(self._providers.values())):
             await provider.close()
-        self._opened = False
 
     # Registry
 

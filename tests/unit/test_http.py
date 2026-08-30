@@ -204,6 +204,57 @@ async def test_auth_helpers_inject_secrets() -> None:
     assert captured[2].url.params["a"] == "b"
 
 
+async def test_hooks_never_receive_query_auth_secret() -> None:
+    seen: list[RequestInfo] = []
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        assert request.url.params["token"] == "q1"
+        return httpx.Response(500 if calls == 1 else 200, json={})
+
+    t = make(handler, auth=QueryAuth("token", "q1"), hooks=[seen.append])
+    await t.get_json("/quote", params={"a": "b"})
+    assert [i.status for i in seen] == [500, 200]
+    assert all(i.url == "/quote" for i in seen)
+    assert all("q1" not in repr(i) for i in seen)
+
+
+@pytest.mark.parametrize("status", [301, 302, 304])
+async def test_redirects_are_not_followed_and_map_to_ismet_error(
+    status: int,
+) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(status, headers={"Location": "https://login.test/"})
+
+    t = make(handler)
+    with pytest.raises(TransportError, match=f"HTTP {status}") as info:
+        await t.get_json("/x")
+    assert calls == 1
+    assert info.value.status == status and info.value.retryable is False
+    if status != 304:
+        assert "https://login.test/" in str(info.value)
+
+
+async def test_non_json_success_body_raises_transport_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="<html>maintenance</html>")
+
+    t = make(handler)
+    with pytest.raises(TransportError, match="not JSON") as info:
+        await t.get_json("/x")
+    assert info.value.status == 200 and info.value.retryable is False
+    assert "maintenance" in str(info.value)
+    with pytest.raises(TransportError, match="not JSON"):
+        await t.post_json("/x", {})
+    assert (await t.request("GET", "/x")).text() == "<html>maintenance</html>"
+
+
 def test_map_response_error_variants() -> None:
     e = map_response_error(429, b"", {"Retry-After": "bogus"})
     assert isinstance(e, RateLimited) and e.retry_after is None
@@ -213,3 +264,6 @@ def test_map_response_error_variants() -> None:
     assert isinstance(v2, VenueError) and v2.code == "7"
     s = map_response_error(502, b"bad gateway", {})
     assert isinstance(s, TransportError) and s.retryable and s.status == 502
+    r = map_response_error(302, b"", {"location": "/login"})
+    assert isinstance(r, TransportError) and not r.retryable and r.status == 302
+    assert "/login" in str(r)

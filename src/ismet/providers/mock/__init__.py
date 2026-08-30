@@ -10,13 +10,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import random
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import ClassVar
+from typing import Any, ClassVar, TypeVar
 
-from ismet.config import ProviderSettings
-from ismet.errors import ValidationError, VenueError
+from ismet.config import ENV_PREFIX, ProviderSettings
+from ismet.errors import ConfigError, ValidationError, VenueError
 from ismet.models import (
     AssetClass,
     Bar,
@@ -42,6 +42,26 @@ DEFAULT_UNIVERSE: tuple[tuple[str, str], ...] = (
     ("WAYNE", "Wayne Enterprises"),
 )
 MAX_BARS = 100_000
+T = TypeVar("T")
+
+
+def _option(
+    settings: ProviderSettings,
+    key: str,
+    default: T,
+    cast: Callable[[Any], T],
+    expected: str,
+) -> T:
+    value = settings.option(key, default)
+    try:
+        return cast(value)
+    except (TypeError, ValueError):
+        env = f"{ENV_PREFIX}{settings.name.upper()}_{key.upper()}"
+        raise ConfigError(
+            f"provider {settings.name!r} option {key!r} must be {expected}, "
+            f"got {value!r}; check {env} or [provider.{settings.name}.options] "
+            f"{key} in the config file"
+        ) from None
 
 
 class _Walk:
@@ -82,9 +102,12 @@ class MockProvider(Provider):
 
     @classmethod
     def from_settings(cls, settings: ProviderSettings) -> MockProvider:
-        seed = settings.option("seed", 42)
-        interval = settings.option("tick_interval", 0.01)
-        return cls(seed=int(seed), tick_interval=float(interval))
+        return cls(
+            seed=_option(settings, "seed", 42, int, "an integer"),
+            tick_interval=_option(
+                settings, "tick_interval", 0.01, float, "a number of seconds"
+            ),
+        )
 
     async def open(self) -> None:
         self.opened = True

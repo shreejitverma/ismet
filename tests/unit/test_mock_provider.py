@@ -8,7 +8,7 @@ from pydantic import SecretStr
 
 from ismet.capabilities import Capability
 from ismet.config import ProviderSettings
-from ismet.errors import NotSupported, ValidationError, VenueError
+from ismet.errors import ConfigError, NotSupported, ValidationError, VenueError
 from ismet.models import Interval, Symbol
 from ismet.providers.mock import TICK, MockProvider
 from ismet.transport.clock import ManualClock
@@ -140,3 +140,20 @@ def test_from_settings() -> None:
     assert p.seed == 5 and p.tick_interval == 0.5
     assert MockProvider.from_settings(ProviderSettings(name="mock")).seed == 42
     assert isinstance(Decimal(p.seed), Decimal)
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"seed": "abc"}, "option 'seed' must be an integer, got 'abc'"),
+        ({"seed": None}, "option 'seed' must be an integer, got None"),
+        ({"tick_interval": "fast"}, "option 'tick_interval' must be a number"),
+    ],
+)
+def test_from_settings_rejects_bad_options_with_config_error(
+    options: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ConfigError, match=message) as info:
+        MockProvider.from_settings(ProviderSettings(name="mock", options=options))
+    key = next(iter(options)).upper()
+    assert f"ISMET_MOCK_{key}" in str(info.value)

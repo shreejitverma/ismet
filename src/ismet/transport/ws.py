@@ -4,7 +4,11 @@ The transport owns a background task that keeps a connection alive. Incoming
 messages are decoded (floats as ``Decimal``) and placed on a bounded queue
 that :meth:`WebSocketTransport.messages` drains. When the connection drops the
 task backs off, reconnects, and calls ``on_connect`` again so the provider can
-re-authenticate and resubscribe.
+re-authenticate and resubscribe. ``max_reconnects`` bounds consecutive attempts
+that deliver no message, however the connection ended; it resets once a message
+arrives. Any error outside the socket layer (decoding, ``on_connect``) is
+terminal: the transport moves to ``FAILED`` and surfaces it from
+``wait_connected`` and ``messages``.
 """
 
 from __future__ import annotations
@@ -171,9 +175,15 @@ class WebSocketTransport:
 
     async def send_json(self, message: Any) -> None:
         """Send ``message`` as JSON on the current connection."""
-        if self._conn is None:
+        conn = self._conn
+        if conn is None:
             raise TransportError(f"websocket {self.url} is not connected")
-        await self._conn.send(json.dumps(message, default=str))
+        try:
+            await conn.send(json.dumps(message, default=str))
+        except websockets.exceptions.ConnectionClosed as exc:
+            raise TransportError(
+                f"websocket {self.url} closed while sending: {exc}"
+            ) from exc
         self.stats.sent += 1
 
     async def messages(self) -> AsyncIterator[Any]:
@@ -212,13 +222,19 @@ class WebSocketTransport:
         else:
             self._enqueue(item)
 
+    def _fail(self, failure: TransportError) -> None:
+        self._failure = failure
+        self._set_state(ConnectionState.FAILED)
+        self._connected.set()
+
     async def _run(self) -> None:
         attempt = 0
         while not self._stop.is_set():
             self._set_state(
                 ConnectionState.RECONNECTING if attempt else ConnectionState.CONNECTING
             )
-            clean_close = False
+            reason: object = "server closed the connection"
+            fatal: TransportError | None = None
             try:
                 async with connect(
                     self.url,
@@ -230,15 +246,14 @@ class WebSocketTransport:
                     self.stats.connects += 1
                     if attempt:
                         self.stats.reconnects += 1
-                    attempt = 0
                     if self._on_connect is not None:
                         await self._on_connect(self)
                     self._set_state(ConnectionState.CONNECTED)
                     self._connected.set()
                     async for raw in conn:
+                        attempt = 0
                         self.stats.received += 1
                         await self._put(self._decode(raw))
-                    clean_close = True
             except asyncio.CancelledError:
                 raise
             except (
@@ -247,27 +262,31 @@ class WebSocketTransport:
                 TimeoutError,
                 asyncio.TimeoutError,
             ) as exc:
-                if self._stop.is_set():
-                    break
-                attempt += 1
-                if self._max_reconnects is not None and attempt > self._max_reconnects:
-                    self._failure = TransportError(
-                        f"websocket {self.url} failed after {attempt - 1} "
-                        f"reconnects: {exc}",
-                        retryable=False,
-                    )
-                    self._set_state(ConnectionState.FAILED)
-                    self._connected.set()
-                    self._enqueue(_CLOSED, force=True)
-                    return
-                await asyncio.sleep(self._backoff.delay(attempt - 1))
+                reason = exc
+            except Exception as exc:
+                fatal = TransportError(
+                    f"websocket {self.url} failed: {exc!r}", retryable=False
+                )
+                fatal.__cause__ = exc
             finally:
                 self._conn = None
                 self._connected.clear()
-            if clean_close and not self._stop.is_set():
-                # Server closed cleanly: reconnect with backoff.
+            if self._stop.is_set():
+                break
+            if fatal is None:
                 attempt += 1
-                await asyncio.sleep(self._backoff.delay(attempt - 1))
+                if self._max_reconnects is not None and attempt > self._max_reconnects:
+                    fatal = TransportError(
+                        f"websocket {self.url} failed after {attempt - 1} "
+                        f"reconnects: {reason}",
+                        retryable=False,
+                    )
+                    if isinstance(reason, BaseException):
+                        fatal.__cause__ = reason
+            if fatal is not None:
+                self._fail(fatal)
+                break
+            await asyncio.sleep(self._backoff.delay(attempt - 1))
         self._enqueue(_CLOSED, force=True)
 
 

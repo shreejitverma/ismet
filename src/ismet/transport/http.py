@@ -84,7 +84,15 @@ class Response:
     latency: float
 
     def json(self) -> Any:
-        return loads_decimal(self.body)
+        """Decode the body as JSON; a non-JSON body is a :class:`TransportError`."""
+        try:
+            return loads_decimal(self.body)
+        except ValueError as exc:
+            raise TransportError(
+                f"HTTP {self.status}: response body is not JSON: {self.text()[:200]!r}",
+                retryable=False,
+                status=self.status,
+            ) from exc
 
     def text(self) -> str:
         return self.body.decode("utf-8", errors="replace")
@@ -92,7 +100,11 @@ class Response:
 
 @dataclass(frozen=True)
 class RequestInfo:
-    """Hook payload describing one attempt."""
+    """Hook payload describing one attempt.
+
+    ``url`` is the request path as given by the caller, never the final URL,
+    so credentials injected by an auth flow do not reach logging hooks.
+    """
 
     method: str
     url: str
@@ -121,6 +133,14 @@ def map_response_error(
 ) -> IsmetError:
     """Map a non-2xx response to the ismet error hierarchy."""
     text = body.decode("utf-8", errors="replace")[:500]
+    if status < 400:
+        location = headers.get("location") or headers.get("Location")
+        return TransportError(
+            f"HTTP {status}: unexpected non-success response"
+            + (f" redirecting to {location!r}" if location else ""),
+            retryable=False,
+            status=status,
+        )
     if status in (401, 403):
         return AuthError(f"HTTP {status}: {text}", status=status)
     if status == 429:
@@ -188,6 +208,7 @@ class HttpTransport:
                 headers=self._headers,
                 auth=self._auth,
                 transport=self._httpx_transport,
+                follow_redirects=False,
             )
 
     async def close(self) -> None:
@@ -243,15 +264,13 @@ class HttpTransport:
                 self._fail(method, path, attempt, latency, err)
                 raise err from exc
             latency = self._clock.monotonic() - started
-            if raw.status_code >= 400:
+            if not 200 <= raw.status_code < 300:
                 mapped = map_response_error(raw.status_code, raw.content, raw.headers)
                 self._fail(method, path, attempt, latency, mapped, raw.status_code)
                 raise mapped
             if self.breaker is not None:
                 self.breaker.record_success()
-            self._emit(
-                RequestInfo(method, str(raw.url), attempt, latency, raw.status_code)
-            )
+            self._emit(RequestInfo(method, path, attempt, latency, raw.status_code))
             return Response(raw.status_code, dict(raw.headers), raw.content, latency)
 
         return await retry(once, policy)
