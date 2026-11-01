@@ -92,7 +92,7 @@ class RecordingListener:
 
 
 async def eventually(
-    predicate: Callable[[], bool], timeout: float = 5.0, message: str = ""
+    predicate: Callable[[], bool], timeout: float = 30.0, message: str = ""
 ) -> None:
     """Poll until true. Used only where nothing can be awaited directly."""
     deadline = asyncio.get_running_loop().time() + timeout

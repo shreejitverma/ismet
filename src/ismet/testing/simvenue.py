@@ -67,6 +67,7 @@ from ismet.providers.base import Provider
 from ismet.transport.clock import SYSTEM_CLOCK, Clock
 
 SIM_VENUE = "ZSIM"
+_WORKING = (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED)
 
 
 class Fault(str, Enum):
@@ -209,11 +210,17 @@ class SimVenue(Provider):
         """An external print: fills resting orders at or better, in price-time order."""
         print_price, remaining = Decimal(price), Decimal(quantity)
         self._markets.setdefault(symbol, _Market()).last = print_price
-        for order in self._orders.values():
-            if order.request.symbol == symbol and self._stop_reached(
-                order, print_price
+        for order in list(self._orders.values()):
+            if (
+                order.request.symbol != symbol
+                or order.elected
+                or order.status not in _WORKING
+                or not self._stop_reached(order, print_price)
             ):
-                order.elected = True
+                continue
+            order.elected = True
+            if order.limit_price is None:
+                self._take_liquidity(order)  # a stop is a market order once elected
         for order in self._resting_in_priority(symbol):
             if remaining <= 0:
                 break
@@ -277,7 +284,7 @@ class SimVenue(Provider):
         """End the trading day: every working DAY order expires."""
         for order in self._orders.values():
             if (
-                order.status in (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED)
+                order.status in _WORKING
                 and order.request.time_in_force is TimeInForce.DAY
             ):
                 order.status = OrderStatus.EXPIRED
@@ -393,7 +400,7 @@ class SimVenue(Provider):
             o
             for o in self._orders.values()
             if o.request.symbol == symbol
-            and o.status in (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED)
+            and o.status in _WORKING
             and (
                 o.request.order_type is OrderType.LIMIT
                 or (o.request.order_type is OrderType.STOP_LIMIT and o.elected)
@@ -608,7 +615,8 @@ class SimVenue(Provider):
                 venue_order_id=order.venue_order_id,
             )
         )
-        self._take_liquidity(order)
+        if order.request.stop_price is None or order.elected:
+            self._take_liquidity(order)
         await self._answer("amend_order")
 
     def _snapshot(self, order: _Order) -> VenueOrderSnapshot:

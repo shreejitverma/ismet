@@ -11,7 +11,7 @@ from websockets.asyncio.server import Server, ServerConnection, serve
 from websockets.exceptions import InvalidStatus, InvalidURI
 from websockets.http11 import Request, Response
 
-from ismet.errors import AuthError, TransportError
+from ismet.errors import AuthError, RateLimited, TransportError
 from ismet.transport.backoff import ExponentialBackoff
 from ismet.transport.ws import (
     BackpressurePolicy,
@@ -466,3 +466,57 @@ def test_sequence_tracker() -> None:
     assert t.classify(14).missing == 2
     assert t.classify(13).missing == 0
     assert t.last == 14 and t.gaps == 1
+
+
+async def test_on_rejected_sees_the_handshake_and_can_end_the_stream() -> None:
+    seen: list[tuple[int, bytes, str | None]] = []
+    verdict = RateLimited("too much", retry_after=9.0)
+
+    def process_request(conn: ServerConnection, request: Request) -> Response:
+        response = conn.respond(429, "slow down")
+        response.headers["Retry-After"] = "9"
+        return response
+
+    def on_rejected(status, body, headers):  # type: ignore[no-untyped-def]
+        seen.append((status, body, headers.get("retry-after")))
+        return verdict
+
+    async def handler(conn: ServerConnection) -> None:
+        await conn.wait_closed()
+
+    async with serve(
+        handler, "127.0.0.1", 0, process_request=process_request
+    ) as server:
+        port = next(iter(server.sockets)).getsockname()[1]
+        ws = WebSocketTransport(f"ws://127.0.0.1:{port}", on_rejected=on_rejected)
+        with pytest.raises(RateLimited) as caught:
+            await ws.start()
+    assert caught.value is verdict
+    assert len(seen) == 1 and seen[0][0] == 429 and seen[0][2] == "9"
+    assert b"slow down" in seen[0][1]
+
+
+async def test_a_failing_on_rejected_leaves_the_normal_handling_in_place(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    attempts = 0
+
+    def process_request(conn: ServerConnection, request: Request) -> Response | None:
+        nonlocal attempts
+        attempts += 1
+        return conn.respond(404, "gone")
+
+    def on_rejected(status, body, headers):  # type: ignore[no-untyped-def]
+        raise RuntimeError("bug in the hook")
+
+    async def handler(conn: ServerConnection) -> None:
+        await conn.wait_closed()
+
+    async with serve(
+        handler, "127.0.0.1", 0, process_request=process_request
+    ) as server:
+        port = next(iter(server.sockets)).getsockname()[1]
+        ws = WebSocketTransport(f"ws://127.0.0.1:{port}", on_rejected=on_rejected)
+        with pytest.raises(TransportError, match="404"):
+            await ws.start()
+    assert attempts == 1 and "on_rejected" in caplog.text

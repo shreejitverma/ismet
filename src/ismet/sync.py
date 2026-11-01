@@ -73,6 +73,10 @@ class IsmetSyncClient:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._opened = False
+        self._closing = False
+        # Guards _loop, _closing and _streams. Held only for moments, never over a wait,
+        # so that nothing can be scheduled on the loop once a close has begun.
+        self._lock = threading.Lock()
         self._streams: dict[threading.Event, list[BaseException]] = {}
 
     # Lifecycle
@@ -101,22 +105,32 @@ class IsmetSyncClient:
         self._opened = True
 
     def close(self) -> None:
-        """Close providers, stop the loop, and join the thread. Idempotent."""
-        if self._thread is None:
-            return
-        for stop, failure in list(self._streams.items()):
+        """Close providers, stop the loop, and join the thread. Idempotent.
+
+        A second caller during a close returns at once and leaves it to the first.
+        """
+        with self._lock:
+            if self._thread is None or self._closing:
+                return
+            self._closing = True
+            streams = list(self._streams.items())
+        for stop, failure in streams:
             failure.append(ConfigError("the client was closed during this stream"))
             stop.set()
         try:
             if self._opened:
-                self._run(self._client.close())
+                self._run(self._client.close(), closing=True)
         finally:
-            self._opened = False
-            self._stop_thread()
+            try:
+                self._stop_thread()
+            finally:
+                self._opened = False
+                self._closing = False
 
     def _stop_thread(self) -> None:
-        loop, thread = self._loop, self._thread
-        self._loop, self._thread = None, None
+        with self._lock:
+            loop, thread = self._loop, self._thread
+            self._loop, self._thread = None, None
         if loop is None or thread is None:
             return
 
@@ -139,11 +153,12 @@ class IsmetSyncClient:
             if not thread.is_alive():
                 loop.close()
 
-    def _run(self, coroutine: Coroutine[Any, Any, T]) -> T:
-        if self._loop is None:
-            coroutine.close()
-            raise ConfigError("client is not open; use it in a 'with' block")
-        future = asyncio.run_coroutine_threadsafe(coroutine, self._loop)
+    def _run(self, coroutine: Coroutine[Any, Any, T], *, closing: bool = False) -> T:
+        with self._lock:
+            if self._loop is None or (self._closing and not closing):
+                coroutine.close()
+                raise ConfigError("client is not open; use it in a 'with' block")
+            future = asyncio.run_coroutine_threadsafe(coroutine, self._loop)
         try:
             # Short waits in a loop, because on Windows an unbounded wait cannot be
             # interrupted by Ctrl-C.
@@ -268,14 +283,16 @@ class IsmetSyncClient:
             except Exception as exc:
                 failure.append(exc)
             finally:
-                self._streams.pop(stop, None)
+                with self._lock:
+                    self._streams.pop(stop, None)
                 finished.set()
 
         def generate() -> Iterator[Any]:
-            if self._loop is None:
-                raise ConfigError("client is not open; use it in a 'with' block")
-            self._streams[stop] = failure
-            future = asyncio.run_coroutine_threadsafe(pump(), self._loop)
+            with self._lock:
+                if self._loop is None or not self._opened or self._closing:
+                    raise ConfigError("client is not open; use it in a 'with' block")
+                self._streams[stop] = failure
+                future = asyncio.run_coroutine_threadsafe(pump(), self._loop)
             try:
                 while True:
                     try:
@@ -283,16 +300,21 @@ class IsmetSyncClient:
                         continue
                     except Empty:
                         pass
-                    # The producer records a failure before it sets finished, so
-                    # reading finished first cannot miss one.
+                    # The producer records a failure before it sets finished, and sets
+                    # finished before its future is done, so read in this order.
+                    done = future.done()
                     ended = finished.is_set() and queue.empty()
                     if failure:
                         raise failure[0]
                     if ended:
                         return
+                    if done and not finished.is_set():
+                        # Cancelled before its first step, so its cleanup never ran.
+                        raise ConfigError("this stream's producer never started")
             finally:
                 stop.set()
-                self._streams.pop(stop, None)
+                with self._lock:
+                    self._streams.pop(stop, None)
                 future.cancel()
 
         return generate()

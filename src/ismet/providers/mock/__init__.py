@@ -99,12 +99,24 @@ class _Walk:
         digest = hashlib.sha256(f"{seed}:{ticker}".encode()).digest()
         self.rng = random.Random(int.from_bytes(digest[:8], "big"))
         self.ticks = 5_000 + int.from_bytes(digest[8:12], "big") % 45_000
-        self.sequence = 0
+        self.snapshots = 0
+        self.trades = 0
 
     def step(self) -> int:
         self.ticks = max(MIN_TICKS, self.ticks + self.rng.randint(-5, 5))
-        self.sequence += 1
         return self.ticks
+
+
+class _StreamSequence:
+    """One stream's numbering per ticker, so what else runs cannot make it jump."""
+
+    def __init__(self) -> None:
+        self._last: dict[str, int] = {}
+
+    def next(self, symbol: Symbol) -> int:
+        key = symbol.ticker.upper()
+        self._last[key] = self._last.get(key, 0) + 1
+        return self._last[key]
 
 
 class MockProvider(Provider):
@@ -171,13 +183,17 @@ class MockProvider(Provider):
     async def quote(self, symbol: Symbol) -> Quote:
         self._check(symbol)
         walk = self._walk(symbol)
+        walk.snapshots += 1
+        return self._quote(symbol, walk, walk.snapshots)
+
+    def _quote(self, symbol: Symbol, walk: _Walk, sequence: int) -> Quote:
         px = walk.step() * TICK
         now = self._now()
         return Quote(
             symbol=symbol,
             exchange_ts=now,
             received_ts=now,
-            sequence=walk.sequence,
+            sequence=sequence,
             bid=px - TICK,
             ask=px + TICK,
             bid_size=Decimal(walk.rng.randint(1, 50) * 100),
@@ -195,6 +211,7 @@ class MockProvider(Provider):
         if depth > MAX_DEPTH:
             raise ValidationError(f"depth must be <= {MAX_DEPTH}, got {depth}")
         walk = self._walk(symbol)
+        walk.snapshots += 1
         px = walk.step() * TICK
         now = self._now()
         bids = tuple(
@@ -213,7 +230,7 @@ class MockProvider(Provider):
             symbol=symbol,
             exchange_ts=now,
             received_ts=now,
-            sequence=walk.sequence,
+            sequence=walk.snapshots,
             bids=bids,
             asks=asks,
             currency="USD",
@@ -272,28 +289,31 @@ class MockProvider(Provider):
     async def stream_quotes(self, symbols: Sequence[Symbol]) -> AsyncIterator[Quote]:
         for symbol in symbols:
             self._check(symbol)
+        sequence = _StreamSequence()
         while True:
             for symbol in symbols:
-                yield await self.quote(symbol)
+                yield self._quote(symbol, self._walk(symbol), sequence.next(symbol))
             await asyncio.sleep(self.tick_interval)
 
     async def stream_trades(self, symbols: Sequence[Symbol]) -> AsyncIterator[Trade]:
         for symbol in symbols:
             self._check(symbol)
+        sequence = _StreamSequence()
         while True:
             for symbol in symbols:
                 walk = self._walk(symbol)
+                walk.trades += 1
                 px = walk.step() * TICK
                 now = self._now()
                 yield Trade(
                     symbol=symbol,
                     exchange_ts=now,
                     received_ts=now,
-                    sequence=walk.sequence,
+                    sequence=sequence.next(symbol),
                     price=px,
                     size=Decimal(walk.rng.randint(1, 20) * 100),
                     side=walk.rng.choice((Side.BUY, Side.SELL)),
-                    trade_id=f"{symbol.ticker.upper()}-{walk.sequence}",
+                    trade_id=f"{symbol.ticker.upper()}-{walk.trades}",
                     currency="USD",
                 )
             await asyncio.sleep(self.tick_interval)

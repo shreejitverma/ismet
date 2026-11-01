@@ -9,13 +9,19 @@ Both registries are process-wide because a code's validity must not depend on
 which object validated it. They only ever grow, so readers need no lock.
 
 Expired MICs remain valid: historical data legitimately refers to them.
+
+Registries live in one process, while stored rows outlive it. A row read back with
+:func:`accepting_stored_codes` needs its codes well formed but not registered here,
+since they were checked when it was written. Nothing new may be built that way.
 """
 
 from __future__ import annotations
 
 import csv
 import re
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import lru_cache
 from importlib import resources
@@ -166,6 +172,24 @@ def _iso_currencies() -> Mapping[str, CurrencyInfo]:
     return MappingProxyType(table)
 
 
+_reading_stored_row: ContextVar[bool] = ContextVar("reading_stored_row", default=False)
+
+
+@contextmanager
+def accepting_stored_codes() -> Iterator[None]:
+    """Check only the shape of codes parsed inside this block, in this context.
+
+    For parsing rows this library stored earlier, perhaps in a process that registered
+    a private venue or crypto asset this one has not. Registers nothing, so the codes
+    stay unknown to everything outside the block.
+    """
+    token = _reading_stored_row.set(True)
+    try:
+        yield
+    finally:
+        _reading_stored_row.reset(token)
+
+
 def venue_info(code: str) -> Venue | None:
     """The registry entry for ``code``, or ``None`` if it is not a known venue."""
     upper = code.strip().upper()
@@ -224,7 +248,7 @@ def validate_venue(value: str) -> str:
     upper = value.strip().upper()
     if not _MIC_FORMAT.match(upper):
         raise ValueError(f"invalid venue MIC: {upper!r} (expected 4 characters)")
-    if venue_info(upper) is None:
+    if venue_info(upper) is None and not _reading_stored_row.get():
         raise ValueError(
             f"unknown venue MIC: {upper!r} is not in the ISO 10383 snapshot; "
             "use the operating or segment MIC, or register_private_venue() for a "
@@ -252,7 +276,12 @@ def validate_currency(value: str) -> str:
         raise ValueError(f"invalid currency code: {upper!r}")
     if upper in NON_MONETARY_ISO_CODES:
         raise ValueError(f"{upper} is a non-monetary ISO 4217 code")
-    if is_iso_currency(upper) or upper in QUOTE_MINOR_UNITS or is_crypto_asset(upper):
+    if (
+        is_iso_currency(upper)
+        or upper in QUOTE_MINOR_UNITS
+        or is_crypto_asset(upper)
+        or _reading_stored_row.get()
+    ):
         return upper
     raise ValueError(
         f"unknown currency code: {upper!r} is not ISO 4217, a known quote unit, or a "
@@ -265,6 +294,7 @@ __all__ = [
     "QUOTE_MINOR_UNITS",
     "CurrencyInfo",
     "Venue",
+    "accepting_stored_codes",
     "currency_info",
     "is_crypto_asset",
     "is_iso_currency",

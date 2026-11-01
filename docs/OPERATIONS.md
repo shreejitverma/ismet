@@ -24,6 +24,8 @@ If the order manager is down, cancel at the venue directly, then reconcile on re
 3. If a position differs for an outside reason, such as a split or a transfer, record it: `ismet position adjust <TICKER@MIC> --journal "$JOURNAL" --delta <signed quantity> --reason "<why>" --operator "<you>"`.
    A running order manager adopts it on its next reconciliation, after verifying the hash chain, and ignores one with no operator.
    In code, `OrderManager.adjust_position` does the same.
+   A venue that is not a known MIC must already appear in the journal, because a record cannot be taken back and a manager could not parse a mistyped venue.
+   For a private venue the journal has never seen, use `OrderManager.adjust_position` in a process that registered it.
 4. Release under your own name: `ismet kill release --journal "$JOURNAL" --reason "<why>" --operator "<you>"`.
    A blank `--reason` or `--operator` is a usage error, and every reader ignores a journalled release that names no operator.
 
@@ -99,6 +101,8 @@ Also poll `OrderManager.stream_healthy` and `OrderManager.kill_state`.
 Market data reconnects retry forever by default, and each logs a WARNING on `ismet.transport.ws`.
 Pass `ws_on_state` to a provider to watch them, or `ws_max_reconnects` to fail instead.
 From configuration, set `ISMET_BINANCE_WS_MAX_RECONNECTS`, `ISMET_COINBASE_WS_MAX_RECONNECTS`, or the option of that name in the config file; `ws_on_state` takes a function, so it is available only when constructing a provider directly.
+On Binance, a rate limit hold of over 20 seconds raises `RateLimited` from a new stream or from one with `ws_max_reconnects`.
+Any other stream logs a WARNING with the remaining time and waits for the hold to end.
 A stream that silently stops delivering cannot be told apart from a quiet market, so periodic reconciliation (`reconcile_interval`, 30 seconds by default) is what bounds how long a missed report can go unnoticed.
 
 ## Journal care
@@ -108,10 +112,16 @@ A stream that silently stops delivering cannot be told apart from a quiet market
 - Back it up with the SQLite backup API or `ismet journal export`, not by copying a live file.
 - Never restore an older copy of a FIX store over the live one.
   An order missing from the store it was journalled under is treated as never sent, so a restored backup could close an order that is live at the venue.
-  After losing a FIX store, start from an empty one, which gets a new identity: orders journalled under the old store then stay `UNKNOWN`, on every restart, and new orders in that symbol stay refused.
-  Confirm each such order with the counterparty first, then call `await OrderManager.resolve_unknown(client_order_id, operator=..., reason=...)`, which closes it as not at the venue and is recorded in the journal.
-  It refuses a blank operator or reason, any order not `UNKNOWN`, and a journal that fails verification.
+  After losing a FIX store, start from an empty one, which gets a new identity: every open order journalled under the old store, working or not, is moved to `UNKNOWN` by the next reconciliation, stays there on every restart, and every new order in every symbol is refused meanwhile, because the venue cannot be queried about it.
+  Nothing closes or cancels such an order by itself, and `OrderManager.cancel` cannot reach it either, since the new store has no row to cancel under.
+  For each one, cancel it at the counterparty and confirm it is no longer working, then call `await OrderManager.resolve_unknown(client_order_id, operator=..., reason=...)`, which closes it as not at the venue and is recorded in the journal.
+  An order with no fills closes as `REJECTED`; one with fills closes as `CANCELED` and keeps them.
+  If it filled while the store was lost, those fills never reached ismet, so record them with `ismet position adjust`, or `position_mismatch` halts on a venue with a position query and goes unnoticed on one without.
+  `resolve_unknown` refuses a blank operator or reason, any order not `UNKNOWN`, and a journal that fails verification.
 - `ismet journal export "$JOURNAL" --out <new file>` refuses an existing file. `ismet.execution.journal.verify_jsonl` checks the hash chain of an export on its own.
+  Output with a `warning` field means the file is complete but its directory could not be synced, so a power cut may lose its name.
+- A record that cannot be read stops `ismet journal export` and `ismet journal orders`, which exit 1 with the error and the `chain` result.
+  An export writes nothing in that case, so back such a journal up with the SQLite backup API.
 - Copy `head_hash` from `ismet journal verify` to separate storage on a schedule, then check against it with `ismet journal verify "$JOURNAL" --expect-head "$SAVED"`.
   An empty value is a usage error, so an unset variable cannot skip the check.
 - Journal commands refuse a file that holds no journal table, so a mistyped path cannot look like a successful halt.
@@ -150,7 +160,7 @@ Apply them at startup in every process that uses the venue, including after each
 
 - Credentials are refused without `tls = true` in settings; a connection a stunnel or VPN protects needs a `FixSessionConfig` built directly, which chooses its own `ssl`.
 - A NewOrderSingle names the instrument by Symbol(55) alone, so the session decides where it trades: declare the MICs it serves with the `venues` option, or on a subclass, and an order for any other venue is refused before the wire.
-- An order whose process died after the order manager's `send_started` and before the FIX store's row closes as never sent on the next reconciliation, because the row is written before the socket, but only when the store is the one the order manager journalled with that `send_started`; a new or replaced store proves nothing, and neither does a journal written before identities were recorded, so the order stays unknown until an operator calls `OrderManager.resolve_unknown`.
+- An order whose process died after the order manager's `send_started` and before the FIX store's row closes as never sent on the next reconciliation, because the row is written before the socket, but only when the store is the one the order manager journalled with that `send_started`; a new or replaced store proves nothing, and neither does a journal written before identities were recorded, so the order is moved to `UNKNOWN` and stays there until an operator calls `OrderManager.resolve_unknown`, as described under Journal care.
 - `reset_on_logon` resets once per `FixSessionConfig.session_period`, by default the UTC date, and a reconnect within the period keeps its numbers.
   Set it and `session_period` to match the venue's daily reset.
   Otherwise the venue's reset arrives unrequested and halts the stream until released.

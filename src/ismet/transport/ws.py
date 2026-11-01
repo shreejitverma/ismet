@@ -28,10 +28,13 @@ and stats and an emptied queue; the queue object itself never changes, so a
 consumer already waiting in ``messages`` keeps receiving across restarts.
 
 ``before_connect`` runs before every handshake, whether or not the handshake then
-succeeds, so a provider can charge a connection budget there. A 429 rejection waits
-at least its ``Retry-After``. Under a dropping policy only data messages are dropped:
-a message ``is_data`` rejects, such as a venue's refusal, evicts the oldest instead,
-and the first drop is logged at WARNING. ``stats.dropped`` counts every message lost.
+succeeds, so a provider can charge a connection budget there. ``on_rejected`` sees the
+status, body and lower-cased headers of each refused handshake, and an error it returns
+ends the stream with that error. A 429 rejection waits at least its ``Retry-After``.
+Under a dropping policy only data messages are dropped: a message ``is_data`` rejects,
+such as a venue's refusal, evicts the oldest instead, and the first drop is logged at
+WARNING. ``stats.dropped`` counts every message lost, and :meth:`lost_before` says where
+in the delivered order a loss belongs.
 """
 
 from __future__ import annotations
@@ -40,7 +43,7 @@ import asyncio
 import contextlib
 import json
 import logging
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
@@ -49,7 +52,7 @@ from typing import Any
 import websockets
 from websockets.asyncio.client import ClientConnection, connect
 
-from ismet.errors import AuthError, IsmetError, TransportError
+from ismet.errors import AuthError, IsmetError, RateLimited, TransportError
 from ismet.transport.backoff import ExponentialBackoff
 from ismet.transport.http import retry_after_seconds
 
@@ -81,6 +84,7 @@ class WsStats:
     reconnects: int = 0
     received: int = 0
     dropped: int = 0
+    evicted: int = 0
     sent: int = 0
 
     def reset(self) -> None:
@@ -89,6 +93,7 @@ class WsStats:
         self.reconnects = 0
         self.received = 0
         self.dropped = 0
+        self.evicted = 0
         self.sent = 0
 
 
@@ -101,6 +106,7 @@ _CLOSED = _Closed()
 OnConnect = Callable[["WebSocketTransport"], Awaitable[None]]
 OnState = Callable[[ConnectionState], None]
 BeforeConnect = Callable[[], Awaitable[None]]
+OnRejected = Callable[[int, bytes, Mapping[str, str]], IsmetError | None]
 
 
 class SequenceOutcome(str, Enum):
@@ -214,6 +220,7 @@ class WebSocketTransport:
         on_connect: OnConnect | None = None,
         on_state: OnState | None = None,
         before_connect: BeforeConnect | None = None,
+        on_rejected: OnRejected | None = None,
         backoff: ExponentialBackoff = DEFAULT_WS_BACKOFF,
         max_reconnects: int | None = None,
         heartbeat_interval: float | None = 20.0,
@@ -230,6 +237,7 @@ class WebSocketTransport:
         self._on_connect = on_connect
         self._on_state = on_state
         self._before_connect = before_connect
+        self._on_rejected = on_rejected
         self._backoff = backoff
         self._max_reconnects = max_reconnects
         self._heartbeat_interval = heartbeat_interval
@@ -245,6 +253,8 @@ class WebSocketTransport:
         self._stop = asyncio.Event()
         self._failure: IsmetError | None = None
         self._last_error: BaseException | None = None
+        self._told_dropped = 0
+        self._told_evicted = 0
 
     def _set_state(self, state: ConnectionState) -> None:
         self.state = state
@@ -277,6 +287,7 @@ class WebSocketTransport:
         self._failure = None
         self._last_error = None
         self.stats.reset()
+        self._told_dropped = self._told_evicted = 0
         self._drain_queue()
         self._task = asyncio.create_task(self._run(), name=f"ismet-ws:{self.url}")
         if not wait_connected:
@@ -356,6 +367,7 @@ class WebSocketTransport:
                 with contextlib.suppress(asyncio.QueueEmpty):
                     self._queue.get_nowait()
                     self._count_drop()
+                    self.stats.evicted += 1
             try:
                 self._queue.put_nowait(item)
                 return True
@@ -369,6 +381,23 @@ class WebSocketTransport:
                 self._queue.get_nowait()
                 self._count_drop()
         self._queue.put_nowait(item)
+        return True
+
+    def lost_before(self, stamped: int) -> bool:
+        """Whether a message was lost ahead of this one, and not yet reported.
+
+        ``stamped`` is ``stats.dropped`` read when this message was decoded. Call once
+        per message, in delivery order. A newest-dropping queue discards only what
+        arrives after everything queued, so the stamp places the loss exactly, unless a
+        message was evicted from the front: then what is left of the queue follows it.
+        """
+        evicted = self.stats.evicted != self._told_evicted
+        self._told_evicted = self.stats.evicted
+        newest_only = self._policy is BackpressurePolicy.DROP_NEWEST and not evicted
+        dropped = stamped if newest_only else self.stats.dropped
+        if dropped <= self._told_dropped:
+            return False
+        self._told_dropped = dropped
         return True
 
     def _count_drop(self) -> None:
@@ -408,9 +437,27 @@ class WebSocketTransport:
         return failure
 
     @staticmethod
-    def _stated_wait(exc: websockets.exceptions.InvalidStatus) -> float:
-        headers = {name.lower(): v for name, v in exc.response.headers.raw_items()}
-        return retry_after_seconds(headers) or 0.0
+    def _headers(exc: websockets.exceptions.InvalidStatus) -> dict[str, str]:
+        return {name.lower(): v for name, v in exc.response.headers.raw_items()}
+
+    def _stated_wait(self, exc: websockets.exceptions.InvalidStatus) -> float:
+        return retry_after_seconds(self._headers(exc)) or 0.0
+
+    def _rejected(self, exc: websockets.exceptions.InvalidStatus) -> IsmetError | None:
+        if self._on_rejected is None:
+            return None
+        try:
+            verdict = self._on_rejected(
+                exc.response.status_code,
+                bytes(exc.response.body or b""),
+                self._headers(exc),
+            )
+        except Exception:
+            logger.exception("on_rejected hook failed")
+            return None
+        if verdict is not None:
+            verdict.__cause__ = exc
+        return verdict
 
     async def _run(self) -> None:
         attempt = 0
@@ -455,7 +502,7 @@ class WebSocketTransport:
                 fatal.__cause__ = exc
             except websockets.exceptions.InvalidStatus as exc:
                 self._last_error = exc
-                fatal = self._handshake_failure(exc)
+                fatal = self._rejected(exc) or self._handshake_failure(exc)
                 if fatal is None:
                     reason = exc
                     stated_wait = self._stated_wait(exc)
@@ -467,6 +514,10 @@ class WebSocketTransport:
             ) as exc:
                 self._last_error = exc
                 reason = exc
+            except RateLimited as exc:
+                fatal = (
+                    exc  # before_connect refusing to wait; more attempts cannot help
+                )
             except TransportError as exc:
                 if exc.retryable:
                     self._last_error = exc
@@ -511,6 +562,7 @@ __all__ = [
     "BackpressurePolicy",
     "BeforeConnect",
     "ConnectionState",
+    "OnRejected",
     "OnState",
     "SequenceObservation",
     "SequenceOutcome",

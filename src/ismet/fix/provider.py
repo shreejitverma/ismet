@@ -1591,7 +1591,6 @@ class FixProvider(Provider):
         cid = request.client_order_id
         self._check_supported(request)
         self._session.require_ready()
-        await self._refuse_while_halted()
         record = _Record(
             client_order_id=cid,
             symbol=request.symbol,
@@ -1619,9 +1618,12 @@ class FixProvider(Provider):
             self._store.put_order(cid, payload)
             self._store.link_wire_id(cid, cid)
 
-        # The duplicate check and the row are one step under the lock, so two callers
-        # racing on one id cannot both pass the check.
+        # The halt check, the duplicate check and the row are one step under the lock:
+        # two callers racing on one id cannot both pass the check, and a cancel for
+        # this id cannot look for the row while the halt check holds the send back,
+        # which would refuse the cancel and then let the order go out.
         async with self._records_lock:
+            await self._refuse_while_halted()
             if await self._lookup(cid) is not None:
                 raise DuplicateOrderId(
                     f"client order id {cid} was already sent on this session; "

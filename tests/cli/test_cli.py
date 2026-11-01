@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -22,6 +23,7 @@ import pytest
 from ismet.cli import main
 from ismet.cli.toon import encode, scalar
 from ismet.execution import RecordKind, SqliteJournal
+from ismet.execution.journal import verify_jsonl
 from ismet.models import Symbol
 from ismet.models.orders import (
     OrderRequest,
@@ -1093,7 +1095,9 @@ def test_export_is_on_disk_before_it_takes_its_name(
     monkeypatch.setattr(os, "fsync", spy_fsync)
     monkeypatch.setattr(os, "link", spy_link)
     code, _ = run(capsys, "journal", "export", str(path), "--out", str(out_path))
-    assert code == 0 and steps[-3:] == ["fsync", "link", "fsync"]
+    assert code == 0 and steps[:2] == ["fsync", "link"]
+    # Windows cannot sync a directory, so the name's own fsync is POSIX only.
+    assert steps[2:] == ([] if os.name == "nt" else ["fsync"])
     assert [p.name for p in tmp_path.glob(".out.jsonl.*")] == []
 
 
@@ -1167,3 +1171,240 @@ def test_bars_show_flags_and_adjustment(capsys, monkeypatch) -> None:  # type: i
     monkeypatch.setenv("ISMET_PROVIDERS", "mock")
     code, out = run(capsys, "bars", "ACME@XMOK")
     assert code == 0 and "outlier" in out and "split" in out
+
+
+def _no_hard_links(*args: Any, **kw: Any) -> None:
+    raise OSError(errno.ENOTSUP, "this filesystem has no hard links")
+
+
+def test_export_works_on_a_filesystem_without_hard_links(
+    capsys, tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    path = tmp_path / "j.db"
+    _journal_with_order(path)
+    target = tmp_path / "out.jsonl"
+    monkeypatch.setattr(os, "link", _no_hard_links)
+    code, out = run(capsys, "journal", "export", str(path), "--out", str(target))
+    assert code == 0 and "exported: 2" in out
+    assert verify_jsonl(target.read_text("utf-8").splitlines()).records == 2
+    assert [p.name for p in tmp_path.glob(".out.jsonl.*")] == []
+
+
+def test_export_without_hard_links_still_never_replaces_a_file(
+    capsys, tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    import ismet.cli as cli
+
+    path = tmp_path / "j.db"
+    _journal_with_order(path)
+    target = tmp_path / "out.jsonl"
+    real = cli.export_jsonl
+
+    def racing(journal: object, stream: object) -> int:
+        target.write_text("someone else's audit file", encoding="utf-8")
+        return real(journal, stream)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(cli, "export_jsonl", racing)
+    monkeypatch.setattr(os, "link", _no_hard_links)
+    code, out = run(capsys, "journal", "export", str(path), "--out", str(target))
+    assert code == 1 and "already exists" in out
+    assert target.read_text("utf-8") == "someone else's audit file"
+    assert [p.name for p in tmp_path.glob(".out.jsonl.*")] == []
+
+
+def test_export_failing_to_take_its_name_leaves_nothing_behind(
+    capsys, tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    path = tmp_path / "j.db"
+    _journal_with_order(path)
+    target = tmp_path / "out.jsonl"
+
+    def no_rename(*args: Any, **kw: Any) -> None:
+        raise OSError(errno.EIO, "disk error")
+
+    monkeypatch.setattr(os, "link", _no_hard_links)
+    monkeypatch.setattr(Path, "replace", no_rename)
+    code, out = run(capsys, "journal", "export", str(path), "--out", str(target))
+    assert code == 1 and "chain: intact" in out
+    assert not target.exists()
+    assert [p.name for p in tmp_path.glob(".out.jsonl.*")] == []
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+    reason="needs POSIX directory permissions, which root ignores",
+)
+def test_an_export_whose_directory_cannot_be_synced_says_so(
+    capsys, tmp_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    path = tmp_path / "j.db"
+    _journal_with_order(path)
+    write_only = tmp_path / "drop"
+    write_only.mkdir()
+    write_only.chmod(0o300)
+    target = write_only / "out.jsonl"
+    try:
+        code, out = run(capsys, "journal", "export", str(path), "--out", str(target))
+        assert code == 0 and "exported: 2" in out and "warning:" in out
+        assert verify_jsonl(target.read_text("utf-8").splitlines()).records == 2
+        code, out = run(capsys, "journal", "export", str(path), "--out", str(target))
+        assert code == 1 and "already exists" in out
+    finally:
+        write_only.chmod(0o700)
+
+
+def _corrupt(path: Path, column: str, value: str) -> None:
+    connection = sqlite3.connect(path)
+    connection.execute("DROP TRIGGER journal_no_update")
+    connection.execute(f"UPDATE journal SET {column} = ? WHERE seq = 2", (value,))
+    connection.commit()
+    connection.close()
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [("payload", "{bad"), ("kind", "junk"), ("ts", "nope")],
+)
+@pytest.mark.parametrize("action", ["orders", "export"])
+def test_an_unreadable_row_does_not_cost_the_chain_result(
+    capsys, tmp_path: Path, column: str, value: str, action: str
+) -> None:  # type: ignore[no-untyped-def]
+    path = tmp_path / "j.db"
+    _journal_with_order(path)
+    _corrupt(path, column, value)
+    target = tmp_path / "out.jsonl"
+    extra = ("--out", str(target)) if action == "export" else ()
+    code, out = run(capsys, "journal", action, str(path), *extra)
+    assert code == 1
+    assert 'chain: "broken at record 2' in out
+    assert "error:" in out and "tampered" in out
+    assert "doctor" not in out
+    assert not target.exists()
+
+
+def test_a_journal_error_on_a_write_points_at_the_journal_not_the_config(
+    capsys, tmp_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    path = str(tmp_path / "j.db")
+    broken_journal(path, (RecordKind.KILL_ENGAGED, KILLED))
+    for args in (
+        ("kill", "release", "--journal", path, *WHO),
+        (
+            "position",
+            "adjust",
+            "ACME@XNYS",
+            "--journal",
+            path,
+            "--delta",
+            "1",
+            *WHO,
+        ),
+    ):
+        code, out = run(capsys, *args)
+        assert code == 1 and "tampered" in out and "doctor" not in out
+
+
+def _in_fresh_process(script: str, *args: str) -> str:
+    """Run in a new interpreter, whose process-wide code registries start empty."""
+    done = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script), *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    return done.stdout
+
+
+def _cli_in_fresh_process(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-m", "ismet", *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+JOURNAL_ON_A_PRIVATE_VENUE = """
+    import sys
+    from datetime import datetime, timezone
+    from ismet.execution import RecordKind, SqliteJournal
+    from ismet.models import Symbol
+    from ismet.models.orders import (
+        OrderRequest, OrderSide, SubmitIntent, dump_order_event
+    )
+    from ismet.refdata.codes import register_private_venue
+
+    register_private_venue("ZABC", "A private venue")
+    journal = SqliteJournal(sys.argv[1])
+    journal.append(RecordKind.POSITION_BASELINE, "{}")
+    event = SubmitIntent(
+        client_order_id="C1",
+        ts=datetime(2026, 3, 9, tzinfo=timezone.utc),
+        request=OrderRequest(
+            client_order_id="C1",
+            symbol=Symbol(venue="ZABC", ticker="ACME"),
+            side=OrderSide.BUY,
+            quantity="10",
+            limit_price="1",
+        ),
+    )
+    journal.append(
+        RecordKind.ORDER_EVENT, dump_order_event(event), client_order_id="C1"
+    )
+    journal.close()
+"""
+
+
+def test_a_new_process_reads_orders_on_a_venue_it_never_registered(
+    tmp_path: Path,
+) -> None:
+    path = str(tmp_path / "j.db")
+    _in_fresh_process(JOURNAL_ON_A_PRIVATE_VENUE, path)
+    done = _cli_in_fresh_process("journal", "orders", path)
+    assert done.returncode == 0, done.stdout
+    assert "C1,ACME@ZABC" in done.stdout and "chain: intact" in done.stdout
+
+
+def test_a_new_process_can_adjust_a_position_on_a_venue_in_the_journal(
+    tmp_path: Path,
+) -> None:
+    path = str(tmp_path / "j.db")
+    _in_fresh_process(JOURNAL_ON_A_PRIVATE_VENUE, path)
+    done = _cli_in_fresh_process(
+        "position", "adjust", "ACME@ZABC", "--journal", path, "--delta", "5", *WHO
+    )
+    assert done.returncode == 0, done.stdout
+    assert "adjusted: ACME@ZABC" in done.stdout
+    journal = SqliteJournal(path)
+    last = list(journal.records())[-1]
+    journal.close()
+    assert last.kind is RecordKind.POSITION_ADJUSTED
+    assert json.loads(last.payload)["symbol"] == "ACME@ZABC"
+
+
+def test_a_mistyped_venue_cannot_be_written_into_the_journal(tmp_path: Path) -> None:
+    """A manager could not read it back, and a journal cannot lose a record."""
+    path = str(tmp_path / "j.db")
+    _in_fresh_process(JOURNAL_ON_A_PRIVATE_VENUE, path)
+    done = _cli_in_fresh_process(
+        "position", "adjust", "ACME@ZABD", "--journal", path, "--delta", "5", *WHO
+    )
+    assert done.returncode == 1 and "ZABD" in done.stdout
+    journal = SqliteJournal(path)
+    kinds = [r.kind for r in journal.records()]
+    journal.close()
+    assert RecordKind.POSITION_ADJUSTED not in kinds
+
+
+def test_a_venue_named_only_by_the_baseline_can_be_adjusted(tmp_path: Path) -> None:
+    path = tmp_path / "j.db"
+    journal = SqliteJournal(path)
+    journal.append(
+        RecordKind.POSITION_BASELINE, json.dumps({"ACME@ZABC": {"quantity": "1"}})
+    )
+    journal.close()
+    done = _cli_in_fresh_process(
+        "position", "adjust", "ACME@ZABC", "--journal", str(path), "--delta", "5", *WHO
+    )
+    assert done.returncode == 0, done.stdout

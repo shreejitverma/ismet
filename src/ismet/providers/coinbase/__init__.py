@@ -426,8 +426,6 @@ class CoinbaseProvider(Provider):
         )
         gate = StreamGate(contiguous=contiguous)
         seen_generation = 1
-        seen_dropped = 0
-        newest_drop = self._ws_backpressure is BackpressurePolicy.DROP_NEWEST
         self._streams.add(ws)
         try:
             await ws.start()
@@ -437,9 +435,9 @@ class CoinbaseProvider(Provider):
                 dropped_before,
                 frame,
             ) in ws.messages():
-                dropped = dropped_before if newest_drop else ws.stats.dropped
-                if frame_generation != seen_generation or dropped != seen_dropped:
-                    seen_generation, seen_dropped = frame_generation, dropped
+                lost = ws.lost_before(dropped_before)
+                if frame_generation != seen_generation or lost:
+                    seen_generation = frame_generation
                     gate.mark_reconnected()
                 kind = frame.get("type")
                 if kind not in data_types:

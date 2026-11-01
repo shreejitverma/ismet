@@ -50,6 +50,9 @@ Rules callers depend on that are easy to miss in the API reference.
 - A Coinbase `/book` response with no `time` raises rather than looking fresh.
 - A Binance 418 ban or a 429 with `Retry-After` is remembered, and requests are refused locally until the wait ends.
   A ban lasts at least 2 minutes, whatever the response or the host clock says.
+- A 429 or 418 answering a Binance stream handshake sets the same hold for requests and for other streams.
+  Whether Binance answers handshakes this way has not been checked.
+- A Binance hold of over 20 seconds raises `RateLimited` from a new stream or from one with `ws_max_reconnects`, and any other stream logs a WARNING with the remaining time and waits.
 
 ## Reference data
 
@@ -61,7 +64,10 @@ Rules callers depend on that are easy to miss in the API reference.
 ## Storage and export
 
 - `BarStore.read` and `checksum` with no `as_of` apply no knowledge cutoff.
-- `backfill` raises when `start >= end`.
+- `backfill` raises when `start >= end`, or when `window` is shorter than the interval's longest period, since such a window could hold no bar and never finish.
+- `backfill` defaults to a 30 day window, 31 for monthly bars, and a tail shorter than one period joins the window before it.
+- A progress write that fails, or a stored row that no longer parses, counts as that window's failure, and the remaining windows still run.
+- A stored row needs its venue and currency well formed, not registered in the reading process, so `BarStore.read` and `ismet journal orders` work in a process that never called `register_private_venue` or `register_crypto_asset`.
 - `BackfillReport` gained `windows_incomplete` and `sessions_missing`.
 - Reformatting a price is not a revision, so existing stored bars with trailing zeros write one spurious revision after upgrading.
 - `to_records` and dataframes gained `timeliness`, and carry `quality` and `source`.

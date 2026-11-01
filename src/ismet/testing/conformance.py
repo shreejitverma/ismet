@@ -35,10 +35,13 @@ MAX_PLAUSIBLE_CLOCK_SKEW = timedelta(seconds=5)
 
 @dataclass(frozen=True)
 class Check:
+    """One result. A ``skipped`` check could not run and passes by default."""
+
     capability: Capability | None
     name: str
     passed: bool
     detail: str = ""
+    skipped: bool = False
 
 
 @dataclass
@@ -55,11 +58,15 @@ class ConformanceReport:
     def failures(self) -> list[Check]:
         return [c for c in self.checks if not c.passed]
 
+    @property
+    def skipped(self) -> list[Check]:
+        return [c for c in self.checks if c.skipped]
+
     def summary(self) -> str:
         lines = [f"{self.provider}: {'PASS' if self.passed else 'FAIL'}"]
         for c in self.checks:
             scope = c.capability.value if c.capability else "core"
-            mark = "ok " if c.passed else "FAIL"
+            mark = "skip" if c.skipped else "ok " if c.passed else "FAIL"
             lines.append(
                 f"  [{mark}] {scope}.{c.name}" + (f": {c.detail}" if c.detail else "")
             )
@@ -291,6 +298,9 @@ async def _check_stream(
     except Exception as exc:
         return Check(Capability.STREAMING, name, False, f"{type(exc).__name__}: {exc}")
     problems = [p for e in received for p in _event_invariants(e, instrument)]
+    if len(received) < wanted:
+        # A stream that ends on its own has not shown it delivers.
+        problems.append(f"stream ended after {len(received)} of {wanted} messages")
     seqs = [e.sequence for e in received if e.sequence is not None]
     if seqs and seqs != sorted(seqs):
         problems.append("sequence numbers not monotonic")

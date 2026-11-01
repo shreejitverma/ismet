@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import sqlite3
 import subprocess
 import sys
 import textwrap
@@ -1006,3 +1007,313 @@ def test_a_concurrent_restatement_is_not_rolled_back(
         got = store.read(SYM, Interval.D1, DAY, DAY + timedelta(days=1))
     assert [b.close for b in got] == [D("10.8")]
     assert got[0].revision == 2
+
+
+def _month_starts(start: datetime, end: datetime) -> list[datetime]:
+    moment = datetime(start.year, start.month, 1, tzinfo=UTC)
+    found = []
+    while moment < end:
+        if moment >= start:
+            found.append(moment)
+        moment = datetime(
+            moment.year + moment.month // 12, moment.month % 12 + 1, 1, tzinfo=UTC
+        )
+    return found
+
+
+def _monthly_vendor(calls: list[datetime]):  # type: ignore[no-untyped-def]
+    async def fetch(symbol, interval, start, end):  # type: ignore[no-untyped-def]
+        calls.append(start)
+        return [bar(ts, interval=Interval.MO1) for ts in _month_starts(start, end)]
+
+    return fetch
+
+
+async def test_a_monthly_backfill_with_the_default_window_completes(
+    store: BarStore,
+) -> None:
+    calls: list[datetime] = []
+    span = (
+        _monthly_vendor(calls),
+        store,
+        SYM,
+        Interval.MO1,
+        datetime(2025, 11, 2, tzinfo=UTC),
+        datetime(2026, 3, 1, tzinfo=UTC),
+    )
+    first = await backfill(*span)
+    assert first.complete and first.windows_empty_unproven == 0
+    # December, January and February: March 1 is outside the half-open range.
+    assert first.bars_inserted == 3
+    calls.clear()
+    second = await backfill(*span)
+    assert second.complete and calls == []
+
+
+async def test_a_backfill_ending_mid_period_does_not_stay_open_forever(
+    store: BarStore,
+) -> None:
+    calls: list[datetime] = []
+
+    async def fetch(symbol, interval, start, end):  # type: ignore[no-untyped-def]
+        calls.append(start)
+        # Hourly bars on the hour.
+        first = start.replace(minute=0, second=0, microsecond=0)
+        if first < start:
+            first += timedelta(hours=1)
+        hours = []
+        while first < end:
+            hours.append(bar(first, interval=Interval.H1))
+            first += timedelta(hours=1)
+        return hours
+
+    # Three one-hour windows would leave 02:10 to 02:15, which holds no hourly bar.
+    begin = datetime(2026, 3, 9, 0, 10, tzinfo=UTC)
+    span = (fetch, store, SYM, Interval.H1, begin, begin + timedelta(minutes=125))
+    first = await backfill(*span, window=timedelta(hours=1))
+    assert first.complete and first.bars_inserted == 2
+    calls.clear()
+    assert (await backfill(*span, window=timedelta(hours=1))).complete and calls == []
+
+
+@pytest.mark.parametrize(
+    ("interval", "window"),
+    [
+        (Interval.MO1, timedelta(days=30)),
+        (Interval.W1, timedelta(days=6)),
+        (Interval.H1, timedelta(minutes=59)),
+    ],
+)
+async def test_a_window_that_can_miss_every_bar_is_refused(
+    store: BarStore, interval: Interval, window: timedelta
+) -> None:
+    async def fetch(symbol, interval, start, end):  # type: ignore[no-untyped-def]
+        raise AssertionError("nothing should be fetched")
+
+    begin = datetime(2026, 1, 1, tzinfo=UTC)
+    with pytest.raises(ValidationError, match="window"):
+        await backfill(
+            fetch,
+            store,
+            SYM,
+            interval,
+            begin,
+            begin + timedelta(days=400),
+            window=window,
+        )
+
+
+async def test_a_refused_progress_write_counts_as_that_windows_failure(
+    store: BarStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[datetime] = []
+
+    async def fetch(symbol, interval, start, end):  # type: ignore[no-untyped-def]
+        calls.append(start)
+        return [bar(start)]
+
+    real = store.mark_window_done
+    armed = {"locked": True}
+
+    def locked_once(*args):  # type: ignore[no-untyped-def]
+        if armed["locked"]:
+            armed["locked"] = False
+            raise sqlite3.OperationalError("database is locked")
+        real(*args)
+
+    monkeypatch.setattr(store, "mark_window_done", locked_once)
+    span = (fetch, store, SYM, Interval.D1, DAY, DAY + timedelta(days=2))
+    first = await backfill(*span, window=timedelta(days=1))
+    assert calls == [DAY, DAY + timedelta(days=1)]  # the second window still ran
+    assert first.windows_failed == 1 and first.windows_fetched == 1
+    assert first.bars_inserted == 2 and not first.complete
+    assert "locked" in first.failures[0][1]
+    second = await backfill(*span, window=timedelta(days=1))
+    assert second.complete and second.windows_skipped == 1
+
+
+async def test_bars_written_before_a_later_failure_are_still_accounted_for(
+    store: BarStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def fetch(symbol, interval, start, end):  # type: ignore[no-untyped-def]
+        return [bar(start)]
+
+    def locked(*args):  # type: ignore[no-untyped-def]
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "mark_window_done", locked)
+    report = await backfill(
+        fetch, store, SYM, Interval.D1, DAY, DAY + timedelta(days=1)
+    )
+    assert report.bars_fetched == 1 and report.bars_inserted == 1
+    assert len(store.read(SYM, Interval.D1, DAY, DAY + timedelta(days=1))) == 1
+
+
+async def test_a_corrupt_stored_row_fails_its_window_and_the_rest_continue(
+    store: BarStore,
+) -> None:
+    store.write([bar(DAY)])
+    connection = sqlite3.connect(store.path)
+    connection.execute("UPDATE bars SET payload = '{bad'")
+    connection.commit()
+    connection.close()
+    calls: list[datetime] = []
+
+    async def fetch(symbol, interval, start, end):  # type: ignore[no-untyped-def]
+        calls.append(start)
+        return [bar(start)]
+
+    report = await backfill(
+        fetch,
+        store,
+        SYM,
+        Interval.D1,
+        DAY,
+        DAY + timedelta(days=2),
+        window=timedelta(days=1),
+    )
+    assert calls == [DAY, DAY + timedelta(days=1)]
+    assert report.windows_failed == 1 and report.windows_fetched == 1
+
+
+def _in_fresh_process(script: str, *args: str) -> str:
+    """Run in a new interpreter, whose process-wide code registries start empty."""
+    done = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script), *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    return done.stdout
+
+
+WRITE_PRIVATE_CODES = """
+    import sys
+    from datetime import datetime, timezone
+    from decimal import Decimal
+    from ismet.models import Adjustment, Bar, Interval, Symbol
+    from ismet.refdata import register_crypto_asset
+    from ismet.refdata.codes import register_private_venue
+    from ismet.store import BarStore
+
+    register_crypto_asset("WIF")
+    register_private_venue("ZABC", "A private venue")
+    ts = datetime(2026, 3, 9, 14, 30, tzinfo=timezone.utc)
+    bars = [
+        Bar(
+            symbol=Symbol(venue=venue, ticker="ACME"), exchange_ts=ts, received_ts=ts,
+            interval=Interval.D1, open=Decimal("1.5"), high=Decimal("1.5"),
+            low=Decimal("1.5"), close=Decimal("1.5"), volume=Decimal(1), currency="WIF",
+            adjustment=Adjustment.RAW,
+        )
+        for venue in ("XNYS", "ZABC")
+    ]
+    with BarStore(sys.argv[1]) as store:
+        store.write(bars)
+"""
+
+
+def test_a_bar_with_a_registered_currency_reads_in_a_new_process(
+    tmp_path: Path,
+) -> None:
+    path = str(tmp_path / "bars.db")
+    _in_fresh_process(WRITE_PRIVATE_CODES, path)
+    out = _in_fresh_process(
+        """
+        import sys
+        from datetime import datetime, timezone
+        from ismet.models import Interval, Symbol
+        from ismet.store import BarStore
+
+        begin = datetime(2026, 3, 9, tzinfo=timezone.utc)
+        end = datetime(2026, 3, 10, tzinfo=timezone.utc)
+        with BarStore(sys.argv[1]) as store:
+            symbol = Symbol(venue="XNYS", ticker="ACME")
+            bars = store.read(symbol, Interval.D1, begin, end)
+        print(bars[0].currency, bars[0].close)
+        """,
+        path,
+    )
+    assert out.split() == ["WIF", "1.5"]
+
+
+def test_a_new_process_can_write_over_a_bar_with_a_registered_currency(
+    tmp_path: Path,
+) -> None:
+    path = str(tmp_path / "bars.db")
+    _in_fresh_process(WRITE_PRIVATE_CODES, path)
+    out = _in_fresh_process(
+        """
+        import sys
+        from datetime import datetime, timezone
+        from decimal import Decimal
+        from ismet.models import Adjustment, Bar, Interval, Symbol
+        from ismet.refdata import register_crypto_asset
+        from ismet.store import BarStore
+
+        ts = datetime(2026, 3, 9, 14, 30, tzinfo=timezone.utc)
+        register_crypto_asset("OTHER")
+        same_slot = Bar(
+            symbol=Symbol(venue="XNYS", ticker="ACME"), exchange_ts=ts, received_ts=ts,
+            interval=Interval.D1, open=Decimal(2), high=Decimal(2), low=Decimal(2),
+            close=Decimal(2), volume=Decimal(1), currency="OTHER",
+            adjustment=Adjustment.RAW,
+        )
+        with BarStore(sys.argv[1]) as store:
+            print(store.write([same_slot]).revised)
+        """,
+        path,
+    )
+    assert out.strip() == "1"
+
+
+def test_adjusting_stored_bars_works_in_a_new_process(tmp_path: Path) -> None:
+    path = str(tmp_path / "bars.db")
+    _in_fresh_process(WRITE_PRIVATE_CODES, path)
+    out = _in_fresh_process(
+        """
+        import sys
+        from datetime import date, datetime, timezone
+        from decimal import Decimal
+        from ismet.calendars import get_calendar
+        from ismet.models import Interval, Symbol
+        from ismet.refdata.master import ActionKind, CorporateAction, adjust_bars
+        from ismet.store import BarStore
+
+        symbol = Symbol(venue="XNYS", ticker="ACME")
+        begin = datetime(2026, 3, 9, tzinfo=timezone.utc)
+        end = datetime(2026, 3, 10, tzinfo=timezone.utc)
+        with BarStore(sys.argv[1]) as store:
+            bars = store.read(symbol, Interval.D1, begin, end)
+        split = CorporateAction(
+            kind=ActionKind.SPLIT, ex_date=date(2026, 3, 11), ratio=Decimal(3)
+        )
+        adjusted = adjust_bars(bars, [split], calendar=get_calendar("XNYS"))
+        print(adjusted[0].close, adjusted[0].currency)
+        """,
+        path,
+    )
+    assert out.split() == ["0.5", "WIF"]
+
+
+def test_a_stored_code_of_the_wrong_shape_is_still_refused(store: BarStore) -> None:
+    store.write([bar(DAY, currency="USD")])
+    connection = sqlite3.connect(store.path)
+    rows = connection.execute("SELECT payload FROM bars").fetchall()
+    tampered = rows[0][0].replace('"currency":"USD"', '"currency":"NOT A CODE"')
+    assert tampered != rows[0][0]
+    connection.execute("UPDATE bars SET payload = ?", (tampered,))
+    connection.commit()
+    connection.close()
+    with pytest.raises(ValueError, match="currency"):
+        store.read(SYM, Interval.D1, DAY, DAY + timedelta(days=1))
+
+
+def test_code_checks_are_back_on_after_reading_stored_rows(store: BarStore) -> None:
+    store.write([bar(DAY)])
+    store.read(SYM, Interval.D1, DAY, DAY + timedelta(days=1))
+    with pytest.raises(ValueError, match="unknown venue"):
+        Symbol(venue="ZZZY", ticker="ACME")
+    with pytest.raises(ValueError, match="unknown currency"):
+        bar(DAY, currency="NOTREGISTERED")

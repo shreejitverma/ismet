@@ -1236,15 +1236,26 @@ class OrderManager:
 
         A provider's missing send record means never sent only if the send was
         journalled under the records it looked in. Anything else proves nothing, so it
-        raises.
+        raises, and an order still open becomes ``UNKNOWN`` first: no query can settle
+        it, and that status is where :meth:`resolve_unknown` applies.
         """
         try:
             return await self._venue.order_status(cid, symbol)
-        except NoSendRecord:
-            journalled = self._orders[cid].send_record_id
-            if journalled is None or journalled != self._send_record_id():
-                raise
-            return None
+        except NoSendRecord as exc:
+            state = self._orders[cid]
+            journalled = state.send_record_id
+            if journalled is not None and journalled == self._send_record_id():
+                return None
+            if state.is_open and state.status is not OrderStatus.UNKNOWN:
+                await self._record(
+                    OutcomeUnknown(
+                        client_order_id=cid,
+                        ts=self._clock.now(),
+                        reason=f"no send record under the current store: {exc}",
+                    ),
+                    only_if=state,
+                )
+            raise
 
     async def _place(self, request: OrderRequest) -> OrderState:
         cid = request.client_order_id
@@ -1551,7 +1562,9 @@ class OrderManager:
 
         For an order no query can settle, such as one whose FIX store was lost. Confirm
         with the counterparty first: a venue that does hold the order then has live
-        exposure ismet no longer counts. Journalled, and refused on a broken chain.
+        exposure ismet no longer counts. An order with no fills closes as ``REJECTED``;
+        one with fills closes as ``CANCELED`` and keeps them, so the position they made
+        stays counted. Journalled, and refused on a broken chain.
         """
         self._require_started()
         if not operator.strip() or not reason.strip():
@@ -1569,20 +1582,34 @@ class OrderManager:
             raise OrderStateError(
                 f"cannot resolve {client_order_id} in {state.status.value}"
             )
+        resolution = f"resolved by {operator}: {reason}"
+        changed = OrderStateError(f"{client_order_id} changed meanwhile")
+        if state.filled_quantity == 0:
+            resolved = await self._record(
+                Rejected(
+                    client_order_id=client_order_id,
+                    ts=self._clock.now(),
+                    reason=resolution,
+                    code="RESOLVED_BY_OPERATOR",
+                ),
+                durable=True,
+                only_if=state,
+            )
+            if resolved.reject_code != "RESOLVED_BY_OPERATOR":
+                raise changed
+            return resolved
         resolved = await self._record(
-            Rejected(
+            Restated(
                 client_order_id=client_order_id,
                 ts=self._clock.now(),
-                reason=f"resolved by {operator}: {reason}",
-                code="RESOLVED_BY_OPERATOR",
+                status=OrderStatus.CANCELED,
+                reason=resolution,
             ),
             durable=True,
             only_if=state,
         )
-        if resolved.reject_code != "RESOLVED_BY_OPERATOR":
-            raise OrderStateError(
-                f"{client_order_id} changed to {resolved.status.value} meanwhile"
-            )
+        if resolved.status is not OrderStatus.CANCELED:
+            raise changed
         return resolved
 
     async def update_risk_config(self, config: RiskConfig, *, operator: str) -> None:
@@ -1614,7 +1641,10 @@ class OrderManager:
                 item = ReconBreak(BreakKind.ORPHAN_FILL, subject, detail)
             else:
                 item = ReconBreak(BreakKind.ORPHAN_ORDER, cid, detail)
-            await self._report_break(item)
+            if not await self._report_break(item):
+                # The report is applied in memory only, like any venue event the
+                # journal missed, so new orders stop until a restart.
+                self._journal_failed = f"could not record {item.kind.value} {cid}"
             return
         if isinstance(event, FillBusted) and (
             event.fill_id in self._orders[cid].busted_fill_ids
@@ -1698,14 +1728,15 @@ class OrderManager:
     async def _report_break_now(self, item: ReconBreak) -> bool:
         """Report one break: the halt first, since a crash may stop what follows.
 
-        An orphan fill counts as reported only here. Until then every pass finds it
-        again, and once its record is durable a restart does not. Returns whether the
-        record reached the journal.
+        An orphan fill counts as reported only once its record is in the journal.
+        Until then every pass finds it again, and once the record is durable a restart
+        does not. Returns whether the record reached the journal.
         """
-        if item.kind is BreakKind.ORPHAN_FILL:
-            if item.subject in self._reported_orphan_fills:
-                return True
-            self._reported_orphan_fills.add(item.subject)
+        if (
+            item.kind is BreakKind.ORPHAN_FILL
+            and item.subject in self._reported_orphan_fills
+        ):
+            return True
         logger.error(
             "reconciliation break: %s %s: %s",
             item.kind.value,
@@ -1725,6 +1756,8 @@ class OrderManager:
                 },
             )
             recorded = True
+        if recorded and item.kind is BreakKind.ORPHAN_FILL:
+            self._reported_orphan_fills.add(item.subject)
         if self._on_break is not None:
             try:
                 self._on_break(item)

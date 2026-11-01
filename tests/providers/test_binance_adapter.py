@@ -36,6 +36,7 @@ from ismet.providers.binance import (
 from ismet.testing.replay import ReplayTransport, WsReplayServer, load_exchanges
 from ismet.transport.backoff import NO_RETRY, ExponentialBackoff, RetryPolicy
 from ismet.transport.clock import ManualClock
+from ismet.transport.ws import BackpressurePolicy
 
 from ._support import (
     FAST_BACKOFF,
@@ -534,7 +535,13 @@ async def test_a_ban_is_honoured_locally_until_it_ends() -> None:
         418, json={"code": -1003, "msg": f"IP banned until {banned_until}."}
     )
     transport, seen = _serving(ban)
-    provider = BinanceProvider(http_transport=transport, clock=clock)
+    # The cap sits below the 30s left at the check, so this exercises the refusal
+    # rather than really sleeping through the retries on a clock that does not move.
+    provider = BinanceProvider(
+        http_transport=transport,
+        clock=clock,
+        retry_policy=replace(BINANCE_RETRY, max_retry_after=20.0),
+    )
     async with provider:
         with pytest.raises(RateLimited):
             await provider._get("/api/v3/depth", {}, "klines")
@@ -1051,3 +1058,283 @@ async def test_a_stream_does_not_handshake_during_a_hold() -> None:
             with contextlib.suppress(asyncio.CancelledError):
                 await pending
     assert handshakes and handshakes[0] - began >= 0.4
+
+
+TOLD_TO_WAIT = httpx.Response(429, headers={"Retry-After": "300"}, json=TOO_MUCH_WEIGHT)
+
+
+def _ws_provider(port: int, http: object, **options) -> BinanceProvider:  # type: ignore[no-untyped-def]
+    provider = BinanceProvider(
+        http_transport=http,  # type: ignore[arg-type]
+        retry_policy=NO_RETRY,
+        ws_url=f"ws://127.0.0.1:{port}",
+        **options,
+    )
+    provider._currencies["BTCUSDT"] = "USDT"
+    return provider
+
+
+async def _until(condition) -> None:  # type: ignore[no-untyped-def]
+    """Wait for a condition another task will make true; the bound only fails a bug."""
+    deadline = time.monotonic() + 10
+    while not condition():
+        assert time.monotonic() < deadline, "the condition never became true"
+        await asyncio.sleep(0.005)
+
+
+async def test_a_new_stream_during_a_long_hold_is_refused_and_says_why() -> None:
+    handshakes: list[float] = []
+
+    def process_request(conn: ServerConnection, request: Request) -> None:
+        handshakes.append(time.monotonic())
+
+    async def handler(conn: ServerConnection) -> None:
+        await conn.wait_closed()
+
+    transport, _ = _serving(TOLD_TO_WAIT)
+    async with serve(
+        handler, "127.0.0.1", 0, process_request=process_request
+    ) as server:
+        port = next(iter(server.sockets)).getsockname()[1]
+        async with _ws_provider(port, transport) as provider:
+            with pytest.raises(RateLimited):
+                await provider.order_book(BTC, 5)
+            with pytest.raises(RateLimited) as caught:
+                await asyncio.wait_for(take(provider.stream_trades([BTC]), 1), 10)
+    assert handshakes == []
+    assert caught.value.retry_after is not None and caught.value.retry_after > 200
+
+
+async def test_a_bounded_stream_fails_when_a_long_hold_starts_under_it() -> None:
+    handshakes = 0
+    drop = asyncio.Event()
+
+    def process_request(conn: ServerConnection, request: Request) -> None:
+        nonlocal handshakes
+        handshakes += 1
+
+    async def handler(conn: ServerConnection) -> None:
+        await conn.recv()
+        await conn.send(session("binance", "trade").frames[0])
+        await drop.wait()
+
+    transport, _ = _serving(TOLD_TO_WAIT)
+    async with serve(
+        handler, "127.0.0.1", 0, process_request=process_request
+    ) as server:
+        port = next(iter(server.sockets)).getsockname()[1]
+        async with _ws_provider(
+            port, transport, ws_max_reconnects=3, ws_backoff=FAST_BACKOFF
+        ) as provider:
+            stream = provider.stream_trades([BTC])
+            await asyncio.wait_for(stream.__anext__(), 10)  # type: ignore[attr-defined]
+            with pytest.raises(RateLimited):
+                await provider.order_book(BTC, 5)
+            drop.set()
+            with pytest.raises(RateLimited) as caught:
+                await asyncio.wait_for(stream.__anext__(), 10)  # type: ignore[attr-defined]
+    assert handshakes == 1  # nothing was sent during the hold
+    assert caught.value.retry_after is not None and caught.value.retry_after > 200
+
+
+async def test_an_unbounded_stream_waits_out_a_long_hold_and_logs_the_wait(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    handshakes = 0
+    drop = asyncio.Event()
+
+    def process_request(conn: ServerConnection, request: Request) -> None:
+        nonlocal handshakes
+        handshakes += 1
+
+    async def handler(conn: ServerConnection) -> None:
+        await conn.recv()
+        await conn.send(session("binance", "trade").frames[0])
+        await drop.wait()
+
+    transport, _ = _serving(TOLD_TO_WAIT)
+    async with serve(
+        handler, "127.0.0.1", 0, process_request=process_request
+    ) as server:
+        port = next(iter(server.sockets)).getsockname()[1]
+        async with _ws_provider(port, transport, ws_backoff=FAST_BACKOFF) as provider:
+            stream = provider.stream_trades([BTC])
+            await asyncio.wait_for(stream.__anext__(), 10)  # type: ignore[attr-defined]
+            with pytest.raises(RateLimited):
+                await provider.order_book(BTC, 5)
+            pending = asyncio.ensure_future(stream.__anext__())  # type: ignore[attr-defined]
+            drop.set()
+            await _until(lambda: "wait another" in caplog.text)
+            assert handshakes == 1 and not pending.done()
+            pending.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await pending
+    assert "wait another 299s" in caplog.text or "wait another 300s" in caplog.text
+
+
+def _rejecting(status: int, retry_after: str | None, body: str = "go away"):  # type: ignore[no-untyped-def]
+    attempts: list[float] = []
+
+    def process_request(conn: ServerConnection, request: Request) -> WsResponse:
+        attempts.append(time.monotonic())
+        response = conn.respond(status, body)
+        if retry_after is not None:
+            response.headers["Retry-After"] = retry_after
+        return response
+
+    return attempts, process_request
+
+
+@pytest.mark.parametrize(
+    ("status", "retry_after", "shortest"),
+    [(429, "300", 200.0), (418, "300", 200.0), (418, None, 100.0)],
+)
+async def test_a_refused_handshake_holds_requests_and_other_streams(
+    status: int, retry_after: str | None, shortest: float
+) -> None:
+    attempts, process_request = _rejecting(status, retry_after)
+
+    async def handler(conn: ServerConnection) -> None:
+        await conn.wait_closed()
+
+    transport, sent = _serving(httpx.Response(200, json={}))
+    async with serve(
+        handler, "127.0.0.1", 0, process_request=process_request
+    ) as server:
+        port = next(iter(server.sockets)).getsockname()[1]
+        async with _ws_provider(port, transport, ws_backoff=FAST_BACKOFF) as provider:
+            with pytest.raises(RateLimited) as caught:
+                await asyncio.wait_for(take(provider.stream_trades([BTC]), 1), 10)
+            assert caught.value.retry_after is not None
+            assert caught.value.retry_after > shortest
+            with pytest.raises(RateLimited):
+                await provider.order_book(BTC, 5)
+            with pytest.raises(RateLimited):
+                await asyncio.wait_for(take(provider.stream_quotes([BTC]), 1), 10)
+    assert len(attempts) == 1 and sent == []
+
+
+async def test_a_short_handshake_429_retries_after_its_wait() -> None:
+    attempts: list[float] = []
+
+    def process_request(conn: ServerConnection, request: Request) -> WsResponse | None:
+        attempts.append(time.monotonic())
+        if len(attempts) > 1:
+            return None
+        response = conn.respond(429, "slow down")
+        response.headers["Retry-After"] = "0.4"
+        return response
+
+    async def handler(conn: ServerConnection) -> None:
+        await conn.recv()
+        await conn.send(session("binance", "trade").frames[0])
+        await conn.wait_closed()
+
+    transport, _ = _serving(httpx.Response(200, json={}))
+    async with serve(
+        handler, "127.0.0.1", 0, process_request=process_request
+    ) as server:
+        port = next(iter(server.sockets)).getsockname()[1]
+        async with _ws_provider(port, transport, ws_backoff=FAST_BACKOFF) as provider:
+            trades = await asyncio.wait_for(take(provider.stream_trades([BTC]), 1), 10)
+    assert len(trades) == 1 and len(attempts) == 2
+    assert attempts[1] - attempts[0] >= 0.4
+
+
+async def test_other_handshake_refusals_set_no_hold() -> None:
+    _, process_request = _rejecting(404, None)
+
+    async def handler(conn: ServerConnection) -> None:
+        await conn.wait_closed()
+
+    transport, sent = _serving(httpx.Response(200, json={"bids": [], "asks": []}))
+    async with serve(
+        handler, "127.0.0.1", 0, process_request=process_request
+    ) as server:
+        port = next(iter(server.sockets)).getsockname()[1]
+        async with _ws_provider(port, transport) as provider:
+            with pytest.raises(TransportError, match="404"):
+                await asyncio.wait_for(take(provider.stream_trades([BTC]), 1), 10)
+            with contextlib.suppress(Exception):
+                await provider.order_book(BTC, 5)
+    assert len(sent) == 1  # the request went out
+
+
+async def test_events_queued_behind_a_forced_eviction_are_flagged() -> None:
+    """A control frame evicts A from a full queue, so B follows a real loss."""
+    recorded = session("binance", "book_ticker").frames
+    go = asyncio.Event()
+
+    async def handler(conn: ServerConnection) -> None:
+        await conn.recv()
+        await conn.send(recorded[0])
+        await go.wait()
+        for raw in recorded[1:4]:  # A, B, C fill a queue of 3
+            await conn.send(raw)
+        await conn.send('{"result":null,"id":1}')  # evicts A
+        await conn.wait_closed()
+
+    transport, _ = _serving(httpx.Response(200, json={}))
+    async with serve(handler, "127.0.0.1", 0) as server:
+        port = next(iter(server.sockets)).getsockname()[1]
+        async with _ws_provider(
+            port,
+            transport,
+            ws_queue_size=3,
+            ws_backpressure=BackpressurePolicy.DROP_NEWEST,
+        ) as provider:
+            stream = provider.stream_quotes([BTC])
+            first = await asyncio.wait_for(stream.__anext__(), 10)  # type: ignore[attr-defined]
+            assert not first.flags
+            ws = next(iter(provider._streams))
+            go.set()
+            await _until(lambda: ws.stats.received == 5)
+            assert ws.stats.dropped == 1
+            behind = await asyncio.wait_for(stream.__anext__(), 10)  # type: ignore[attr-defined]
+            after = await asyncio.wait_for(stream.__anext__(), 10)  # type: ignore[attr-defined]
+    assert QualityFlag.AFTER_GAP in behind.flags
+    assert QualityFlag.AFTER_GAP not in after.flags
+    assert behind.sequence == json.loads(recorded[2])["u"]
+    assert after.sequence == json.loads(recorded[3])["u"]
+
+
+async def test_a_dropped_newest_frame_flags_the_frame_after_it_and_no_earlier() -> None:
+    recorded = session("binance", "book_ticker").frames
+    go = asyncio.Event()
+    more = asyncio.Event()
+
+    async def handler(conn: ServerConnection) -> None:
+        await conn.recv()
+        await conn.send(recorded[0])
+        await go.wait()
+        for raw in recorded[1:4]:  # A and B queue, C is dropped: the queue holds 2
+            await conn.send(raw)
+        await more.wait()
+        await conn.send(recorded[4])
+        await conn.wait_closed()
+
+    transport, _ = _serving(httpx.Response(200, json={}))
+    async with serve(handler, "127.0.0.1", 0) as server:
+        port = next(iter(server.sockets)).getsockname()[1]
+        async with _ws_provider(
+            port,
+            transport,
+            ws_queue_size=2,
+            ws_backpressure=BackpressurePolicy.DROP_NEWEST,
+        ) as provider:
+            stream = provider.stream_quotes([BTC])
+            await asyncio.wait_for(stream.__anext__(), 10)  # type: ignore[attr-defined]
+            ws = next(iter(provider._streams))
+            go.set()
+            await _until(lambda: ws.stats.dropped == 1)
+            seen = [
+                await asyncio.wait_for(stream.__anext__(), 10),  # type: ignore[attr-defined]
+                await asyncio.wait_for(stream.__anext__(), 10),  # type: ignore[attr-defined]
+            ]
+            more.set()
+            seen.append(await asyncio.wait_for(stream.__anext__(), 10))  # type: ignore[attr-defined]
+    assert [QualityFlag.AFTER_GAP in event.flags for event in seen] == [
+        False,
+        False,
+        True,
+    ]

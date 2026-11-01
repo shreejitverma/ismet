@@ -35,6 +35,7 @@ from ismet.execution import (
     new_order,
 )
 from ismet.execution.journal import VerifyResult
+from ismet.execution.reconcile import ReconBreak
 from ismet.execution.risk import check_open_orders
 from ismet.execution.state import apply_event
 from ismet.models import Symbol
@@ -44,6 +45,7 @@ from ismet.models.orders import (
     Fill,
     Filled,
     OrderEvent,
+    OrderRequest,
     OrderSide,
     OrderType,
     Replaced,
@@ -678,13 +680,17 @@ async def test_a_stream_that_holds_is_healthy_when_start_returns(
 async def test_a_stream_that_delivers_and_dies_never_counts_as_up(
     make_manager: Factory, venue: SimVenue, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    async def delivers_once():  # type: ignore[no-untyped-def]
-        yield Acknowledged(client_order_id="OUT-Z", ts=START, venue_order_id="V")
-        raise TransportError("dropped")
-
+    """With ``stream_settle`` an hour, a stream living one event never held up."""
     attempts: list[int] = []
     healthy: list[bool] = []
     oms = make_manager(stream_settle=3600.0, halt_on_break=False)
+
+    async def delivers_once():  # type: ignore[no-untyped-def]
+        yield Acknowledged(client_order_id="OUT-Z", ts=START, venue_order_id="V")
+        # The consumer has taken the event: this is the moment it could wrongly
+        # count the stream as up.
+        healthy.append(oms.stream_healthy)
+        raise TransportError("dropped")
 
     class Recording:
         def __init__(self, **_: object) -> None:
@@ -807,6 +813,85 @@ async def test_an_old_orphan_fill_survives_a_break_that_never_reached_the_journa
         assert kinds_of(journal).count(RecordKind.RECON_BREAK) == 1
     finally:
         await restarted.abort()
+
+
+def orphan_manager(
+    venue: SimVenue, journal: Journal, clock: ManualClock, **options: object
+) -> OrderManager:
+    settings: dict[str, object] = {
+        "clock": clock,
+        "stream_settle": None,
+        "reconcile_interval": 3600.0,
+        "fill_lookback": 3600.0,
+        "unknown_grace": 0.0,
+    }
+    settings.update(options)
+    return OrderManager(venue, journal, RiskEngine(permissive_config()), **settings)  # type: ignore[arg-type]
+
+
+def orphan_subjects(breaks: list[ReconBreak]) -> list[str]:
+    return [b.subject for b in breaks if b.kind is BreakKind.ORPHAN_FILL]
+
+
+async def test_an_orphan_fill_whose_break_never_landed_is_recorded_by_the_next_pass(
+    venue: SimVenue, clock: ManualClock
+) -> None:
+    """A fill is on record once its break reaches the journal, not once it is seen."""
+    journal = BreakJournalDown()
+    oms = orphan_manager(venue, journal, clock)
+    await oms.start()
+    await venue.drain()
+    clock.advance(1)
+    venue._fills.append(fill("OUT-B").model_copy(update={"ts": clock.now()}))
+    clock.advance(7200)
+    journal.failing = True
+    first = await oms.reconcile()
+    assert orphan_subjects(first.breaks) == ["OUT-B:1001"]
+    assert kinds_of(journal).count(RecordKind.RECON_BREAK) == 0
+
+    journal.failing = False
+    clock.advance(1)
+    second = await oms.reconcile()
+    try:
+        assert orphan_subjects(second.breaks) == ["OUT-B:1001"]
+        assert kinds_of(journal).count(RecordKind.RECON_BREAK) == 1
+        third = await oms.reconcile()
+        assert orphan_subjects(third.breaks) == []
+    finally:
+        await oms.abort()
+    restarted = orphan_manager(venue, journal, clock)
+    report = await restarted.start()
+    try:
+        assert orphan_subjects(report.breaks) == []
+        assert kinds_of(journal).count(RecordKind.RECON_BREAK) == 1
+    finally:
+        await restarted.abort()
+
+
+async def test_a_streamed_orphan_fill_whose_record_fails_stops_new_orders(
+    venue: SimVenue, clock: ManualClock
+) -> None:
+    """A venue report that could not be journalled stops new orders, like any other,
+    and the next sweep after the journal recovers puts it on record."""
+    journal = BreakJournalDown()
+    oms = orphan_manager(venue, journal, clock, halt_on_break=False)
+    await oms.start()
+    await venue.drain()
+    journal.failing = True
+    venue._deliver(filled("OUT-C"))
+    await venue.drain()
+    try:
+        assert kinds_of(journal).count(RecordKind.RECON_BREAK) == 0
+        with pytest.raises(KillSwitchEngaged, match="journal failure"):
+            await oms.submit(order(price="9.50"))
+        journal.failing = False
+        venue._fills.append(fill("OUT-C"))
+        clock.advance(1)
+        report = await oms.reconcile()
+        assert orphan_subjects(report.breaks) == ["OUT-C:1001"]
+        assert kinds_of(journal).count(RecordKind.RECON_BREAK) == 1
+    finally:
+        await oms.abort()
 
 
 async def test_a_clean_pass_still_moves_the_sweep_window(
@@ -1085,11 +1170,124 @@ async def test_an_elected_stop_limit_fills_on_a_print_at_its_limit(
     assert snapshot is not None and snapshot.filled_quantity == 100
 
 
+def sell_stop_limit(cid: str) -> OrderRequest:
+    """A sell stop at 9.50 with its limit at 9.40, both below the 9.99 bid."""
+    return order(
+        cid,
+        side=OrderSide.SELL,
+        price="9.40",
+        order_type=OrderType.STOP_LIMIT,
+        stop_price="9.50",
+        time_in_force=TimeInForce.GTC,
+    )
+
+
+def buy_stop_limit(cid: str) -> OrderRequest:
+    """A buy stop at 10.50 with its limit at 10.60, both above the 10.01 ask."""
+    return order(
+        cid,
+        price="10.60",
+        order_type=OrderType.STOP_LIMIT,
+        stop_price="10.50",
+        time_in_force=TimeInForce.GTC,
+    )
+
+
+async def filled_at_venue(venue: SimVenue, cid: str) -> Decimal:
+    snapshot = await venue.order_status(cid, ACME)
+    assert snapshot is not None
+    return snapshot.filled_quantity
+
+
+async def test_an_unelected_sell_stop_limit_does_not_fill_on_a_print_at_its_limit(
+    venue: SimVenue,
+) -> None:
+    await venue.place_order(sell_stop_limit("SS3"))
+    venue.trade_through(ACME, "10.00", "100")  # above the stop, so not elected
+    assert await filled_at_venue(venue, "SS3") == 0
+
+
+async def test_an_elected_sell_stop_limit_fills_on_a_print_through_its_stop(
+    venue: SimVenue,
+) -> None:
+    await venue.place_order(sell_stop_limit("SS4"))
+    venue.trade_through(ACME, "9.45", "100")  # at or below the stop, above the limit
+    assert await filled_at_venue(venue, "SS4") == 100
+
+
+async def test_a_stop_limit_elected_by_a_quote_rests_at_its_limit(
+    venue: SimVenue,
+) -> None:
+    """The ask reaches the stop but not the limit, so the order rests, elected."""
+    await venue.place_order(buy_stop_limit("SS5"))
+    venue.set_quote(ACME, "10.52", "10.70")
+    assert await filled_at_venue(venue, "SS5") == 0
+    venue.trade_through(ACME, "10.30", "100")  # below the stop, within the limit
+    assert await filled_at_venue(venue, "SS5") == 100
+
+
+async def test_a_stop_limit_elected_by_a_quote_takes_the_ask_within_its_limit(
+    venue: SimVenue,
+) -> None:
+    await venue.place_order(buy_stop_limit("SS6"))
+    venue.set_quote(ACME, "10.52", "10.55")
+    snapshot = await venue.order_status("SS6", ACME)
+    assert snapshot is not None and snapshot.filled_quantity == 100
+    assert [f.price for f in await venue.fills_since(START)] == [D("10.55")]
+
+
+async def test_an_unelected_stop_limit_does_not_fill_on_an_amend(
+    venue: SimVenue,
+) -> None:
+    await venue.place_order(buy_stop_limit("SS7"))
+    await venue.amend_order("SS7", ACME, quantity=D(200))
+    assert await filled_at_venue(venue, "SS7") == 0
+
+
+async def test_an_unelected_stop_does_not_fill_on_an_amend(venue: SimVenue) -> None:
+    await venue.place_order(
+        order("SS8", price=None, order_type=OrderType.STOP, stop_price="10.50")
+    )
+    await venue.amend_order("SS8", ACME, quantity=D(200))
+    assert await filled_at_venue(venue, "SS8") == 0
+
+
+async def test_a_stop_elected_by_a_print_takes_the_touch(venue: SimVenue) -> None:
+    """A stop with no limit becomes a market order once elected."""
+    await venue.place_order(
+        order("SS9", price=None, order_type=OrderType.STOP, stop_price="10.50")
+    )
+    venue.trade_through(ACME, "10.55", "100")
+    assert await filled_at_venue(venue, "SS9") == 100
+    assert [f.price for f in await venue.fills_since(START)] == [D("10.01")]
+
+
+async def test_a_sell_stop_elected_by_a_print_takes_the_bid(venue: SimVenue) -> None:
+    await venue.place_order(
+        order(
+            "SS10",
+            side=OrderSide.SELL,
+            price=None,
+            order_type=OrderType.STOP,
+            stop_price="9.50",
+        )
+    )
+    venue.trade_through(ACME, "9.60", "100")  # above the stop, so not elected
+    assert await filled_at_venue(venue, "SS10") == 0
+    venue.trade_through(ACME, "9.50", "100")
+    assert await filled_at_venue(venue, "SS10") == 100
+    assert [f.price for f in await venue.fills_since(START)] == [D("9.99")]
+
+
 # Send records
 
 
 class RecordKeepingVenue(SimVenue):
-    """A venue whose adapter keeps its own send records, as the FIX provider does."""
+    """A venue whose adapter keeps its own send records, as the FIX provider does.
+
+    With ``lost_rows`` every status query raises, as the FIX provider's does once its
+    store is gone, whether or not the venue still holds the order.
+    """
 
     record_id: str | None = "store-1"
     lost_rows: bool = False
@@ -1098,10 +1296,9 @@ class RecordKeepingVenue(SimVenue):
         return self.record_id
 
     async def order_status(self, client_order_id, symbol):  # type: ignore[no-untyped-def]
-        found = await super().order_status(client_order_id, symbol)
-        if found is None and self.lost_rows:
+        if self.lost_rows:
             raise NoSendRecord(f"no send record for {client_order_id}")
-        return found
+        return await super().order_status(client_order_id, symbol)
 
 
 def record_venue(clock: ManualClock) -> RecordKeepingVenue:
@@ -1183,6 +1380,88 @@ async def test_no_record_with_no_journalled_id_stays_unknown(
         assert oms.order("SR1").status is S.UNKNOWN
     finally:
         await oms.abort()
+
+
+async def lost_store_after(
+    venue: RecordKeepingVenue, journal: Journal, clock: ManualClock, cid: str
+) -> OrderManager:
+    """Restart on a new, empty store with ``cid`` journalled under the old one."""
+    venue.lost_rows = True
+    venue.record_id = "store-2"
+    restarted = record_manager(venue, journal, clock)
+    report = await restarted.start()
+    assert BreakKind.QUERY_FAILED in [b.kind for b in report.breaks]
+    assert restarted.order(cid).status is S.UNKNOWN
+    return restarted
+
+
+async def test_a_working_order_on_a_lost_store_waits_for_the_operator(
+    journal: Journal, clock: ManualClock
+) -> None:
+    """Nothing closes it by itself, and ``resolve_unknown`` is its route out."""
+    venue = record_venue(clock)
+    oms = record_manager(venue, journal, clock)
+    await oms.start()
+    await venue.drain()
+    assert (await oms.submit(order("SR4", price="9.50"))).status is S.ACCEPTED
+    await oms.abort()
+
+    restarted = await lost_store_after(venue, journal, clock, "SR4")
+    try:
+        with pytest.raises(RiskRejected):
+            await restarted.submit(order(price="9.50", symbol=OTHR))
+        assert [o.client_order_id for o in await venue.open_orders()] == ["SR4"]
+        for _ in range(2):
+            await restarted.reconcile()
+            assert restarted.order("SR4").status is S.UNKNOWN
+        assert [o.client_order_id for o in await venue.open_orders()] == ["SR4"]
+
+        venue.forget_order("SR4")  # the operator cancelled at the counterparty
+        state = await restarted.resolve_unknown(
+            "SR4", operator="ops", reason="cancelled and confirmed at the venue"
+        )
+        assert state.status is S.REJECTED
+        assert state.reject_code == "RESOLVED_BY_OPERATOR"
+        assert (await restarted.reconcile()).clean
+        assert (await restarted.submit(order("SR5", price="9.50"))).status is S.ACCEPTED
+    finally:
+        await restarted.abort()
+
+
+async def test_a_partly_filled_order_on_a_lost_store_closes_canceled_with_its_fills(
+    journal: Journal, clock: ManualClock
+) -> None:
+    venue = record_venue(clock)
+    oms = record_manager(venue, journal, clock)
+    await oms.start()
+    await venue.drain()
+    await oms.submit(order("SR6", price="9.50"))
+    await venue.drain()
+    venue.trade_through(ACME, "9.50", "40")
+    await oms.wait_for("SR6", lambda o: o.filled_quantity == 40, 5)
+    await oms.abort()
+
+    restarted = await lost_store_after(venue, journal, clock, "SR6")
+    try:
+        assert restarted.order("SR6").filled_quantity == 40
+        venue.forget_order("SR6")
+        state = await restarted.resolve_unknown(
+            "SR6", operator="ops", reason="cancelled and confirmed at the venue"
+        )
+        assert state.status is S.CANCELED
+        assert state.filled_quantity == 40
+        assert [f.quantity for f in state.fills] == [D(40)]
+        assert restarted.net_position(ACME) == 40
+        assert (await restarted.reconcile()).clean
+    finally:
+        await restarted.abort()
+    again = record_manager(venue, journal, clock)
+    await again.start()
+    try:
+        assert again.order("SR6").status is S.CANCELED
+        assert again.net_position(ACME) == 40
+    finally:
+        await again.abort()
 
 
 async def test_a_venue_with_no_send_records_journals_no_id(

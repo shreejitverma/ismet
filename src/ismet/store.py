@@ -27,6 +27,7 @@ from ismet.errors import CalendarOutOfRange, IsmetError, ValidationError
 from ismet.export import BarSeries
 from ismet.models import Bar, Interval, Symbol
 from ismet.models.decimals import _EXACT
+from ismet.refdata.codes import accepting_stored_codes
 from ismet.refdata.master import trading_date
 from ismet.transport.clock import SYSTEM_CLOCK, Clock
 
@@ -66,6 +67,11 @@ def _content_digest(bar: Bar) -> str:
                 fields[name] = format(value.normalize(), "f")  # 10.10 equals 10.1
     payload = json.dumps(fields, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _stored_bar(payload: str) -> Bar:
+    with accepting_stored_codes():
+        return Bar.model_validate_json(payload)
 
 
 def _utc_text(moment: datetime, name: str) -> str:
@@ -135,7 +141,7 @@ class BarStore:
                 if latest is None:
                     inserted += 1
                 else:
-                    stored = Bar.model_validate_json(latest[2])
+                    stored = _stored_bar(latest[2])
                     if stored.adjustment is not bar.adjustment:
                         raise ValidationError(
                             f"{bar.symbol} {bar.interval.value} at "
@@ -192,7 +198,7 @@ class BarStore:
                 cutoff,
             ),
         ).fetchall()
-        bars = BarSeries(Bar.model_validate_json(row[0]) for row in rows)
+        bars = BarSeries(_stored_bar(row[0]) for row in rows)
         scales = sorted({bar.adjustment.value for bar in bars})
         if len(scales) > 1:
             raise ValidationError(
@@ -289,6 +295,7 @@ class BarStore:
             )
 
 
+_DEFAULT_WINDOW = timedelta(days=30)
 FetchBars = Callable[[Symbol, Interval, datetime, datetime], Awaitable[list[Bar]]]
 
 
@@ -345,6 +352,11 @@ def _check_window(
             )
 
 
+def _longest_period(interval: Interval) -> timedelta:
+    seconds = interval.nominal_seconds
+    return timedelta(days=31) if seconds is None else timedelta(seconds=seconds)
+
+
 async def backfill(
     fetch: FetchBars,
     store: BarStore,
@@ -353,7 +365,7 @@ async def backfill(
     start: datetime,
     end: datetime,
     *,
-    window: timedelta = timedelta(days=30),
+    window: timedelta | None = None,
     calendar: TradingCalendar | None = None,
 ) -> BackfillReport:
     """Fetch ``[start, end)`` in windows into ``store``. Safe to rerun after a failure.
@@ -371,9 +383,22 @@ async def backfill(
     were only partly requested, so they are not required. The bars received are kept
     either way. Without a calendar, a non-empty answer is taken as final, since nothing
     can contradict it. Check :attr:`BackfillReport.complete`.
+
+    ``window`` defaults to 30 days, or 31 for monthly bars. One shorter than the
+    interval's longest period raises, because it could hold no bar and so never finish.
+    For the same reason a tail shorter than that period joins the window before it. A
+    whole range that short keeps its window open if it comes back empty.
     """
+    period = _longest_period(interval)
+    if window is None:
+        window = max(_DEFAULT_WINDOW, period)
     if window <= timedelta(0):
         raise ValidationError("window must be positive")
+    if window < period:
+        raise ValidationError(
+            f"window {window} can hold no {interval.value} bar, whose period can be "
+            f"{period}; use a window of at least that"
+        )
     if start >= end:
         raise ValidationError(f"backfill start {start} is not before end {end}")
     if calendar is not None and interval in (Interval.W1, Interval.MO1):
@@ -385,6 +410,8 @@ async def backfill(
     cursor = start
     while cursor < end:
         upper = min(cursor + window, end)
+        if end - upper < period:
+            upper = end
         report.windows_total += 1
         await _backfill_window(
             fetch, store, symbol, interval, cursor, upper, calendar, start, report
@@ -415,7 +442,14 @@ async def _backfill_window(
             return
         bars = await fetch(symbol, interval, start, end)
         _check_window(bars, symbol, interval, start, end)
+        report.bars_fetched += len(bars)
         result = store.write(bars)
+        report.bars_inserted += result.inserted
+        report.bars_unchanged += result.unchanged
+        report.bars_revised += result.revised
+        if not bars and not _proven_empty(calendar, start, end):
+            report.windows_empty_unproven += 1
+            return
         missing = (
             _sessions_without_bars(
                 store, symbol, interval, calendar, start, end, requested_from
@@ -423,23 +457,17 @@ async def _backfill_window(
             if calendar is not None and bars
             else []
         )
-    except (IsmetError, sqlite3.Error) as exc:
+        if missing:
+            report.windows_incomplete += 1
+            report.sessions_missing.extend(missing)
+            return
+        store.mark_window_done(symbol, interval, start, end, len(bars))
+    # ValueError: a stored row that no longer parses is this window's failure.
+    except (IsmetError, sqlite3.Error, ValueError) as exc:
         logger.warning("backfill window %s failed: %s", start, exc)
         report.windows_failed += 1
         report.failures.append((start, repr(exc)))
         return
-    report.bars_fetched += len(bars)
-    report.bars_inserted += result.inserted
-    report.bars_unchanged += result.unchanged
-    report.bars_revised += result.revised
-    if not bars and not _proven_empty(calendar, start, end):
-        report.windows_empty_unproven += 1
-        return
-    if missing:
-        report.windows_incomplete += 1
-        report.sessions_missing.extend(missing)
-        return
-    store.mark_window_done(symbol, interval, start, end, len(bars))
     report.windows_fetched += 1
 
 

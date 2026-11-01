@@ -49,7 +49,9 @@ from ismet.execution.journal import (
 from ismet.execution.manager import events_of
 from ismet.execution.state import replay
 from ismet.models import Symbol, to_decimal
+from ismet.models.orders import SubmitIntent
 from ismet.providers import ProviderRegistry
+from ismet.refdata.codes import accepting_stored_codes, is_known_venue
 from ismet.sync import as_datetime
 
 DESCRIPTION = (
@@ -502,11 +504,30 @@ def _sync_directory(directory: Path) -> None:
         os.close(descriptor)
 
 
-def _export(journal: SqliteJournal, out: Path) -> int:
+def _take_name(temporary: Path, out: Path) -> None:
+    """Give the finished file its name, refusing one that already exists."""
+    try:
+        os.link(temporary, out)
+    except FileExistsError:
+        raise
+    except OSError:
+        # This filesystem has no hard links. Claim the name, then rename over the claim,
+        # so a crash leaves an empty file rather than a truncated audit that verifies.
+        os.close(os.open(out, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+        try:
+            temporary.replace(out)
+        except BaseException:
+            out.unlink(missing_ok=True)
+            raise
+
+
+def _export(journal: SqliteJournal, out: Path) -> tuple[int, str | None]:
     """Write the export beside its destination, so a failure leaves nothing behind.
 
-    The file is on disk before it takes its name, and linking the name refuses a file
-    that appeared in the meantime, so an existing audit file is never replaced.
+    The file is on disk before it takes its name, and taking the name refuses a file
+    that appeared in the meantime, so an existing audit file is never replaced. Returns
+    the count and a warning if the name itself could not be made durable: the complete
+    file is there, so that is reported rather than undone.
     """
     if out.exists():
         raise ValidationError(f"{out} already exists; choose a new --out")
@@ -517,13 +538,20 @@ def _export(journal: SqliteJournal, out: Path) -> int:
             count = export_jsonl(journal, stream)
             stream.flush()
             os.fsync(stream.fileno())
-        os.link(temporary, out)
+        _take_name(temporary, out)
     except FileExistsError:
         raise ValidationError(f"{out} already exists; choose a new --out") from None
     finally:
         temporary.unlink(missing_ok=True)
-    _sync_directory(out.parent)
-    return count
+    try:
+        _sync_directory(out.parent)
+    except OSError as exc:
+        return (
+            count,
+            f"{out.parent} could not be synced, so a power cut may lose "
+            f"{out.name}: {exc}",
+        )
+    return count, None
 
 
 def _chain_text(result: VerifyResult) -> str:
@@ -573,41 +601,65 @@ def _journal(args: argparse.Namespace) -> int:
             )
             return EXIT_OK if result.ok else EXIT_FAILED
         chain = journal.verify()
-        outcome = EXIT_OK if chain.ok else EXIT_FAILED
-        if args.action == "export":
-            count = _export(journal, Path(args.out))
-            _print({"exported": count, "path": args.out, "chain": _chain_text(chain)})
-            return outcome
-        orders = replay(events_of(journal))
-        states = [o for o in orders.values() if args.all or o.is_open]
-        if not states:
-            scope = "" if args.all else "open "
+        try:
+            _journal_contents(args, journal, chain)
+        except (IsmetError, ValueError, OSError) as exc:
+            # The chain was worked out first, and it is the answer that matters most.
             _print(
                 {
-                    "orders": f"0 {scope}orders of {len(orders)} in this journal",
+                    "error": _error_text(exc),
                     "chain": _chain_text(chain),
+                    "help": _JOURNAL_HINT if not chain.ok else _error_hint(exc),
                 }
             )
-            return outcome
-        _print(
-            {
-                "chain": _chain_text(chain),
-                "count": f"{len(states)} of {len(orders)} total",
-                "orders": [
-                    {
-                        "id": o.client_order_id,
-                        "symbol": str(o.request.symbol),
-                        "side": o.request.side,
-                        "status": o.status,
-                        "filled": f"{o.filled_quantity}/{o.quantity}",
-                    }
-                    for o in states
-                ],
-            }
-        )
-        return outcome
+            return EXIT_FAILED
+        return EXIT_OK if chain.ok else EXIT_FAILED
     finally:
         journal.close()
+
+
+def _journal_contents(
+    args: argparse.Namespace, journal: SqliteJournal, chain: VerifyResult
+) -> None:
+    if args.action == "export":
+        count, warning = _export(journal, Path(args.out))
+        _print(
+            {
+                "exported": count,
+                "path": args.out,
+                "chain": _chain_text(chain),
+                **({} if warning is None else {"warning": warning}),
+            }
+        )
+        return
+    with accepting_stored_codes():
+        orders = replay(events_of(journal))
+    states = [o for o in orders.values() if args.all or o.is_open]
+    if not states:
+        scope = "" if args.all else "open "
+        _print(
+            {
+                "orders": f"0 {scope}orders of {len(orders)} in this journal",
+                "chain": _chain_text(chain),
+            }
+        )
+        return
+    _print(
+        {
+            "chain": _chain_text(chain),
+            "count": f"{len(states)} of {len(orders)} total",
+            "orders": [
+                {
+                    "id": o.client_order_id,
+                    "symbol": str(o.request.symbol),
+                    "side": o.request.side,
+                    "status": o.status,
+                    "filled": f"{o.filled_quantity}/{o.quantity}",
+                }
+                for o in states
+            ],
+        }
+    )
 
 
 def _require_named(args: argparse.Namespace, help_text: str) -> None:
@@ -689,11 +741,32 @@ def _kill(args: argparse.Namespace) -> int:
         journal.close()
 
 
+def _journal_names_venue(journal: SqliteJournal, venue: str) -> bool:
+    """Whether a baseline, an adjustment or an order in the journal is on ``venue``."""
+    for record in journal.records():
+        if record.kind is RecordKind.POSITION_BASELINE:
+            symbols = list(json.loads(record.payload))
+        elif record.kind is RecordKind.POSITION_ADJUSTED:
+            symbols = [json.loads(record.payload)["symbol"]]
+        else:
+            continue
+        if any(text.rpartition("@")[2].upper() == venue for text in symbols):
+            return True
+    with accepting_stored_codes():
+        return any(
+            isinstance(event, SubmitIntent) and event.request.symbol.venue == venue
+            for event in events_of(journal)
+        )
+
+
 def _position(args: argparse.Namespace) -> int:
     if args.action is None:
         raise _UsageError("position needs an action", "ismet position --help")
     _require_named(args, "ismet position --help")
-    symbol = Symbol.parse(args.symbol)
+    # A venue may have been registered only by the process that traded it. It is
+    # checked against the journal below, once the journal is open.
+    with accepting_stored_codes():
+        symbol = Symbol.parse(args.symbol)
     try:
         delta = to_decimal(args.delta)
     except ValueError as exc:
@@ -705,6 +778,15 @@ def _position(args: argparse.Namespace) -> int:
             raise ConfigError(
                 "this journal has no position baseline, so a running manager would "
                 "ignore the adjustment"
+            )
+        if not is_known_venue(symbol.venue) and not _journal_names_venue(
+            journal, symbol.venue
+        ):
+            # A record cannot be taken back, and a manager could not parse this symbol.
+            raise ValidationError(
+                f"venue {symbol.venue} is not a known MIC and nothing in this journal "
+                "is on it, so this looks like a typing mistake; check the symbol, or "
+                "use OrderManager.adjust_position in a process that registered it"
             )
         record = journal.append(
             RecordKind.POSITION_ADJUSTED,
@@ -748,7 +830,21 @@ def _dispatch(args: argparse.Namespace) -> int:
     return asyncio.run(_with_client(lambda client: handler(args, client)))
 
 
+_JOURNAL_HINT = (
+    "Check the path. If it is the journal, treat it as tampered with: preserve it and "
+    "its .head file, as in docs/OPERATIONS.md"
+)
+
+
+def _error_text(exc: Exception) -> str:
+    if isinstance(exc, PydanticValidationError):
+        return "; ".join(e["msg"] for e in exc.errors())
+    return str(exc)
+
+
 def _error_hint(exc: Exception) -> str:
+    if isinstance(exc, JournalError):
+        return _JOURNAL_HINT
     if isinstance(exc, ConfigError):
         return f"Set {ENV_PREFIX}PROVIDERS=mock to try it, or run `ismet doctor`"
     if isinstance(exc, AuthError):
@@ -781,12 +877,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         _print({"error": str(exc), "help": help_text})
         return EXIT_USAGE
     except (IsmetError, ValueError, OSError) as exc:
-        message = (
-            "; ".join(e["msg"] for e in exc.errors())
-            if isinstance(exc, PydanticValidationError)
-            else str(exc)
-        )
-        _print({"error": message, "help": _error_hint(exc)})
+        _print({"error": _error_text(exc), "help": _error_hint(exc)})
         return EXIT_FAILED
     except Exception as exc:
         traceback.print_exc(file=sys.stderr)

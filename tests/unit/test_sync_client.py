@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import threading
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -247,3 +248,116 @@ def test_an_iterator_never_consumed_starts_nothing() -> None:
         assert next(used).symbol.ticker == "ACME"
         used.close()
     assert len(started) == 1
+
+
+class _SlowToClose(MockProvider):
+    """A provider whose close waits for the test, so a close can be caught midway."""
+
+    def __init__(self) -> None:
+        super().__init__(tick_interval=0)
+        self.closing = threading.Event()
+        self.may_finish = threading.Event()
+
+    async def close(self) -> None:
+        self.closing.set()
+        await asyncio.to_thread(self.may_finish.wait)
+        await super().close()
+
+
+def _closing_client() -> tuple[IsmetSyncClient, _SlowToClose, threading.Thread]:
+    provider = _SlowToClose()
+    client = IsmetSyncClient([provider])
+    client.open()
+    closer = threading.Thread(target=client.close)
+    return client, provider, closer
+
+
+def test_a_stream_first_consumed_during_a_close_raises() -> None:
+    client, provider, closer = _closing_client()
+    stream = client.stream_quotes(["ACME@XMOK"])
+    closer.start()
+    try:
+        assert provider.closing.wait(10)
+        with pytest.raises(ConfigError, match="not open"):
+            next(stream)
+    finally:
+        provider.may_finish.set()
+        closer.join(10)
+    assert sync_threads() == []
+
+
+def test_a_call_made_during_a_close_raises_and_does_not_hang() -> None:
+    client, provider, closer = _closing_client()
+    closer.start()
+    try:
+        assert provider.closing.wait(10)
+        with pytest.raises(ConfigError, match="not open"):
+            client.quote("ACME@XMOK")
+    finally:
+        provider.may_finish.set()
+        closer.join(10)
+    assert sync_threads() == []
+
+
+def test_a_stream_already_running_when_close_begins_raises() -> None:
+    client, provider, closer = _closing_client()
+    stream = client.stream_quotes(["ACME@XMOK"])
+    assert next(stream).symbol.ticker == "ACME"
+    closer.start()
+    assert provider.closing.wait(10)
+    provider.may_finish.set()
+    with pytest.raises(ConfigError, match="closed"):
+        for _ in stream:
+            pass
+    closer.join(10)
+    assert sync_threads() == []
+
+
+def test_a_producer_that_died_before_it_ran_does_not_hang_the_consumer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Its cleanup never ran, so nothing else would ever end the consumer."""
+    outcome: list[object] = []
+
+    def never_ran(coroutine, loop):  # type: ignore[no-untyped-def]
+        coroutine.close()
+        future: concurrent.futures.Future[None] = concurrent.futures.Future()
+        future.cancel()
+        return future
+
+    def consume(stream) -> None:  # type: ignore[no-untyped-def]
+        try:
+            outcome.append(list(stream))
+        except ConfigError as exc:
+            outcome.append(exc)
+
+    with IsmetSyncClient([MockProvider()]) as client:
+        stream = client.stream_quotes(["ACME@XMOK"])
+        monkeypatch.setattr("ismet.sync.asyncio.run_coroutine_threadsafe", never_ran)
+        consumer = threading.Thread(target=consume, args=(stream,), daemon=True)
+        consumer.start()
+        consumer.join(10)
+        monkeypatch.undo()
+        assert not consumer.is_alive()
+    assert len(outcome) == 1 and isinstance(outcome[0], ConfigError)
+
+
+def test_closing_twice_at_once_is_safe() -> None:
+    client, provider, closer = _closing_client()
+    closer.start()
+    assert provider.closing.wait(10)
+    client.close()
+    provider.may_finish.set()
+    closer.join(10)
+    client.close()
+    assert sync_threads() == []
+
+
+def test_a_closed_client_can_be_opened_again() -> None:
+    client = IsmetSyncClient([MockProvider()])
+    with client:
+        client.quote("ACME@XMOK")
+    with client:
+        assert client.quote("ACME@XMOK").bid is not None
+        assert next(client.stream_quotes(["ACME@XMOK"])).bid is not None
+    assert sync_threads() == []

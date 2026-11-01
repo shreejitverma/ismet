@@ -86,6 +86,31 @@ async def test_invariant_violations_are_reported(sym: Symbol) -> None:
     assert "FAIL" in report.summary()
 
 
+async def test_a_stream_that_ends_before_delivering_fails(sym: Symbol) -> None:
+    """A declared stream must deliver: ending at once proves nothing works."""
+
+    class EndsAtOnce(MockProvider):
+        name = "endsatonce"
+
+        async def stream_quotes(self, symbols):  # type: ignore[no-untyped-def, override]
+            return
+            yield
+
+        async def stream_trades(self, symbols):  # type: ignore[no-untyped-def, override]
+            quote = await self.quote(symbols[0])
+            yield quote
+            return
+
+    report = await run_conformance(
+        EndsAtOnce(tick_interval=0), symbol=sym, stream_messages=3
+    )
+    failed = {c.name: c.detail for c in report.failures}
+    assert "stream_quotes" in failed and "0" in failed["stream_quotes"]
+    assert "stream_trades" in failed and "1" in failed["stream_trades"]
+    with pytest.raises(AssertionError, match="stream_quotes"):
+        assert_conformant(report)
+
+
 async def test_timeouts_are_reported(sym: Symbol) -> None:
     class Slow(MockProvider):
         name = "slow"

@@ -50,7 +50,11 @@ discarded counts the same as a reconnect, so the next quote per symbol is flagge
 
 Outages. Reconnects never stop by default, since a long-lived stream should survive a
 network outage. Each one is logged at WARNING; pass ``ws_on_state`` to watch them, or
-``ws_max_reconnects`` to fail instead. Only data frames count as progress.
+``ws_max_reconnects`` to fail instead. Only data frames count as progress. A rate limit
+hold of over 20 seconds, see below, is not an outage to sit through unless the stream
+is told to: a new stream or one with ``ws_max_reconnects`` raises
+:class:`~ismet.errors.RateLimited` with the remaining ``retry_after``, while any other
+stream logs a WARNING with the remaining time and waits.
 
 Vendor quirks:
 
@@ -72,7 +76,10 @@ Vendor quirks:
   shorten it. A 429's ``Retry-After`` is held the same way. Until the wait ends, nothing
   is sent: the check runs after any wait for rate limit budget, right before the send.
   A request then waits out a hold within the retry policy's cap and is otherwise
-  refused locally, and a stream reconnect waits it out before its handshake.
+  refused locally, and a stream waits it out before its handshake. A 429 or 418
+  answering a stream handshake sets the same hold, on the rule that a limit stated on
+  one connection holds for this IP. Whether Binance answers handshakes this way, or
+  counts the two hosts together, has not been checked.
 - ``serverShutdown`` frames are logged; the close that follows triggers the
   reconnect. A connection is valid for 24 hours and then dropped, handled the same
   way.
@@ -148,6 +155,8 @@ _MS_PER_SECOND = 1000
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _BANNED_UNTIL = re.compile(r"banned until (\d+)")
 _SHORTEST_BAN_SECONDS = 120.0
+# Under the 30 seconds a stream's start allows, so a wait and its handshake both fit.
+_LONGEST_STREAM_WAIT_SECONDS = 20.0
 
 _WEIGHT = "weight"
 _WS_CONNECT = "ws_connect"
@@ -194,8 +203,10 @@ class _WeightLimiter(RateLimiter):
                 retry_after=remaining,
             )
 
-    async def wait_out_hold(self) -> None:
+    async def wait_out_hold(self, check: Callable[[float], None]) -> None:
+        """Sleep until no hold is left. ``check`` sees each wait and may raise."""
         while (remaining := self._hold_until - self._clock.monotonic()) > 0:
+            check(remaining)
             await self._sleep(remaining)
 
     async def acquire(self, key: str | None = None, tokens: int = 1) -> float:
@@ -498,9 +509,52 @@ class BinanceProvider(Provider):
         def decode(raw: str | bytes) -> tuple[datetime, int, int, Any]:
             return self.clock.now(), generation, ws.stats.dropped, loads_decimal(raw)
 
+        def outlasts_stream(seconds: float) -> bool:
+            # A consumer still waiting to start, or one that asked to fail rather than
+            # sit through an outage, should not block for the whole of a long hold.
+            return seconds > _LONGEST_STREAM_WAIT_SECONDS and (
+                generation == 0 or self._ws_max_reconnects is not None
+            )
+
         async def before_connect() -> None:
             await self._limiter.acquire(_WS_CONNECT)
-            await self._limiter.wait_out_hold()
+            logged = False
+
+            def check(remaining: float) -> None:
+                nonlocal logged
+                if outlasts_stream(remaining):
+                    raise RateLimited(
+                        f"binance told this IP to wait another {remaining:.0f}s; "
+                        "not waiting that long for a stream",
+                        retry_after=remaining,
+                    )
+                if not logged:
+                    logged = True
+                    logger.warning(
+                        "binance told this IP to wait another %.0fs; a stream "
+                        "handshake waits until then",
+                        remaining,
+                    )
+
+            await self._limiter.wait_out_hold(check)
+
+        def on_rejected(
+            status: int, body: bytes, headers: Mapping[str, str]
+        ) -> IsmetError | None:
+            error = self._map_error(status, body, headers)
+            if not isinstance(error, RateLimited) or error.retry_after is None:
+                return None
+            self._limiter.hold(error.retry_after)
+            logger.warning(
+                "stream handshake answered HTTP %d; holding every request and "
+                "handshake for %.0fs",
+                status,
+                error.retry_after,
+            )
+            # A ban is never retried, and a caller starting over is refused locally.
+            return (
+                error if status == 418 or outlasts_stream(error.retry_after) else None
+            )
 
         async def on_connect(ws: WebSocketTransport) -> None:
             nonlocal generation
@@ -511,6 +565,7 @@ class BinanceProvider(Provider):
             self._ws_url,
             on_connect=on_connect,
             before_connect=before_connect,
+            on_rejected=on_rejected,
             on_state=self._ws_on_state,
             backoff=self._ws_backoff,
             max_reconnects=self._ws_max_reconnects,
@@ -521,8 +576,6 @@ class BinanceProvider(Provider):
         )
         gate = StreamGate(contiguous=contiguous)
         seen_generation = 1
-        seen_dropped = 0
-        newest_drop = self._ws_backpressure is BackpressurePolicy.DROP_NEWEST
         self._streams.add(ws)
         try:
             await ws.start()
@@ -532,9 +585,9 @@ class BinanceProvider(Provider):
                 dropped_before,
                 frame,
             ) in ws.messages():
-                dropped = dropped_before if newest_drop else ws.stats.dropped
-                if frame_generation != seen_generation or dropped != seen_dropped:
-                    seen_generation, seen_dropped = frame_generation, dropped
+                lost = ws.lost_before(dropped_before)
+                if frame_generation != seen_generation or lost:
+                    seen_generation = frame_generation
                     gate.mark_reconnected()
                 if number_field not in frame:
                     self._control(frame)

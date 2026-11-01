@@ -9,12 +9,22 @@ fixtures.
 executing, such as a limit far from the market, so the suite can observe it working.
 ``make_marketable_order(client_order_id)``, if given, must return an order that fills
 at once, which lets the suite check how fills are reported.
+``make_unelected_stop_limit(client_order_id)``, if given, must return a stop limit
+order whose stop the market has not reached, so the suite can check that it rests
+unfilled under its own terms rather than going out as a plain limit.
 ``attempts(client_order_id)``, if given, reports how many requests actually reached the
 venue or its test double, which is the only way to catch an adapter that resends
 internally.
 ``arm_ambiguous_outcome()``, if given, makes the next ``place_order`` lose its answer
-after the venue or its test double may have accepted the order, so the suite can check
-that the adapter reports :class:`~ismet.errors.AmbiguousOutcome` rather than a refusal.
+after the venue or its test double has accepted the order, so the suite can check
+that the adapter reports :class:`~ismet.errors.AmbiguousOutcome` rather than a refusal,
+and that a cancel of an order whose ack was never seen still takes effect.
+``arm_status_failure()``, if given, makes the next ``order_status`` fail at the
+transport, so the suite can check that the failure raises rather than looking like an
+order the venue does not have.
+
+A check whose hook was not given is reported as skipped, so a run that proves less
+says so.
 """
 
 from __future__ import annotations
@@ -53,16 +63,19 @@ async def run_trading_conformance(
     id_prefix: str = "CONF",
     timeout: float = 15.0,
     make_marketable_order: Callable[[str], OrderRequest] | None = None,
+    make_unelected_stop_limit: Callable[[str], OrderRequest] | None = None,
     attempts: Callable[[str], int] | None = None,
     unknown_status_error: type[Exception] | None = None,
     arm_ambiguous_outcome: Callable[[], None] | None = None,
+    arm_status_failure: Callable[[], None] | None = None,
 ) -> ConformanceReport:
     """Exercise the order-entry contract and return a report.
 
     ``unknown_status_error`` declares a documented exception to the rule that a status
     query for an order the venue does not have returns ``None``. It is for a provider
     whose ``None`` would falsely say the venue has no such order, because the only
-    record it can consult is local.
+    record it can consult is local. Such a provider must then raise it: a ``None``
+    from it is a failure.
 
     Queries are made both with and without a symbol, because the order manager's fill
     sweep asks for every symbol at once, and an adapter answering that with nothing
@@ -88,6 +101,9 @@ async def run_trading_conformance(
             add(Check(_CAP, name, False, f"{type(exc).__name__}: {exc}"))
             return False, None
         return True, result
+
+    def skip(name: str, hook: str) -> None:
+        add(Check(_CAP, name, True, f"skipped: no {hook} given", skipped=True))
 
     rules = venue.trading_rules()
     add(Check(_CAP, "declares_order_types", bool(rules.order_types)))
@@ -126,7 +142,10 @@ async def run_trading_conformance(
                     "status_reports_terms",
                     snapshot.symbol == symbol
                     and snapshot.side is request.side
-                    and snapshot.quantity == request.quantity,
+                    and snapshot.quantity == request.quantity
+                    and snapshot.limit_price == request.limit_price,
+                    f"{snapshot.side.value} {snapshot.quantity} {snapshot.symbol} at "
+                    f"{snapshot.limit_price}",
                 )
             )
             add(
@@ -148,7 +167,36 @@ async def run_trading_conformance(
         )
         add(Check(_CAP, "status_of_unknown_order", declared, type(exc).__name__))
     else:
-        add(Check(_CAP, "status_none_when_not_found", missing is None))
+        if unknown_status_error is not None:
+            # The declared exception says this provider's None cannot be trusted.
+            add(
+                Check(
+                    _CAP,
+                    "status_of_unknown_order",
+                    False,
+                    f"returned {missing!r}; expected {unknown_status_error.__name__}",
+                )
+            )
+        else:
+            add(Check(_CAP, "status_none_when_not_found", missing is None))
+
+    if arm_status_failure is None:
+        skip("failed_status_query_raises", "arm_status_failure")
+    else:
+        arm_status_failure()
+        try:
+            answer = await asyncio.wait_for(venue.order_status(cid, symbol), timeout)
+        except Exception as exc:
+            add(Check(_CAP, "failed_status_query_raises", True, type(exc).__name__))
+        else:
+            add(
+                Check(
+                    _CAP,
+                    "failed_status_query_raises",
+                    False,
+                    "no order" if answer is None else f"status {answer.status.value}",
+                )
+            )
 
     ok, listed = await step("open_orders", venue.open_orders(symbol))
     if ok:
@@ -169,18 +217,34 @@ async def run_trading_conformance(
             )
         )
 
-    if attempts is not None:
+    if attempts is None:
+        skip("place_sends_exactly_once", "attempts")
+    else:
         count = attempts(cid)
         add(Check(_CAP, "place_sends_exactly_once", count == 1, f"{count} requests"))
-    await _check_duplicate_refused(venue, request, report)
+    await _check_duplicate_refused(venue, request, report, timeout)
     await _check_stream_reports(venue, make_passive_order, id_prefix, report, timeout)
-    if make_marketable_order is not None:
+    if make_marketable_order is None:
+        skip("stream_reports_fill", "make_marketable_order")
+    else:
         await _check_fill_reporting(
             venue, make_marketable_order(f"{id_prefix}-3"), report, timeout
         )
-    if arm_ambiguous_outcome is not None:
+    if arm_ambiguous_outcome is None:
+        skip("lost_answer_is_ambiguous_outcome", "arm_ambiguous_outcome")
+    else:
         await _check_ambiguous_outcome(
-            venue, make_passive_order(f"{id_prefix}-4"), arm_ambiguous_outcome, report
+            venue,
+            make_passive_order(f"{id_prefix}-4"),
+            arm_ambiguous_outcome,
+            report,
+            timeout,
+        )
+    if make_unelected_stop_limit is None:
+        skip("stop_limit_rests_unelected", "make_unelected_stop_limit")
+    else:
+        await _check_stop_limit(
+            venue, make_unelected_stop_limit(f"{id_prefix}-5"), report, timeout
         )
 
     ok, _ = await step("cancel_order", venue.cancel_order(cid, symbol))
@@ -194,6 +258,21 @@ async def run_trading_conformance(
                     after is not None and after.status is OrderStatus.CANCELED,
                 )
             )
+        # A cancel can cross the order's close at the venue. The order manager reads
+        # anything but VenueError from a cancel as "unknown whether applied" and marks
+        # the order UNKNOWN, so a closed order must refuse with VenueError.
+        try:
+            await asyncio.wait_for(venue.cancel_order(cid, symbol), timeout)
+        except VenueError:
+            add(Check(_CAP, "cancel_of_closed_is_venue_error", True))
+        except Exception as exc:
+            add(
+                Check(
+                    _CAP, "cancel_of_closed_is_venue_error", False, type(exc).__name__
+                )
+            )
+        else:
+            add(Check(_CAP, "cancel_of_closed_is_venue_error", False, "no error"))
 
     try:
         await venue.cancel_order(f"{id_prefix}-never-sent", symbol)
@@ -214,17 +293,19 @@ async def run_trading_conformance(
 
 
 async def _check_duplicate_refused(
-    venue: TradingCapability, request: OrderRequest, report: ConformanceReport
+    venue: TradingCapability,
+    request: OrderRequest,
+    report: ConformanceReport,
+    timeout: float,
 ) -> None:
     """A repeated client order id must not create a second order."""
+    add = report.checks.append
     try:
         await venue.place_order(request)
     except DuplicateOrderId as exc:
-        report.checks.append(
-            Check(_CAP, "duplicate_client_id_refused", True, str(exc.code))
-        )
+        add(Check(_CAP, "duplicate_client_id_refused", True, str(exc.code)))
     except IsmetError as exc:
-        report.checks.append(
+        add(
             Check(
                 _CAP,
                 "duplicate_client_id_refused",
@@ -233,9 +314,15 @@ async def _check_duplicate_refused(
             )
         )
     else:
-        report.checks.append(
-            Check(_CAP, "duplicate_client_id_refused", False, "second order accepted")
-        )
+        add(Check(_CAP, "duplicate_client_id_refused", False, "second order accepted"))
+    # The exception alone does not show that nothing was created.
+    try:
+        listed = await asyncio.wait_for(venue.open_orders(request.symbol), timeout)
+    except Exception as exc:
+        add(Check(_CAP, "duplicate_leaves_one_order", False, repr(exc)))
+        return
+    rows = sum(1 for item in listed if item.client_order_id == request.client_order_id)
+    add(Check(_CAP, "duplicate_leaves_one_order", rows == 1, f"{rows} open rows"))
 
 
 async def _check_ambiguous_outcome(
@@ -243,19 +330,23 @@ async def _check_ambiguous_outcome(
     request: OrderRequest,
     arm: Callable[[], None],
     report: ConformanceReport,
+    timeout: float,
 ) -> None:
     """A lost answer must surface as ``AmbiguousOutcome``, never as a refusal.
 
     The order manager records a refusal as never delivered and closes the order. An
     adapter that reports a lost answer that way leaves a possibly live order unwatched.
+    The order is then cancelled without an ack ever seen, as a kill sweep would.
     """
+    add = report.checks.append
+    cid, symbol = request.client_order_id, request.symbol
     arm()
     try:
         await venue.place_order(request)
     except AmbiguousOutcome:
-        report.checks.append(Check(_CAP, "lost_answer_is_ambiguous_outcome", True))
+        add(Check(_CAP, "lost_answer_is_ambiguous_outcome", True))
     except Exception as exc:
-        report.checks.append(
+        add(
             Check(
                 _CAP,
                 "lost_answer_is_ambiguous_outcome",
@@ -264,7 +355,7 @@ async def _check_ambiguous_outcome(
             )
         )
     else:
-        report.checks.append(
+        add(
             Check(
                 _CAP,
                 "lost_answer_is_ambiguous_outcome",
@@ -272,9 +363,72 @@ async def _check_ambiguous_outcome(
                 "the armed fault did not fire",
             )
         )
+    try:
+        await asyncio.wait_for(venue.cancel_order(cid, symbol), timeout)
+        after = await asyncio.wait_for(venue.order_status(cid, symbol), timeout)
+    except Exception as exc:
+        add(
+            Check(
+                _CAP,
+                "cancel_without_ack_takes_effect",
+                False,
+                f"{type(exc).__name__}: {exc}",
+            )
+        )
+        return
+    add(
+        Check(
+            _CAP,
+            "cancel_without_ack_takes_effect",
+            after is not None and after.status is OrderStatus.CANCELED,
+            "no order" if after is None else after.status.value,
+        )
+    )
+
+
+async def _check_stop_limit(
+    venue: TradingCapability,
+    request: OrderRequest,
+    report: ConformanceReport,
+    timeout: float,
+) -> None:
+    """A stop limit whose stop is not reached must rest, unfilled, under its terms.
+
+    An adapter that drops the stop sends a limit order that may execute at once.
+    """
+    add = report.checks.append
+    cid, symbol = request.client_order_id, request.symbol
+    try:
+        try:
+            await asyncio.wait_for(venue.place_order(request), timeout)
+            snapshot = await asyncio.wait_for(venue.order_status(cid, symbol), timeout)
+        except Exception as exc:
+            add(
+                Check(
+                    _CAP,
+                    "stop_limit_rests_unelected",
+                    False,
+                    f"{type(exc).__name__}: {exc}",
+                )
+            )
+            return
+        if snapshot is None:
+            add(Check(_CAP, "stop_limit_rests_unelected", False, "no order"))
+            return
+        add(
+            Check(
+                _CAP,
+                "stop_limit_rests_unelected",
+                snapshot.status is OrderStatus.ACCEPTED
+                and snapshot.filled_quantity == 0
+                and snapshot.limit_price == request.limit_price,
+                f"{snapshot.status.value}, {snapshot.filled_quantity} filled, limit "
+                f"{snapshot.limit_price}",
+            )
+        )
     finally:
         with contextlib.suppress(IsmetError):
-            await venue.cancel_order(request.client_order_id, request.symbol)
+            await venue.cancel_order(cid, symbol)
 
 
 async def _check_stream_reports(
@@ -377,6 +531,26 @@ async def _check_fill_reporting(
             any(f.fill_id == streamed.fill_id for f in everything),
         )
     )
+    # ``since`` is inclusive, by the fill's own time: the order manager's sweep window
+    # starts at the last fill it knows, so an exclusive or shifted comparison loses
+    # fills, and one ignored returns the whole history every pass.
+    if not ours:
+        return  # already failed above, and there is no fill time to ask by
+    known = next((f for f in ours if f.fill_id == streamed.fill_id), ours[0])
+    later = known.ts + timedelta(seconds=1)
+    for name, since, wanted in (
+        ("fills_since_includes_fill_at_since", known.ts, True),
+        ("fills_since_excludes_fill_before_since", later, False),
+    ):
+        try:
+            answer = await asyncio.wait_for(
+                venue.fills_since(since, request.symbol), timeout
+            )
+        except Exception as exc:
+            add(Check(_CAP, name, False, repr(exc)))
+            continue
+        found = any(f.fill_id == known.fill_id for f in answer)
+        add(Check(_CAP, name, found == wanted, f"since {since.isoformat()}"))
 
 
 def _traded(fill: Fill) -> tuple[str, str, str, str]:

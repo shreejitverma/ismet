@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
+from websockets.asyncio.server import ServerConnection, serve
 
 from ismet.capabilities import Capability
 from ismet.config import ProviderSettings
@@ -30,7 +33,7 @@ from ismet.testing.replay import ReplayTransport, WsReplayServer, load_exchanges
 from ismet.transport.backoff import NO_RETRY, ExponentialBackoff, RetryPolicy
 from ismet.transport.clock import ManualClock
 from ismet.transport.ratelimit import TokenBucket
-from ismet.transport.ws import ConnectionState
+from ismet.transport.ws import BackpressurePolicy, ConnectionState
 
 from ._support import (
     FAST_BACKOFF,
@@ -790,3 +793,43 @@ def test_a_reconnect_bound_that_is_not_a_count_is_refused() -> None:
     settings = ProviderSettings(name="coinbase", options={"ws_max_reconnects": "many"})
     with pytest.raises(ConfigError, match="ws_max_reconnects"):
         CoinbaseProvider.from_settings(settings)
+
+
+async def test_events_queued_behind_a_forced_eviction_are_flagged() -> None:
+    """A control frame evicts A from a full queue, so B follows a real loss."""
+    recorded = session("coinbase", "ticker").frames
+    subscribed = session("coinbase", "ticker").control[0]
+    go = asyncio.Event()
+
+    async def handler(conn: ServerConnection) -> None:
+        await conn.recv()
+        await conn.send(recorded[0])
+        await go.wait()
+        for raw in recorded[1:4]:  # A, B, C fill a queue of 3
+            await conn.send(raw)
+        await conn.send(subscribed)  # evicts A
+        await conn.wait_closed()
+
+    async with serve(handler, "127.0.0.1", 0) as server:
+        port = next(iter(server.sockets)).getsockname()[1]
+        provider = CoinbaseProvider(
+            http_transport=replay("coinbase", "conformance"),
+            ws_url=f"ws://127.0.0.1:{port}",
+            ws_queue_size=3,
+            ws_backpressure=BackpressurePolicy.DROP_NEWEST,
+        )
+        async with provider:
+            stream = provider.stream_quotes([BTC])
+            await asyncio.wait_for(stream.__anext__(), 10)  # type: ignore[attr-defined]
+            ws = next(iter(provider._streams))
+            go.set()
+            deadline = time.monotonic() + 10
+            while ws.stats.received < 5:
+                assert time.monotonic() < deadline
+                await asyncio.sleep(0.005)
+            assert ws.stats.dropped == 1
+            behind = await asyncio.wait_for(stream.__anext__(), 10)  # type: ignore[attr-defined]
+            after = await asyncio.wait_for(stream.__anext__(), 10)  # type: ignore[attr-defined]
+    assert QualityFlag.AFTER_GAP in behind.flags
+    assert QualityFlag.AFTER_GAP not in after.flags
+    assert behind.sequence == json.loads(recorded[2])["sequence"]

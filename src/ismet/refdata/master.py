@@ -23,6 +23,7 @@ from ismet.calendars import TradingCalendar, get_calendar
 from ismet.errors import ValidationError
 from ismet.models import Adjustment, Bar, Symbol
 from ismet.models.decimals import add, mul, ratio, sub
+from ismet.refdata.codes import accepting_stored_codes
 
 _FOREVER = date.max
 _BEGINNING = datetime(1900, 1, 1, tzinfo=timezone.utc)
@@ -446,7 +447,9 @@ def adjust_bars(
                 fields[name] = factors.price(fields[name])
         fields["volume"] = _rounded(mul(bar.volume, factors.volume))
         fields["adjustment"] = target
-        result.append(Bar.model_validate(fields))
+        # Only prices changed. Its codes may come from a store, registered elsewhere.
+        with accepting_stored_codes():
+            result.append(Bar.model_validate(fields))
     return result
 
 

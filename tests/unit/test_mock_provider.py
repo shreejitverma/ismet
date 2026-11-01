@@ -195,3 +195,49 @@ def test_from_settings_rejects_bad_options_with_config_error(
         MockProvider.from_settings(ProviderSettings(name="mock", options=options))
     key = next(iter(options)).upper()
     assert f"ISMET_MOCK_{key}" in str(info.value)
+
+
+async def test_concurrent_streams_each_see_an_unbroken_sequence() -> None:
+    """One ticker, two streams and a snapshot, with nothing lost: no gap anywhere."""
+    from ismet import IsmetClient
+    from ismet.marketdata.quality import GapPolicy
+
+    async with IsmetClient([MockProvider(tick_interval=0)]) as client:
+        quotes = client.stream_quotes(["ACME@XMOK"], gap_policy=GapPolicy.RAISE)
+        trades = client.stream_trades(["ACME@XMOK"], gap_policy=GapPolicy.RAISE)
+        seen_quotes, seen_trades = [], []
+        for _ in range(5):
+            seen_quotes.append(await quotes.__anext__())
+            seen_trades.append(await trades.__anext__())
+            await client.quote("ACME@XMOK")
+        await quotes.aclose()
+        await trades.aclose()
+    assert [q.sequence for q in seen_quotes] == [1, 2, 3, 4, 5]
+    assert [t.sequence for t in seen_trades] == [1, 2, 3, 4, 5]
+    assert not any(q.flags for q in seen_quotes)
+    assert not any(t.flags for t in seen_trades)
+
+
+async def test_trade_ids_stay_unique_across_streams_on_one_ticker() -> None:
+    provider = MockProvider(tick_interval=0)
+    symbol = Symbol(venue="XMOK", ticker="ACME")
+    first, second = provider.stream_trades([symbol]), provider.stream_trades([symbol])
+    ids = [
+        (await stream.__anext__()).trade_id  # type: ignore[attr-defined]
+        for stream in (first, second, first, second)
+    ]
+    assert len(set(ids)) == 4
+
+
+async def test_a_restarted_or_concurrent_stream_keeps_the_seeded_prices() -> None:
+    symbol = Symbol(venue="XMOK", ticker="ACME")
+
+    async def take_prices(provider: MockProvider) -> list[Decimal]:
+        stream = provider.stream_quotes([symbol])
+        prices = [(await stream.__anext__()).last for _ in range(3)]  # type: ignore[attr-defined]
+        await stream.aclose()  # type: ignore[attr-defined]
+        return prices
+
+    assert await take_prices(MockProvider(tick_interval=0)) == await take_prices(
+        MockProvider(tick_interval=0)
+    )

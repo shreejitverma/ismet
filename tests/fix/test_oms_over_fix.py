@@ -6,7 +6,9 @@ the evidence for the claim that matters: one intent is at most one order.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import threading
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -24,7 +26,7 @@ from ismet.execution import (
     RiskLimits,
     SqliteJournal,
 )
-from ismet.execution.manager import CheckpointHook
+from ismet.execution.manager import CheckpointHook, EventHook
 from ismet.execution.reconcile import BreakKind, ReconBreak
 from ismet.fix.provider import FixProvider
 from ismet.fix.store import FixStore, MemoryFixStore, SqliteFixStore
@@ -37,7 +39,13 @@ from ismet.models import (
     Symbol,
     Timeliness,
 )
-from ismet.models.orders import OrderRequest, OrderSide, OrderStatus
+from ismet.models.orders import (
+    CancelRequested,
+    OrderEvent,
+    OrderRequest,
+    OrderSide,
+    OrderStatus,
+)
 
 from .acceptor import FixAcceptor, VenueOrder
 from .conftest import eventually, session_config
@@ -139,6 +147,7 @@ class Rig:
         ack_timeout: float = 0.2,
         unknown_grace: float = 0.0,
         checkpoint: CheckpointHook | None = None,
+        on_event: EventHook | None = None,
         block_while_unknown: bool = False,
         **session: Any,
     ) -> OrderManager:
@@ -166,6 +175,7 @@ class Rig:
             reconcile_interval=3600.0,
             kill_poll_interval=0.01,
             on_break=self.breaks.append,
+            on_event=on_event,
             checkpoint=checkpoint,
         )
         await self.oms.start()
@@ -721,6 +731,42 @@ class TestCrashRecovery:
         assert list(acceptor.orders) == ["C1"]
         assert acceptor.of_type("F") == []
 
+    async def test_a_working_order_on_a_lost_store_is_resolved_by_an_operator(
+        self, acceptor: FixAcceptor, rig: Rig
+    ) -> None:
+        """It becomes unknown, which is where ``resolve_unknown`` applies. Nothing
+        cancels or closes it by itself, and every new order waits meanwhile."""
+        oms = await rig.build()
+        await oms.submit(request())
+        await rig.teardown()
+        self._lose_the_store(acceptor, rig)
+
+        restarted = await rig.build()
+        report = await restarted.reconcile()
+        assert [b.kind for b in report.breaks] == [BreakKind.QUERY_FAILED]
+        assert restarted.order("C1").status is OrderStatus.UNKNOWN
+        with pytest.raises(RiskRejected):
+            await restarted.submit(request("C2"))
+        assert acceptor.of_type("F") == []
+        assert acceptor.orders["C1"].status == "0"
+
+        # The operator cancels at the counterparty and confirms, then resolves.
+        acceptor.orders["C1"].status = "4"
+        state = await restarted.resolve_unknown(
+            "C1", operator="ops", reason="cancelled and confirmed at the venue"
+        )
+        assert state.status is OrderStatus.REJECTED
+        assert state.reject_code == "RESOLVED_BY_OPERATOR"
+        assert (await restarted.reconcile()).clean
+        assert (await restarted.submit(request("C2"))).status is OrderStatus.ACCEPTED
+        assert [m.get(11) for m in acceptor.of_type("D")] == ["C1", "C2"]
+        await rig.teardown()
+
+        again = await rig.build()
+        assert (await again.reconcile()).clean
+        assert again.order("C1").reject_code == "RESOLVED_BY_OPERATOR"
+        assert again.order("C2").status is OrderStatus.ACCEPTED
+
     async def test_a_wiped_store_that_carried_a_new_order_does_not_clear_the_old_one(
         self, acceptor: FixAcceptor, rig: Rig
     ) -> None:
@@ -739,6 +785,51 @@ class TestCrashRecovery:
         again = await rig.build()
         await again.reconcile()
         assert again.order("C1").status is OrderStatus.UNKNOWN
+
+
+class TestCancelDuringPlacement:
+    async def test_a_cancel_during_the_halt_check_waits_for_the_row_and_is_sent(
+        self, acceptor: FixAcceptor, rig: Rig
+    ) -> None:
+        """The send checks the quarantine before it writes its row. A cancel that
+        looks for the row meanwhile must wait, not be refused while the order goes
+        out anyway."""
+        cancel_recorded = asyncio.Event()
+
+        def on_event(event: OrderEvent, _: Any) -> None:
+            if isinstance(event, CancelRequested):
+                cancel_recorded.set()
+
+        oms = await rig.build(on_event=on_event)
+        # Hold the send inside its quarantine check, on the store's own thread.
+        reached, release = threading.Event(), threading.Event()
+        real_quarantined = rig.store.quarantined
+
+        def gated_quarantined():  # type: ignore[no-untyped-def]
+            reached.set()
+            release.wait(5.0)
+            return real_quarantined()
+
+        rig.store.quarantined = gated_quarantined  # type: ignore[method-assign]
+        placing = asyncio.create_task(oms.submit(request()))
+        await eventually(reached.is_set)
+        cancelling = asyncio.create_task(oms.cancel("C1"))
+        # The cancel is journalled, then goes to the provider; give it the turns it
+        # takes to get there, so it is in front of the row's write either way.
+        await asyncio.wait_for(cancel_recorded.wait(), 5.0)
+        for _ in range(20):
+            await asyncio.sleep(0)
+        release.set()
+
+        await placing
+        await cancelling
+        state = await oms.wait_for("C1", lambda s: s.is_terminal, 3.0)
+        assert state.status is OrderStatus.CANCELED
+        assert acceptor.orders["C1"].status == "4"
+        assert [m.msg_type for m in acceptor.received if m.msg_type in "DF"] == [
+            "D",
+            "F",
+        ]
 
 
 class TestHaltAcrossRestart:

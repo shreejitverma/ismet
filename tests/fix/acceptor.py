@@ -28,6 +28,7 @@ from ismet.fix.message import (
 
 FieldList = list[tuple[int, str]]
 ADMIN = {"0", "1", "2", "3", "4", "5", "A"}
+CLOSED = {"2", "4", "8", "C"}
 
 
 @dataclass
@@ -512,6 +513,8 @@ class FixAcceptor:
         orig = message.require(41)
         order = self._order_for(orig)
         reason = self.faults.cancel_reject
+        if reason is None and order is not None and order.status in CLOSED:
+            reason = "0"  # too late to cancel, as a venue answers for a closed order
         if order is None or reason is not None:
             await self.send(
                 "9",
@@ -632,11 +635,7 @@ class FixAcceptor:
         """Report on an order, in the form this acceptor's FIX version uses."""
         order = self.orders[cl_ord_id]
         identifier = exec_id or ("0" if status_reply else self.next_exec_id())
-        leaves = (
-            Decimal(0)
-            if ord_status in ("2", "4", "8", "C")
-            else order.quantity - order.filled
-        )
+        leaves = Decimal(0) if ord_status in CLOSED else order.quantity - order.filled
         fields: FieldList = [
             (37, order.order_id),
             (11, wire_id or order.wire_id),
