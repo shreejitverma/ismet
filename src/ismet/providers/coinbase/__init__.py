@@ -105,7 +105,6 @@ from ismet.providers.base import Provider, max_reconnects_option
 from ismet.transport.backoff import (
     ExponentialBackoff,
     RetryPolicy,
-    should_retry_after_stated_wait,
 )
 from ismet.transport.circuit import CircuitBreaker
 from ismet.transport.clock import SYSTEM_CLOCK, Clock
@@ -138,7 +137,7 @@ RATE_LIMITS: Mapping[str, RateLimitSpec] = {
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _ONE_SECOND = timedelta(seconds=1)
 
-COINBASE_RETRY = RetryPolicy(should_retry=should_retry_after_stated_wait)
+COINBASE_RETRY = RetryPolicy()
 
 E = TypeVar("E", bound=MarketEvent)
 

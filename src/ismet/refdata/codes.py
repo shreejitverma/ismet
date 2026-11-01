@@ -24,6 +24,7 @@ from types import MappingProxyType
 _MIC_FORMAT = re.compile(r"^[A-Z0-9]{4}$")
 # Crypto tickers include single letters and non-Latin names, so only shape is checked.
 _ASSET_FORMAT = re.compile(r"^[^\W_]{1,20}$")
+_MINOR_UNIT_SPELLING = re.compile(r"^[A-Z]{2}[a-z]$")
 
 NON_MONETARY_ISO_CODES = frozenset({"XTS", "XXX"})
 """ISO 4217 codes for testing and for "no currency"; never valid on a price."""
@@ -233,8 +234,20 @@ def validate_venue(value: str) -> str:
 
 
 def validate_currency(value: str) -> str:
-    """Normalise ``value`` and require an ISO, quote-unit, or crypto code."""
-    upper = value.strip().upper()
+    """Normalise ``value`` and require an ISO, quote-unit, or crypto code.
+
+    Vendors spell a minor unit as an ISO code with a lower case last letter, so
+    upper-casing would turn pence into pounds. ``GBp`` is read as ``GBX``, and any other
+    such spelling of an ISO code is refused.
+    """
+    stripped = value.strip()
+    if stripped == "GBp":
+        return "GBX"
+    upper = stripped.upper()
+    if _MINOR_UNIT_SPELLING.match(stripped) and is_iso_currency(upper):
+        raise ValueError(
+            f"ambiguous currency code: {stripped!r} may mean a minor unit of {upper}"
+        )
     if not _ASSET_FORMAT.match(upper) and upper not in QUOTE_MINOR_UNITS:
         raise ValueError(f"invalid currency code: {upper!r}")
     if upper in NON_MONETARY_ISO_CODES:

@@ -14,7 +14,7 @@ Source: [17 CFR 240.15c3-5 (eCFR)](https://www.ecfr.gov/current/title-17/chapter
 
 | Requirement | ISMET mechanism | Firm remains responsible for |
 |---|---|---|
-| (c)(1)(i) Credit and capital thresholds | `max_gross_notional`, `max_position`, per account and strategy scopes | Setting appropriate thresholds. Aggregating across every system, since ISMET sees only its own orders. |
+| (c)(1)(i) Credit and capital thresholds | `max_gross_notional` and `max_position`, by default and per symbol. Both are refused in per account and per strategy scopes, because exposure is tracked per symbol and not per scope. | Setting appropriate thresholds. Aggregating across every system, since ISMET sees only its own orders. Enforcing account or strategy exposure limits elsewhere. |
 | (c)(1)(ii) Reject erroneous orders by price or size, per order or over a short period; catch duplicates | `price_collar_bps`, `max_order_quantity`, `max_order_notional`, `max_orders_per_second`, duplicate check | Calibrating parameters per instrument |
 | (c)(2) Regulatory requirements before entry | Restricted list, short-sale marking and locate hook, session check | The content of those lists, and all other pre-entry regulatory requirements |
 | (c)(2) Authorized access | Not provided | Access control to the systems running ISMET |
@@ -65,7 +65,8 @@ ISMET does not have an algo identifier field wired to any Indian broker yet, and
 
 ## Market data licensing
 
-ISMET ships no market data and no redistribution rights.
+The ISMET wheel and source distribution ship no market data and no redistribution rights.
+The public source repository still contains recorded venue responses under `tests/fixtures/`, pending the legal review listed in `docs/GAP_MATRIX.md`.
 Each provider's data is governed by the user's agreement with that provider.
 Exchange data commonly restricts display, non-display use, and redistribution.
 Calendars bundled with ISMET are factual schedules derived from an Apache-2.0 project.

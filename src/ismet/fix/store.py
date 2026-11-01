@@ -17,6 +17,8 @@ The store also keeps what the provider must not lose: the terms of each order (F
 requires Side on a cancel or status request, which the capability's signature does not
 supply), the chain of ClOrdIDs, and each execution by ExecID. A report's order update
 and its execution record commit together, so a crash cannot apply half of a report.
+A store is stamped with a random id when it is created, so that a store which was lost
+and started again can be told from the one an order was sent under.
 Credentials never reach this module, because Logon is not stored.
 """
 
@@ -25,6 +27,7 @@ from __future__ import annotations
 import dataclasses
 import sqlite3
 import threading
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -85,6 +88,10 @@ class QuarantinedMessage:
 class FixStore(Protocol):
     """Session and order state. Every mutating call is durable when it returns."""
 
+    def store_id(self) -> str:
+        """A random id stamped when this store was created, and never changed."""
+        ...
+
     def next_outbound(self) -> int: ...
 
     def next_inbound(self) -> int: ...
@@ -138,8 +145,13 @@ class FixStore(Protocol):
         order_open: bool = True,
         execution: StoredExecution | None = None,
         bust_exec_id: str | None = None,
+        quarantine: QuarantinedMessage | None = None,
     ) -> None:
-        """Atomically update the order, add the execution, and mark a bust."""
+        """Atomically update the order, add the execution, mark a bust, and quarantine.
+
+        The execution being known stops a redelivery of the report from being looked at
+        again, so a halt the report caused must commit with it.
+        """
         ...
 
     def fills_since(self, since_us: int) -> list[StoredExecution]:
@@ -174,6 +186,7 @@ class MemoryFixStore:
     """The same behaviour in memory, for tests. Not durable."""
 
     def __init__(self) -> None:
+        self._store_id = uuid.uuid4().hex
         self._next_out = 1
         self._next_in = 1
         self._messages: dict[int, StoredMessage] = {}
@@ -183,6 +196,9 @@ class MemoryFixStore:
         self._wire: dict[str, str] = {}
         self._executions: dict[tuple[str, str], StoredExecution] = {}
         self._quarantine: list[QuarantinedMessage] = []
+
+    def store_id(self) -> str:
+        return self._store_id
 
     def next_outbound(self) -> int:
         return self._next_out
@@ -256,6 +272,7 @@ class MemoryFixStore:
         order_open: bool = True,
         execution: StoredExecution | None = None,
         bust_exec_id: str | None = None,
+        quarantine: QuarantinedMessage | None = None,
     ) -> None:
         if order_payload is not None:
             self.put_order(client_order_id, order_payload, is_open=order_open)
@@ -268,6 +285,8 @@ class MemoryFixStore:
                 self._executions[(client_order_id, bust_exec_id)] = dataclasses.replace(
                     known, busted=True
                 )
+        if quarantine is not None:
+            self._quarantine.append(quarantine)
 
     def fills_since(self, since_us: int) -> list[StoredExecution]:
         return [
@@ -313,6 +332,10 @@ _EXECUTION_COLUMNS = (
 )
 
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS fix_store_identity (
+    session TEXT PRIMARY KEY,
+    store_id TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS fix_sequence (
     session TEXT PRIMARY KEY,
     next_out INTEGER NOT NULL,
@@ -404,6 +427,11 @@ class SqliteFixStore:
                 "VALUES (?, 1, 1)",
                 (session,),
             )
+            self._conn.execute(
+                "INSERT OR IGNORE INTO fix_store_identity (session, store_id) "
+                "VALUES (?, ?)",
+                (session, uuid.uuid4().hex),
+            )
         except sqlite3.Error as exc:
             self._conn.close()
             raise FixStoreError(f"cannot open FIX store {self.path}: {exc}") from exc
@@ -428,6 +456,12 @@ class SqliteFixStore:
                 return self._conn.execute(sql, args).fetchall()
             except sqlite3.Error as exc:
                 raise FixStoreError(f"FIX store read failed: {exc}") from exc
+
+    def store_id(self) -> str:
+        rows = self._query(
+            "SELECT store_id FROM fix_store_identity WHERE session = ?", self.session
+        )
+        return str(rows[0][0])
 
     def next_outbound(self) -> int:
         rows = self._query(
@@ -577,6 +611,7 @@ class SqliteFixStore:
         order_open: bool = True,
         execution: StoredExecution | None = None,
         bust_exec_id: str | None = None,
+        quarantine: QuarantinedMessage | None = None,
     ) -> None:
         with self._transaction() as conn:
             if order_payload is not None:
@@ -606,6 +641,8 @@ class SqliteFixStore:
                     "AND client_order_id = ? AND exec_id = ?",
                     (self.session, client_order_id, bust_exec_id),
                 )
+            if quarantine is not None:
+                self._insert_quarantine(conn, quarantine)
 
     def fills_since(self, since_us: int) -> list[StoredExecution]:
         rows = self._query(
@@ -626,24 +663,29 @@ class SqliteFixStore:
 
     def quarantine(self, record: QuarantinedMessage) -> None:
         with self._transaction() as conn:
-            conn.execute(
-                "INSERT INTO fix_quarantine "
-                "(session, seq, msg_type, content, reason, received_at, halted, "
-                "released_by, release_reason, released_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    self.session,
-                    record.seq,
-                    record.msg_type,
-                    record.content,
-                    record.reason,
-                    record.received_at,
-                    int(record.halted),
-                    record.released_by,
-                    record.release_reason,
-                    record.released_at,
-                ),
-            )
+            self._insert_quarantine(conn, record)
+
+    def _insert_quarantine(
+        self, conn: sqlite3.Connection, record: QuarantinedMessage
+    ) -> None:
+        conn.execute(
+            "INSERT INTO fix_quarantine "
+            "(session, seq, msg_type, content, reason, received_at, halted, "
+            "released_by, release_reason, released_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                self.session,
+                record.seq,
+                record.msg_type,
+                record.content,
+                record.reason,
+                record.received_at,
+                int(record.halted),
+                record.released_by,
+                record.release_reason,
+                record.released_at,
+            ),
+        )
 
     def quarantined(self) -> list[QuarantinedMessage]:
         rows = self._query(

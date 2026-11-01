@@ -110,9 +110,12 @@ class BarStore:
         from the latest stored version raises :class:`~ismet.errors.ValidationError`
         and nothing in the call is written, because a read would mix price scales.
         """
-        now = self._clock.now().astimezone(timezone.utc)
         inserted = unchanged = revised = 0
         with self._conn:
+            # Hold the write lock from the first read, or another writer's revision
+            # could land between that read and the insert, and this one would bury it.
+            self._conn.execute("BEGIN IMMEDIATE")
+            now = self._clock.now().astimezone(timezone.utc)
             for bar in bars:
                 key = (
                     bar.symbol.venue,
@@ -360,7 +363,9 @@ async def backfill(
     start can: that window is fetched again and judged as new. A window's failure is
     logged and counted, and the rest continue. An empty window counts as finished only
     if ``calendar`` shows no session touching it. With ``calendar``, every session must
-    have at least one bar, at any interval, for the window holding its close to finish.
+    have at least one bar, at daily or shorter intervals, for the window holding its
+    close to finish; a longer interval with ``calendar`` raises, since one bar spans
+    many sessions.
     The bars can be in an earlier window, since a session can straddle several, and the
     store is what is asked. Sessions that began before ``start`` or close after ``end``
     were only partly requested, so they are not required. The bars received are kept
@@ -371,6 +376,11 @@ async def backfill(
         raise ValidationError("window must be positive")
     if start >= end:
         raise ValidationError(f"backfill start {start} is not before end {end}")
+    if calendar is not None and interval in (Interval.W1, Interval.MO1):
+        raise ValidationError(
+            f"a calendar checks that each session has a bar, which {interval.value} "
+            "bars cannot show; backfill them without one"
+        )
     report = BackfillReport()
     cursor = start
     while cursor < end:

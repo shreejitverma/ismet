@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
+import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -958,3 +961,93 @@ async def test_the_reconnect_bound_is_reachable_from_configuration(
 def test_a_reconnect_bound_that_is_not_a_count_is_refused(value: object) -> None:
     with pytest.raises(ConfigError, match="ws_max_reconnects"):
         BinanceProvider.from_settings(_unreachable(ws_max_reconnects=value))
+
+
+async def test_requests_queued_for_budget_are_not_sent_during_a_hold() -> None:
+    sent: list[str] = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        sent.append(str(request.url))
+        await asyncio.sleep(0.05)
+        return httpx.Response(429, headers={"Retry-After": "300"}, json=TOO_MUCH_WEIGHT)
+
+    provider = BinanceProvider(http_transport=httpx.MockTransport(respond))
+    provider._currencies["BTCUSDT"] = "USDT"
+    async with provider:
+        results = await asyncio.gather(
+            *(provider.order_book(BTC, 5000) for _ in range(5)),
+            return_exceptions=True,
+        )
+    assert all(isinstance(result, RateLimited) for result in results)
+    # A burst of 1200 pays for four requests at weight 250. The fifth queues for
+    # budget, and by the time it has that budget the venue has said to wait.
+    assert len(sent) == 4
+
+
+async def test_a_request_during_a_short_hold_waits_it_out() -> None:
+    sent_at: list[float] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        sent_at.append(time.monotonic())
+        if len(sent_at) == 1:
+            return httpx.Response(
+                429, headers={"Retry-After": "0.3"}, json=TOO_MUCH_WEIGHT
+            )
+        return httpx.Response(200, json={"symbols": []})
+
+    provider = BinanceProvider(http_transport=httpx.MockTransport(respond))
+    async with provider:
+        first = asyncio.ensure_future(provider._get("/a", {}, "klines"))
+        await asyncio.sleep(0.05)
+        await provider._get("/b", {}, "klines")
+        await first
+    assert len(sent_at) == 3
+    assert min(sent_at[1:]) - sent_at[0] >= 0.3
+
+
+async def test_a_policy_cap_below_the_stated_wait_refuses_the_retry() -> None:
+    limited = httpx.Response(429, headers={"Retry-After": "3"}, json=TOO_MUCH_WEIGHT)
+    transport, seen = _serving(limited)
+    provider = BinanceProvider(
+        http_transport=transport,
+        retry_policy=replace(BINANCE_RETRY, max_retry_after=0.5),
+    )
+    async with provider:
+        with pytest.raises(RateLimited):
+            await provider._get("/api/v3/depth", {}, "klines")
+    assert len(seen) == 1
+
+
+async def test_a_stream_does_not_handshake_during_a_hold() -> None:
+    handshakes: list[float] = []
+
+    def process_request(conn: ServerConnection, request: Request) -> None:
+        handshakes.append(time.monotonic())
+
+    async def handler(conn: ServerConnection) -> None:
+        await conn.wait_closed()
+
+    limited = httpx.Response(429, headers={"Retry-After": "0.4"}, json=TOO_MUCH_WEIGHT)
+    transport, _ = _serving(limited)
+    async with serve(
+        handler, "127.0.0.1", 0, process_request=process_request
+    ) as server:
+        port = next(iter(server.sockets)).getsockname()[1]
+        provider = BinanceProvider(
+            http_transport=transport,
+            retry_policy=NO_RETRY,
+            ws_url=f"ws://127.0.0.1:{port}",
+        )
+        provider._currencies["BTCUSDT"] = "USDT"
+        async with provider:
+            began = time.monotonic()
+            with pytest.raises(RateLimited):
+                await provider.order_book(BTC, 5)
+            pending = asyncio.ensure_future(take(provider.stream_trades([BTC]), 1))
+            deadline = time.monotonic() + 5
+            while not handshakes and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            pending.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await pending
+    assert handshakes and handshakes[0] - began >= 0.4

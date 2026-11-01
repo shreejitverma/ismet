@@ -8,7 +8,7 @@ by name. ``pandas`` and ``polars`` are optional extras, imported on use.
 from __future__ import annotations
 
 import importlib
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from decimal import Decimal
 from typing import Any
 
@@ -55,11 +55,32 @@ def _optional(module: str) -> Any:
         ) from exc
 
 
+def _floated(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, dict):
+        return {key: _floated(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_floated(item) for item in value]
+    return value
+
+
 def _floatify(rows: list[dict[str, Any]]) -> None:
     for row in rows:
         for key, value in row.items():
-            if isinstance(value, Decimal):
-                row[key] = float(value)
+            row[key] = _floated(value)
+
+
+def _decimals(value: Any, path: str) -> Iterator[tuple[str, Decimal]]:
+    """Every decimal in a value, named by column and, inside a book, by field."""
+    if isinstance(value, Decimal):
+        yield path, value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield from _decimals(item, f"{path}.{key}")
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _decimals(item, path)
 
 
 def _require_polars_width(rows: list[dict[str, Any]]) -> None:
@@ -67,13 +88,12 @@ def _require_polars_width(rows: list[dict[str, Any]]) -> None:
     integers: dict[str, int] = {}
     scales: dict[str, int] = {}
     for row in rows:
-        for key, value in row.items():
-            if not isinstance(value, Decimal):
-                continue
-            _, digits, exponent = value.as_tuple()
-            assert isinstance(exponent, int)
-            integers[key] = max(integers.get(key, 0), len(digits) + exponent)
-            scales[key] = max(scales.get(key, 0), -exponent)
+        for column, cell in row.items():
+            for key, value in _decimals(cell, column):
+                _, digits, exponent = value.as_tuple()
+                assert isinstance(exponent, int)
+                integers[key] = max(integers.get(key, 0), len(digits) + exponent)
+                scales[key] = max(scales.get(key, 0), -exponent)
     for key, integer in integers.items():
         if integer + scales[key] > _POLARS_DECIMAL_DIGITS:
             raise ValidationError(
@@ -83,13 +103,27 @@ def _require_polars_width(rows: list[dict[str, Any]]) -> None:
             )
 
 
+def _has_integer_gap(values: list[Any]) -> bool:
+    kinds = {type(value) for value in values}
+    return kinds == {int, type(None)}
+
+
 def to_pandas(items: Iterable[BaseModel], *, lossy_float: bool = False) -> Any:
-    """A pandas DataFrame. Decimals stay exact unless ``lossy_float`` is set."""
+    """A pandas DataFrame. Decimals stay exact unless ``lossy_float`` is set.
+
+    An integer column with a missing value stays exact too, as an object column: pandas
+    would otherwise make it float, which cannot hold a nanosecond timestamp.
+    """
     pd = _optional("pandas")
     rows = to_records(items)
     if lossy_float:
         _floatify(rows)
-    return pd.DataFrame(rows)
+    frame = pd.DataFrame(rows)
+    for column in frame.columns:
+        values = [row.get(column) for row in rows]
+        if _has_integer_gap(values):
+            frame[column] = pd.Series(values, dtype=object)
+    return frame
 
 
 def to_polars(items: Iterable[BaseModel], *, lossy_float: bool = False) -> Any:

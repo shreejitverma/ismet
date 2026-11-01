@@ -67,6 +67,7 @@ A strategy that restarts should resubmit with the same deterministic id, which r
 | Break `missing_at_venue` | A working order vanished, as can happen on venue failover | Confirm with the venue. The order is marked cancelled. New orders are halted. |
 | Anomaly `overfill` | More filled than ordered, judged against the requested size while a replace is pending | Contact the venue. New orders are halted. |
 | Anomaly `before the send started` | A venue report arrived for an order ismet never sent | The books were wrong. New orders are halted. |
+| Anomaly `does not match the order` | A fill names another side or symbol than the order under that client order id, so a foreign order may share the id | The fill is booked on the order's own side and symbol, so the position is suspect. Get the venue's execution report, correct the position with `ismet position adjust`, then release. |
 | Anomaly `re-reported with different terms` | The stream or a fill query reports a known fill with another price, quantity, side or symbol | Get the venue's execution report; the record keeps the first terms. New orders are halted once per fill and set of terms, so a release holds across later sweeps and restarts. |
 | `JournalError` on submit | The journal cannot be written, so that order was refused and nothing was sent | Check disk space and permissions. Orders are accepted again once writes succeed, unless closing that order failed too, which is the next row. |
 | `KillSwitchEngaged("journal failure: ...")` on submit | A record that does not wait for the disk could not be journalled: a venue event, an internal event such as closing an order whose send failed, or a kill record. An order event was applied in memory, and is rewritten in order once the journal recovers | Fix the disk, then restart: only a restart clears this. `ismet kill status` shows `not engaged` and `ismet kill release` cannot clear it, because it lives in this process. |
@@ -106,8 +107,10 @@ A stream that silently stops delivering cannot be told apart from a quiet market
   Network filesystems can break SQLite's locking.
 - Back it up with the SQLite backup API or `ismet journal export`, not by copying a live file.
 - Never restore an older copy of a FIX store over the live one.
-  An order missing from a store that shows prior use is treated as never sent, so a restored backup could close an order that is live at the venue.
-  After losing a FIX store, start from an empty one: orders with no record then stay refused until an operator confirms them with the counterparty.
+  An order missing from the store it was journalled under is treated as never sent, so a restored backup could close an order that is live at the venue.
+  After losing a FIX store, start from an empty one, which gets a new identity: orders journalled under the old store then stay `UNKNOWN`, on every restart, and new orders in that symbol stay refused.
+  Confirm each such order with the counterparty first, then call `await OrderManager.resolve_unknown(client_order_id, operator=..., reason=...)`, which closes it as not at the venue and is recorded in the journal.
+  It refuses a blank operator or reason, any order not `UNKNOWN`, and a journal that fails verification.
 - `ismet journal export "$JOURNAL" --out <new file>` refuses an existing file. `ismet.execution.journal.verify_jsonl` checks the hash chain of an export on its own.
 - Copy `head_hash` from `ismet journal verify` to separate storage on a schedule, then check against it with `ismet journal verify "$JOURNAL" --expect-head "$SAVED"`.
   An empty value is a usage error, so an unset variable cannot skip the check.
@@ -147,7 +150,7 @@ Apply them at startup in every process that uses the venue, including after each
 
 - Credentials are refused without `tls = true` in settings; a connection a stunnel or VPN protects needs a `FixSessionConfig` built directly, which chooses its own `ssl`.
 - A NewOrderSingle names the instrument by Symbol(55) alone, so the session decides where it trades: declare the MICs it serves with the `venues` option, or on a subclass, and an order for any other venue is refused before the wire.
-- An order whose process died after the order manager's `send_started` and before the FIX store's row closes as never sent on the next reconciliation, because the row is written before the socket, but only when the store already carried this session before the restart; a new or replaced store proves nothing, so the order stays unknown until an operator resolves it.
+- An order whose process died after the order manager's `send_started` and before the FIX store's row closes as never sent on the next reconciliation, because the row is written before the socket, but only when the store is the one the order manager journalled with that `send_started`; a new or replaced store proves nothing, and neither does a journal written before identities were recorded, so the order stays unknown until an operator calls `OrderManager.resolve_unknown`.
 - `reset_on_logon` resets once per `FixSessionConfig.session_period`, by default the UTC date, and a reconnect within the period keeps its numbers.
   Set it and `session_period` to match the venue's daily reset.
   Otherwise the venue's reset arrives unrequested and halts the stream until released.

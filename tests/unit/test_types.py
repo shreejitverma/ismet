@@ -17,6 +17,7 @@ from ismet.models.types import (
     VenueCode,
     to_decimal,
 )
+from ismet.refdata.codes import validate_currency
 
 
 class M(BaseModel):
@@ -100,3 +101,18 @@ def test_interval_seconds() -> None:
     assert Interval.MO1.nominal_seconds is None
     assert Interval.MO1.seconds is None
     assert Interval("1h") is Interval.H1
+
+
+@pytest.mark.parametrize(
+    ("spelling", "code"),
+    [("GBp", "GBX"), ("GBX", "GBX"), ("GBP", "GBP"), ("gbp", "GBP"), ("ZAc", "ZAC")],
+)
+def test_pence_spelled_by_a_vendor_are_never_read_as_pounds(
+    spelling: str, code: str
+) -> None:
+    assert validate_currency(spelling) == code
+
+
+def test_a_minor_unit_spelling_of_another_iso_code_is_refused() -> None:
+    with pytest.raises(ValueError, match="ambiguous"):
+        validate_currency("USd")

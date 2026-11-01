@@ -29,7 +29,7 @@ from ismet.calendars import available_calendars, get_calendar
 from ismet.capabilities import capabilities_of
 from ismet.cli.toon import encode
 from ismet.client import IsmetClient
-from ismet.config import ENV_PREFIX, Settings, default_config_path
+from ismet.config import ENV_PREFIX, Settings, config_file_path
 from ismet.errors import (
     AuthError,
     CalendarOutOfRange,
@@ -236,17 +236,21 @@ def _home() -> int:
             )
         except CalendarOutOfRange:
             rows.append({"venue": code, "phase": "calendar_expired", "next_open": None})
-    configured: Sequence[str]
+    configured: Sequence[str] = ()
+    config_error: dict[str, str] = {}
     try:
         configured = Settings.load().providers
-    except ConfigError:
-        configured = ()
+    except ConfigError as exc:
+        config_error = {"config_error": f"{exc}; run `ismet doctor`"}
     _print(
         {
             "bin": _bin_path(),
             "description": DESCRIPTION,
             "version": _version(),
-            "providers_configured": ",".join(configured) or "none",
+            "providers_configured": (
+                "unknown" if config_error else ",".join(configured) or "none"
+            ),
+            **config_error,
             "venues": rows,
             "help": [
                 "Run `ismet quote <TICKER@MIC>` for a quote",
@@ -256,7 +260,7 @@ def _home() -> int:
             ],
         }
     )
-    return EXIT_OK
+    return EXIT_FAILED if config_error else EXIT_OK
 
 
 async def _with_client(call: Callable[[IsmetClient], Awaitable[int]]) -> int:
@@ -324,6 +328,8 @@ async def _bars(args: argparse.Namespace, client: IsmetClient) -> int:
                 "low": bar.low,
                 "close": bar.close,
                 "volume": bar.volume,
+                "flags": ",".join(sorted(f.value for f in bar.flags)) or "none",
+                "adjustment": bar.adjustment.value,
             }
             for bar in shown
         ],
@@ -461,7 +467,7 @@ def _doctor() -> int:
         "version": _version(),
         "python": platform.python_version(),
         "os": f"{platform.system()} {platform.machine()}",
-        "config_file": str(default_config_path()),
+        "config_file": str(config_file_path()),
         "providers_configured": ",".join(configured) or "none",
         "problems": problems,
         "checks": checks,
@@ -485,8 +491,23 @@ def _existing_journal(path: str) -> SqliteJournal:
     return SqliteJournal(path)
 
 
+def _sync_directory(directory: Path) -> None:
+    """Make a new name in ``directory`` survive a power cut. Windows cannot do this."""
+    if os.name == "nt":
+        return
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _export(journal: SqliteJournal, out: Path) -> int:
-    """Write the export beside its destination, so a failure leaves nothing behind."""
+    """Write the export beside its destination, so a failure leaves nothing behind.
+
+    The file is on disk before it takes its name, and linking the name refuses a file
+    that appeared in the meantime, so an existing audit file is never replaced.
+    """
     if out.exists():
         raise ValidationError(f"{out} already exists; choose a new --out")
     descriptor, name = tempfile.mkstemp(dir=out.parent, prefix=f".{out.name}.")
@@ -494,11 +515,21 @@ def _export(journal: SqliteJournal, out: Path) -> int:
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             count = export_jsonl(journal, stream)
-        temporary.replace(out)
-    except BaseException:
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary, out)
+    except FileExistsError:
+        raise ValidationError(f"{out} already exists; choose a new --out") from None
+    finally:
         temporary.unlink(missing_ok=True)
-        raise
+    _sync_directory(out.parent)
     return count
+
+
+def _chain_text(result: VerifyResult) -> str:
+    if result.ok:
+        return "intact"
+    return f"broken at record {result.first_bad_seq}: {result.detail}"
 
 
 def _journal(args: argparse.Namespace) -> int:
@@ -541,18 +572,26 @@ def _journal(args: argparse.Namespace) -> int:
                 }
             )
             return EXIT_OK if result.ok else EXIT_FAILED
+        chain = journal.verify()
+        outcome = EXIT_OK if chain.ok else EXIT_FAILED
         if args.action == "export":
             count = _export(journal, Path(args.out))
-            _print({"exported": count, "path": args.out})
-            return EXIT_OK
+            _print({"exported": count, "path": args.out, "chain": _chain_text(chain)})
+            return outcome
         orders = replay(events_of(journal))
         states = [o for o in orders.values() if args.all or o.is_open]
         if not states:
             scope = "" if args.all else "open "
-            _print({"orders": f"0 {scope}orders of {len(orders)} in this journal"})
-            return EXIT_OK
+            _print(
+                {
+                    "orders": f"0 {scope}orders of {len(orders)} in this journal",
+                    "chain": _chain_text(chain),
+                }
+            )
+            return outcome
         _print(
             {
+                "chain": _chain_text(chain),
                 "count": f"{len(states)} of {len(orders)} total",
                 "orders": [
                     {
@@ -566,7 +605,7 @@ def _journal(args: argparse.Namespace) -> int:
                 ],
             }
         )
-        return EXIT_OK
+        return outcome
     finally:
         journal.close()
 
@@ -642,18 +681,7 @@ def _kill(args: argparse.Namespace) -> int:
                 "reason": state.reason or "none",
                 "operator": state.operator or "none",
                 "cancel_open": state.cancel_open,
-                **(
-                    {}
-                    if chain is None
-                    else {
-                        "chain": (
-                            "intact"
-                            if chain.ok
-                            else f"broken at record {chain.first_bad_seq}: "
-                            f"{chain.detail}; a release here would be ignored"
-                        )
-                    }
-                ),
+                **({} if chain is None else {"chain": _chain_text(chain)}),
             }
         )
         return EXIT_OK if chain is None or chain.ok else EXIT_FAILED

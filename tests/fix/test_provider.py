@@ -20,6 +20,7 @@ from ismet.errors import (
     AuthError,
     ConfigError,
     DuplicateOrderId,
+    NoSendRecord,
     TransportError,
     ValidationError,
     VenueError,
@@ -1668,21 +1669,20 @@ class TestOrderStatus:
             await provider.order_status("NEVER", ACME)
         assert acceptor.of_type("H") == []
 
-    async def test_no_local_record_in_a_store_that_was_in_use_is_not_found(
+    async def test_no_local_record_in_a_store_that_was_in_use_still_raises(
         self, acceptor: FixAcceptor, make_provider: ProviderFactory, tmp_path: Path
     ) -> None:
-        """The row is written before the socket, so an intact store proves never sent.
-
-        A process that died between the order manager's ``send_started`` and that row
-        would otherwise leave the order unknown forever.
-        """
+        """Only the journalled store id can say the row would have been here."""
         store = SqliteFixStore(tmp_path / "fix.db", "s")
         first = await make_provider(store=store)
         await first.place_order(order())
+        identity = first.send_record_id()
         await first.close()
 
         second = await make_provider(store=store)
-        assert await second.order_status("NEVER", ACME) is None
+        assert second.send_record_id() == identity
+        with pytest.raises(NoSendRecord):
+            await second.order_status("NEVER", ACME)
         assert acceptor.of_type("H") == []
         known = await second.order_status("C1", ACME)
         assert known is not None
@@ -2454,6 +2454,38 @@ class TestALostFillSeenInCumQty:
         with pytest.raises(ReportQuarantinedError):
             await provider.place_order(order("C2"))
         assert "C2" not in acceptor.orders
+
+    async def test_a_death_right_after_the_commit_still_leaves_the_halt(
+        self, acceptor: FixAcceptor, make_provider: ProviderFactory, tmp_path: Path
+    ) -> None:
+        """The ExecID is seen once committed, so a redelivery cannot raise it again."""
+
+        class DiesAfterCommit(SqliteFixStore):
+            dying = False
+
+            def record_report(self, *args: Any, **kw: Any) -> None:
+                super().record_report(*args, **kw)
+                if self.dying:
+                    raise FixStoreError("the process died here")
+
+        store = DiesAfterCommit(tmp_path / "fix.db", "s")
+        provider = await make_provider(store=store)
+        await provider.place_order(order())
+        await self._lose_a_fill(acceptor)
+        store.dying = True
+        await acceptor.exec_report("C1", "4", "4", exec_id="CLOSE")
+        await eventually(lambda: bool(store.execution("C1", "CLOSE")))
+        store.dying = False
+        await provider.close()
+
+        restarted = await make_provider(store=store)
+        rows = await restarted.quarantined()
+        assert [(q.msg_type, q.halted) for q in rows] == [("8", True)]
+        with pytest.raises(ReportQuarantinedError):
+            await restarted.place_order(order("C2"))
+        assert "C2" not in acceptor.orders
+        await restarted.close()
+        store.close()
 
     async def test_a_status_reply_does_not_hide_the_loss_from_a_later_report(
         self, acceptor: FixAcceptor, make_provider: ProviderFactory

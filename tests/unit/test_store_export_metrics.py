@@ -5,12 +5,14 @@ import os
 import subprocess
 import sys
 import textwrap
+import threading
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, localcontext
 from pathlib import Path
 
 import pytest
 
+import ismet.store as store_module
 from ismet import IsmetClient
 from ismet.calendars import get_calendar
 from ismet.errors import ConfigError, SequenceGap, TransportError, ValidationError
@@ -18,7 +20,7 @@ from ismet.execution import BreakKind, ReconBreak, apply_event, new_order
 from ismet.export import BarSeries, to_pandas, to_polars, to_records
 from ismet.marketdata import GapPolicy
 from ismet.models import Adjustment, Bar, Interval, QualityFlag, Quote, Symbol
-from ismet.models.market_data import DataSource, Timeliness
+from ismet.models.market_data import DataSource, Level, OrderBook, Timeliness, Trade
 from ismet.models.orders import (
     Canceled,
     Fill,
@@ -885,3 +887,122 @@ def test_polars_names_the_way_out_when_decimals_are_too_wide() -> None:
     with pytest.raises(ValidationError, match="lossy_float"):
         to_polars(series)
     assert series.to_polars(lossy_float=True)["close"].dtype.is_float()
+
+
+# Nested levels, integer gaps, longer intervals, and concurrent writers
+
+
+def book_of(price: str) -> OrderBook:
+    return OrderBook(
+        symbol=SYM,
+        exchange_ts=DAY,
+        received_ts=DAY,
+        bids=[Level(price=price, size="1")],
+        asks=[],
+    )
+
+
+def test_polars_refuses_book_levels_that_share_too_wide_a_scale() -> None:
+    pytest.importorskip("polars")
+    books = [book_of("1" + "0" * 29), book_of("0." + "1" * 30)]
+    with pytest.raises(ValidationError, match=r"bids\.price"):
+        to_polars(books)
+
+
+def test_polars_refuses_one_book_level_over_its_digit_limit() -> None:
+    pytest.importorskip("polars")
+    with pytest.raises(ValidationError, match=r"bids\.price"):
+        to_polars([book_of("1." + "1" * 40)])
+
+
+def test_book_levels_become_floats_only_when_asked() -> None:
+    polars = pytest.importorskip("polars")
+    frame = to_polars([book_of("1." + "1" * 40)], lossy_float=True)
+    assert isinstance(frame["bids"][0][0]["price"], float)
+    assert frame.schema["bids"] != polars.Null
+
+
+def test_polars_keeps_book_levels_exact_when_they_fit() -> None:
+    pytest.importorskip("polars")
+    frame = to_polars([book_of("100.25"), book_of("0.5")])
+    assert frame["bids"][0][0]["price"] == D("100.25")
+    assert frame["bids"][1][0]["price"] == D("0.5")
+
+
+def test_pandas_keeps_large_integers_exact_beside_a_missing_value() -> None:
+    pytest.importorskip("pandas")
+    sequence = 2**60 + 1
+    stamp = datetime(2026, 3, 9, 15, 0, tzinfo=UTC) + timedelta(microseconds=123456)
+    nanos = (int(stamp.timestamp()) * 10**9) + 123456789
+    exact = Trade(
+        symbol=SYM,
+        exchange_ts=stamp,
+        received_ts=stamp,
+        price="1",
+        size="1",
+        exchange_ts_ns=nanos,
+        sequence=sequence,
+    )
+    bare = Trade(symbol=SYM, exchange_ts=DAY, received_ts=DAY, price="1", size="1")
+    frame = to_pandas([exact, bare])
+    assert frame["exchange_ts_ns"][0] == nanos
+    assert frame["sequence"][0] == sequence
+    assert frame["sequence"][1] is None
+
+
+async def test_a_calendar_is_refused_for_bars_longer_than_a_session(
+    tmp_path: Path,
+) -> None:
+    async def fetch(*_: object) -> list[Bar]:
+        raise AssertionError("nothing should be fetched")
+
+    for interval in (Interval.W1, Interval.MO1):
+        with (
+            BarStore(tmp_path / "bars.db") as store,
+            pytest.raises(ValidationError, match=interval.value),
+        ):
+            await backfill(
+                fetch,
+                store,
+                SYM,
+                interval,
+                DAY,
+                DAY + timedelta(days=30),
+                calendar=XNYS,
+            )
+
+
+def test_a_concurrent_restatement_is_not_rolled_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "bars.db"
+    with BarStore(path) as seed:
+        seed.write([bar(close="10", revision=0)])
+    errors: list[BaseException] = []
+
+    def other_writer() -> None:
+        try:
+            with BarStore(path, clock=ManualClock(DAY)) as other:
+                other.write([bar(close="10.8", revision=2)])
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=other_writer)
+    digest = store_module._content_digest
+    started: list[bool] = []
+
+    def interleaved(item: Bar) -> str:
+        if not started:
+            started.append(True)
+            thread.start()
+            thread.join(0.3)
+        return digest(item)
+
+    monkeypatch.setattr(store_module, "_content_digest", interleaved)
+    with BarStore(path, clock=ManualClock(DAY + timedelta(days=1))) as store:
+        store.write([bar(close="10.5", revision=1)])
+        thread.join(10)
+        assert not errors
+        got = store.read(SYM, Interval.D1, DAY, DAY + timedelta(days=1))
+    assert [b.close for b in got] == [D("10.8")]
+    assert got[0].revision == 2

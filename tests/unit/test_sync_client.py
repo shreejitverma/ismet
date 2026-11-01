@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -226,3 +227,23 @@ def test_a_buffer_that_would_be_unbounded_is_refused(buffer: int) -> None:
             client.stream_quotes(["ACME"], venue="XMOK", buffer=buffer)
         with pytest.raises(ValidationError, match="buffer"):
             client.stream_trades(["ACME"], venue="XMOK", buffer=buffer)
+
+
+def test_an_iterator_never_consumed_starts_nothing() -> None:
+    started: list[object] = []
+
+    class Recording(MockProvider):
+        async def stream_quotes(self, symbols):  # type: ignore[no-untyped-def,override]
+            started.append(symbols)
+            async for quote in super().stream_quotes(symbols):
+                yield quote
+
+    with IsmetSyncClient([Recording()]) as client:
+        unused = client.stream_quotes(["ACME"], venue="XMOK", buffer=1)
+        time.sleep(0.1)
+        assert started == []
+        del unused
+        used = client.stream_quotes(["ACME"], venue="XMOK", buffer=1)
+        assert next(used).symbol.ticker == "ACME"
+        used.close()
+    assert len(started) == 1

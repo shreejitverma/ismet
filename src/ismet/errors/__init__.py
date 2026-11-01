@@ -169,6 +169,15 @@ class DuplicateOrderId(VenueError):
     """
 
 
+class NoSendRecord(TransportError):
+    """A provider's own send records hold no row for this order.
+
+    That proves the order was never sent only if those are the records it would have
+    been written to, which a provider cannot know alone. The order manager decides,
+    from the record id journalled with the send.
+    """
+
+
 __all__ = [
     "AmbiguousOutcome",
     "AuthError",
@@ -179,6 +188,7 @@ __all__ = [
     "IsmetError",
     "JournalError",
     "KillSwitchEngaged",
+    "NoSendRecord",
     "NotSupported",
     "OrderStateError",
     "RateLimited",

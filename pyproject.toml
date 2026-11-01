@@ -69,6 +69,9 @@ coinbase = "ismet.providers.coinbase:CoinbaseProvider"
 [tool.hatch.build.targets.wheel]
 packages = ["src/ismet"]
 
+[tool.hatch.build.targets.sdist]
+exclude = ["tests/fixtures"]
+
 [tool.ruff]
 line-length = 88
 target-version = "py310"

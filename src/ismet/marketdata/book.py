@@ -25,12 +25,16 @@ from ismet.models.types import to_decimal
 
 
 def _check_level(price: Decimal, size: Decimal) -> None:
+    if not isinstance(price, Decimal) or not isinstance(size, Decimal):
+        raise ValidationError(
+            f"book levels must be Decimal, got {price!r} and {size!r}"
+        )
     try:
         to_decimal(price)
-        checked_size = to_decimal(size)
-    except (TypeError, ValueError) as exc:
+        to_decimal(size)
+    except ValueError as exc:
         raise ValidationError(f"invalid book level: {exc}") from exc
-    if checked_size < 0:
+    if size < 0:
         raise ValidationError(f"book level size must be >= 0, got {size}")
 
 
@@ -46,7 +50,9 @@ class BookDelta:
     ``first_sequence`` to ``sequence`` is the range this delta covers, for venues
     that batch updates (such as Binance's ``U`` and ``u``). Every level of one venue
     update carries the same range. Single-update feeds use the default, where the
-    range is one number. An impossible delta raises
+    range is one number, and levels repeating that number belong to the same update.
+    Prices and sizes must be :class:`~decimal.Decimal`, so vendor text is converted
+    before it gets here. An impossible delta raises
     :class:`~ismet.errors.ValidationError` here, so it can never reach a book or its
     buffer.
     """
@@ -153,6 +159,7 @@ class BookBuilder:
         Rows are read and checked before anything changes, so a bad row raises
         :class:`~ismet.errors.ValidationError` and leaves the book as it was.
         """
+        _check_sequence(sequence)
         rolls_back = self._synced and self._last is not None and sequence < self._last
         misses_dropped = (
             self._dropped_through is not None and sequence < self._dropped_through
@@ -160,9 +167,9 @@ class BookBuilder:
         if rolls_back or misses_dropped:
             self.stale_snapshots += 1
             return False
-        _check_sequence(sequence)
-        self._bids = self._side_from(bids, descending=True)
-        self._asks = self._side_from(asks, descending=False)
+        new_bids = self._side_from(bids, descending=True)
+        new_asks = self._side_from(asks, descending=False)
+        self._bids, self._asks = new_bids, new_asks
         self._last = sequence
         self._synced = True
         self._dropped_through = None
@@ -199,8 +206,7 @@ class BookBuilder:
             return False
         assert self._last is not None
         batch = (delta.start, delta.sequence)
-        same_batch = delta.first_sequence is not None and batch == self._batch
-        if delta.sequence <= self._last and not same_batch:
+        if delta.sequence <= self._last and batch != self._batch:
             self.stale_deltas += 1
             return False
         if delta.start > self._last + 1:

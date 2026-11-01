@@ -93,6 +93,22 @@ class TestBothStores:
         assert store.get_order("C1") is None
         assert store.resolve_wire_id("C1~1") is None
 
+    def test_a_report_and_the_halt_it_caused_commit_together(
+        self, store: FixStore
+    ) -> None:
+        row = QuarantinedMessage(7, "8", "content", "lost", "t", halted=True)
+        store.record_report(
+            "C1", order_payload="o", execution=execution(), quarantine=row
+        )
+        assert store.execution("C1", "E1") is not None
+        assert store.quarantined() == [row]
+
+    def test_the_store_id_outlives_a_sequence_reset(self, store: FixStore) -> None:
+        identity = store.store_id()
+        assert identity
+        store.reset_sequences()
+        assert store.store_id() == identity
+
     def test_record_report_is_keyed_by_order_and_exec_id(self, store: FixStore) -> None:
         store.record_report("C1", order_payload="o", execution=execution())
         store.record_report(
@@ -333,3 +349,33 @@ class TestSqlite:
         assert again.quarantined()[0].released_by is None
         assert again.reset_period() == "2026-03-09"
         again.close()
+
+
+def test_a_report_rolls_back_if_its_quarantine_row_cannot_be_written(
+    tmp_path: Path,
+) -> None:
+    store = SqliteFixStore(tmp_path / "fix.db", SESSION)
+    too_large = QuarantinedMessage(2**70, "8", "content", "lost", "t", halted=True)
+    with pytest.raises(FixStoreError):
+        store.record_report(
+            "C1", order_payload="o", execution=execution(), quarantine=too_large
+        )
+    assert store.execution("C1", "E1") is None
+    assert store.get_order("C1") is None
+    store.close()
+
+
+def test_a_store_keeps_its_id_across_opens_and_a_new_file_gets_another(
+    tmp_path: Path,
+) -> None:
+    first = SqliteFixStore(tmp_path / "fix.db", SESSION)
+    identity = first.store_id()
+    first.close()
+    reopened = SqliteFixStore(tmp_path / "fix.db", SESSION)
+    assert reopened.store_id() == identity
+    reopened.close()
+    for lost in tmp_path.glob("fix.db*"):
+        lost.unlink()
+    recreated = SqliteFixStore(tmp_path / "fix.db", SESSION)
+    assert recreated.store_id() != identity
+    recreated.close()

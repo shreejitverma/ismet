@@ -103,14 +103,5 @@ jobs:
           python-version: "3.12"
       - name: Build
         run: python -m pip install build==1.5.0 && python -m build
-      - name: Assert wheel is py3-none-any
-        run: ls dist/*-py3-none-any.whl
-      - name: The wheel works outside the source tree
-        shell: bash
-        run: |
-          python -m venv /tmp/fresh
-          /tmp/fresh/bin/pip install dist/*.whl
-          cd /tmp
-          /tmp/fresh/bin/ismet --version
-          /tmp/fresh/bin/ismet calendar XNYS --on 2026-11-27
-          ISMET_PROVIDERS=mock /tmp/fresh/bin/ismet quote ACME@XMOK
+      - name: The files are pure, hold no venue data, and run when installed
+        run: python scripts/check_dist.py dist --smoke

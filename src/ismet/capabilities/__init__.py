@@ -135,6 +135,20 @@ class TradingCapability(Protocol):
 
 
 @runtime_checkable
+class SendRecordCapability(Protocol):
+    """A trading provider that writes its own durable record before each send.
+
+    Optional. ``send_record_id`` names those records, and changes if they are lost and
+    start again. The order manager journals it with each send. Such a provider's
+    ``order_status`` raises :class:`~ismet.errors.NoSendRecord` for an order with no
+    record, and the manager reads that as "never sent" only when the journalled id
+    equals the current one.
+    """
+
+    def send_record_id(self) -> str | None: ...
+
+
+@runtime_checkable
 class AccountCapability(Protocol):
     """Positions and balances as the venue reports them."""
 
@@ -165,6 +179,7 @@ __all__ = [
     "HistoricalCapability",
     "MarketDataCapability",
     "ReferenceDataCapability",
+    "SendRecordCapability",
     "StreamingCapability",
     "TradingCapability",
     "capabilities_of",

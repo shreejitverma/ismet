@@ -16,6 +16,8 @@ import pytest
 from ismet.errors import (
     JournalError,
     KillSwitchEngaged,
+    NoSendRecord,
+    OrderStateError,
     RiskRejected,
     TransportError,
     ValidationError,
@@ -32,6 +34,7 @@ from ismet.execution import (
     RiskLimits,
     new_order,
 )
+from ismet.execution.journal import VerifyResult
 from ismet.execution.risk import check_open_orders
 from ismet.execution.state import apply_event
 from ismet.models import Symbol
@@ -42,19 +45,29 @@ from ismet.models.orders import (
     Filled,
     OrderEvent,
     OrderSide,
+    OrderType,
     Replaced,
     ReplaceRequested,
     SendStarted,
     SubmitIntent,
+    TimeInForce,
     dump_order_event,
 )
 from ismet.models.orders import (
     OrderStatus as S,
 )
-from ismet.testing.simvenue import SIM_VENUE, SimVenue, sim_instrument
+from ismet.testing.simvenue import SIM_VENUE, Fault, SimVenue, sim_instrument
 from ismet.transport.clock import ManualClock
 
-from .conftest import ACME, START, Factory, order, permissive_config, until
+from .conftest import (
+    ACME,
+    START,
+    Factory,
+    lose_stream,
+    order,
+    permissive_config,
+    until,
+)
 
 D = Decimal
 OTHR = Symbol(venue=SIM_VENUE, ticker="OTHR")
@@ -662,17 +675,592 @@ async def test_a_stream_that_holds_is_healthy_when_start_returns(
         await oms.abort()
 
 
-async def test_a_stream_that_delivers_is_healthy_without_waiting_out_the_settle(
+async def test_a_stream_that_delivers_and_dies_never_counts_as_up(
     make_manager: Factory, venue: SimVenue, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    async def delivers():  # type: ignore[no-untyped-def]
-        yield filled("OUT-Z")
-        await asyncio.Event().wait()
+    async def delivers_once():  # type: ignore[no-untyped-def]
+        yield Acknowledged(client_order_id="OUT-Z", ts=START, venue_order_id="V")
+        raise TransportError("dropped")
 
-    monkeypatch.setattr(venue, "stream_executions", delivers)
-    oms = make_manager(stream_settle=3600.0)
+    attempts: list[int] = []
+    healthy: list[bool] = []
+    oms = make_manager(stream_settle=3600.0, halt_on_break=False)
+
+    class Recording:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def delay(self, attempt: int) -> float:
+            attempts.append(attempt)
+            healthy.append(oms.stream_healthy)
+            return 0.0
+
+    monkeypatch.setattr("ismet.execution.manager.ExponentialBackoff", Recording)
+    monkeypatch.setattr(venue, "stream_executions", delivers_once)
     await asyncio.wait_for(oms.start(), 5)
     try:
+        await until(lambda: len(attempts) >= 4)
+        assert attempts[:4] == [0, 1, 2, 3]
+        assert not any(healthy)
+    finally:
+        await oms.abort()
+
+
+def gated_open_orders(
+    venue: SimVenue, monkeypatch: pytest.MonkeyPatch, *, open_after: int = 0
+) -> tuple[asyncio.Event, asyncio.Event]:
+    """Hold the venue's open order query once ``open_after`` answers have gone out."""
+    reached, release = asyncio.Event(), asyncio.Event()
+    real = venue.open_orders
+    answered = [0]
+
+    async def held():  # type: ignore[no-untyped-def]
+        if answered[0] >= open_after:
+            reached.set()
+            await release.wait()
+        answered[0] += 1
+        return await real()
+
+    monkeypatch.setattr(venue, "open_orders", held)
+    return reached, release
+
+
+async def test_no_order_is_admitted_while_the_catch_up_is_running(
+    oms: OrderManager, venue: SimVenue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await venue.drain()
+    await oms.submit(order("CU1", price="9.50"))
+    await venue.drain()
+    reached, release = gated_open_orders(venue, monkeypatch)
+    await lose_stream(oms, venue)
+    await asyncio.wait_for(reached.wait(), 5)
+    await until(lambda: bool(venue._subscribers))
+    venue.trade_through(ACME, "9.50", "10")
+    await oms.wait_for("CU1", lambda o: o.filled_quantity == 10, 5)
+    assert not oms.stream_healthy
+    with pytest.raises(RiskRejected) as caught:
+        await oms.submit(order("CU2", price="9.50"))
+    assert caught.value.check == "execution_stream"
+    release.set()
+    await until(lambda: oms.stream_healthy)
+
+
+async def test_no_order_is_admitted_before_the_settled_follow_up_finishes(
+    make_manager: Factory, venue: SimVenue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    oms = make_manager(stream_settle=0.01)
+    await oms.start()
+    try:
+        await venue.drain()
+        reached, release = gated_open_orders(venue, monkeypatch, open_after=1)
+        await lose_stream(oms, venue)
+        await asyncio.wait_for(reached.wait(), 5)
+        assert not oms.stream_healthy
+        release.set()
+        await until(lambda: oms.stream_healthy)
+    finally:
+        await oms.abort()
+
+
+class BreakJournalDown(MemoryJournal):
+    failing = False
+
+    def append(self, *args: object, **kw: object):  # type: ignore[no-untyped-def]
+        if self.failing and args[0] is RecordKind.RECON_BREAK:
+            raise JournalError("disk gone")
+        return super().append(*args, **kw)  # type: ignore[arg-type]
+
+
+async def test_an_old_orphan_fill_survives_a_break_that_never_reached_the_journal(
+    venue: SimVenue, clock: ManualClock
+) -> None:
+    journal = BreakJournalDown()
+
+    def build() -> OrderManager:
+        return OrderManager(
+            venue,
+            journal,
+            RiskEngine(permissive_config()),
+            clock=clock,
+            stream_settle=None,
+            reconcile_interval=3600.0,
+            fill_lookback=3600.0,
+            unknown_grace=0.0,
+        )
+
+    oms = build()
+    await oms.start()
+    await venue.drain()
+    clock.advance(1)
+    venue._fills.append(fill("OUT-A").model_copy(update={"ts": clock.now()}))
+    clock.advance(7200)
+    journal.failing = True
+    await oms.reconcile()
+    journal.failing = False
+    await oms.abort()
+    restarted = build()
+    report = await restarted.start()
+    try:
+        assert [
+            b.subject for b in report.breaks if b.kind is BreakKind.ORPHAN_FILL
+        ] == ["OUT-A:1001"]
+        assert kinds_of(journal).count(RecordKind.RECON_BREAK) == 1
+    finally:
+        await restarted.abort()
+
+
+async def test_a_clean_pass_still_moves_the_sweep_window(
+    oms: OrderManager, venue: SimVenue, clock: ManualClock, journal: Journal
+) -> None:
+    await venue.drain()
+    clock.advance(7200)
+    moved_to = clock.now()
+    await oms.reconcile()
+    marks = [
+        json.loads(r.payload)["at"]
+        for r in journal.records()
+        if r.kind is RecordKind.SWEEP_MARK
+    ]
+    assert marks[-1] == moved_to.isoformat()
+
+
+# Not found
+
+
+async def test_an_order_arriving_while_its_fills_are_fetched_is_not_closed(
+    oms: OrderManager, venue: SimVenue
+) -> None:
+    await venue.drain()
+    venue.faults.append(Fault.LOSE_REQUEST)
+    late = order("NF1", price="9.50")
+    await oms.submit(late)
+    assert oms.order("NF1").status is S.UNKNOWN
+    armed = [True]
+
+    def arrives(method: str) -> None:
+        if method == "fills_since" and armed:
+            armed.clear()
+            venue.add_external_order(late)
+            venue._deliver(
+                Acknowledged(client_order_id="NF1", ts=START, venue_order_id="V9")
+            )
+
+    venue.after_answer = arrives
+    await oms.reconcile()
+    venue.after_answer = None
+    assert oms.order("NF1").is_open
+    assert oms.order("NF1").reject_code is None
+    await oms.reconcile()
+    assert oms.order("NF1").status is S.ACCEPTED
+
+
+async def test_an_order_the_venue_never_got_still_closes_as_not_found(
+    oms: OrderManager, venue: SimVenue
+) -> None:
+    await venue.drain()
+    venue.faults.append(Fault.LOSE_REQUEST)
+    await oms.submit(order("NF2", price="9.50"))
+    await oms.reconcile()
+    state = oms.order("NF2")
+    assert state.status is S.REJECTED and state.reject_code == "NOT_FOUND_AT_VENUE"
+
+
+async def test_a_purged_order_with_fills_closes_as_canceled_with_a_break(
+    oms: OrderManager, venue: SimVenue
+) -> None:
+    await venue.drain()
+    await oms.submit(order("NF3", price="9.50"))
+    await venue.drain()
+    venue.report_faults.drop_next = 1
+    venue.trade_through(ACME, "9.50", "40")
+    venue.forget_order("NF3")
+    report = await oms.reconcile()
+    state = oms.order("NF3")
+    assert state.status is S.CANCELED and state.filled_quantity == 40
+    assert BreakKind.MISSING_AT_VENUE in [b.kind for b in report.breaks]
+
+
+# Fills that belong to something else
+
+
+@pytest.mark.parametrize(
+    "terms", [{"side": OrderSide.SELL}, {"symbol": OTHR}], ids=["side", "symbol"]
+)
+async def test_a_fill_for_another_side_or_symbol_halts(
+    oms: OrderManager, venue: SimVenue, terms: dict[str, object]
+) -> None:
+    await venue.drain()
+    await oms.submit(order("FM1", price="9.50"))
+    await venue.drain()
+    foreign = fill("FM1", quantity="40").model_copy(update=terms)
+    venue._deliver(
+        Filled(client_order_id="FM1", ts=START, origin=EventOrigin.VENUE, fill=foreign)
+    )
+    await until(lambda: oms.kill_state.engaged)
+    assert [a for a in oms.order("FM1").anomalies if "does not match" in a]
+
+
+def test_a_fill_on_the_orders_own_terms_is_not_an_anomaly() -> None:
+    state = replaced_order("4", 5)
+    assert not state.anomalies
+
+
+async def test_a_foreign_fill_recorded_before_a_crash_halts_on_restart(
+    make_manager: Factory, venue: SimVenue, journal: Journal
+) -> None:
+    oms = make_manager()
+    await oms.start()
+    await venue.drain()
+    await oms.submit(order("FM2", price="9.50"))
+    await venue.drain()
+    await oms.abort()
+    foreign = fill("FM2", quantity="40").model_copy(update={"side": OrderSide.SELL})
+    journal.append(
+        RecordKind.ORDER_EVENT,
+        dump_order_event(
+            Filled(
+                client_order_id="FM2", ts=START, origin=EventOrigin.VENUE, fill=foreign
+            )
+        ),
+        client_order_id="FM2",
+    )
+    restarted = make_manager(halt_on_break=False)
+    await restarted.start()
+    try:
+        assert restarted.kill_state.engaged
+    finally:
+        await restarted.abort()
+
+
+# Scoped limits
+
+
+@pytest.mark.parametrize("scope", ["per_account", "per_strategy"])
+@pytest.mark.parametrize(
+    "limits",
+    [{"max_position": D(100)}, {"max_gross_notional": D(100)}],
+    ids=["position", "gross"],
+)
+def test_position_limits_per_account_or_strategy_are_refused(
+    scope: str, limits: dict[str, Decimal]
+) -> None:
+    with pytest.raises(pydantic.ValidationError, match="net position per symbol"):
+        RiskConfig(default=RiskLimits(), **{scope: {"A": RiskLimits(**limits)}})
+
+
+def test_order_level_limits_per_account_and_position_limits_per_symbol_remain() -> None:
+    config = RiskConfig(
+        default=RiskLimits(),
+        per_account={"A": RiskLimits(max_order_quantity=D(1), max_open_orders=1)},
+        per_strategy={"S": RiskLimits(max_order_notional=D(1))},
+        per_symbol={"ACME@ZSIM": RiskLimits(max_position=D(1))},
+    )
+    labels = [
+        label
+        for label, _ in config.limits_for(
+            order("SL1", account="A", strategy="S", quantity="1")
+        )
+    ]
+    assert labels == ["default", "account:A", "strategy:S", "symbol:ACME@ZSIM"]
+
+
+# Anomalies with the journal failing
+
+
+class AnomalyOsError(MemoryJournal):
+    def append(self, *args: object, **kw: object):  # type: ignore[no-untyped-def]
+        if args[0] is RecordKind.ANOMALY:
+            raise OSError("disk full")
+        return super().append(*args, **kw)  # type: ignore[arg-type]
+
+
+async def test_an_oserror_writing_an_anomaly_does_not_skip_the_halt(
+    venue: SimVenue, clock: ManualClock
+) -> None:
+    oms = OrderManager(
+        venue,
+        AnomalyOsError(),
+        RiskEngine(permissive_config()),
+        clock=clock,
+        stream_settle=None,
+        reconcile_interval=3600.0,
+        halt_on_break=False,
+    )
+    await oms.start()
+    try:
+        await venue.drain()
+        await oms.submit(order("AO1", price="9.50"))
+        await venue.drain()
+        venue._deliver(filled("AO1", quantity="150"))
+        await until(lambda: oms.kill_state.engaged)
         assert oms.stream_healthy
+    finally:
+        await oms.abort()
+
+
+async def test_the_halt_is_durable_before_the_anomaly_that_caused_it(
+    oms: OrderManager, venue: SimVenue, journal: Journal
+) -> None:
+    await venue.drain()
+    await oms.submit(order("AO3", price="9.50"))
+    await venue.drain()
+    venue._deliver(filled("AO3", quantity="150"))
+    await until(lambda: RecordKind.ANOMALY in kinds_of(journal))
+    kinds = kinds_of(journal)
+    assert kinds.index(RecordKind.KILL_ENGAGED) < kinds.index(RecordKind.ANOMALY)
+
+
+# Marks
+
+
+async def test_a_late_fill_at_an_old_price_is_not_a_current_mark(
+    oms: OrderManager, venue: SimVenue, clock: ManualClock
+) -> None:
+    await venue.drain()
+    await oms.submit(order("MK1", price="9.50"))
+    await venue.drain()
+    old = clock.now()
+    clock.advance(600)
+    venue._deliver(
+        Filled(
+            client_order_id="MK1",
+            ts=clock.now(),
+            origin=EventOrigin.VENUE,
+            fill=fill("MK1", quantity="10").model_copy(update={"ts": old}),
+        )
+    )
+    await oms.wait_for("MK1", lambda o: o.filled_quantity == 10, 2)
+    assert oms._mark(ACME) == D("10.00")
+
+
+async def test_a_current_fill_is_a_mark(
+    oms: OrderManager, venue: SimVenue, clock: ManualClock
+) -> None:
+    await venue.drain()
+    await oms.submit(order("MK2", price="9.50"))
+    await venue.drain()
+    venue.trade_through(ACME, "9.50", "10")
+    await oms.wait_for("MK2", lambda o: o.filled_quantity == 10, 2)
+    assert oms._mark(ACME) == D("9.50")
+
+
+# The simulator
+
+
+async def test_an_unelected_stop_limit_does_not_fill_on_a_print_at_its_limit(
+    oms: OrderManager, venue: SimVenue
+) -> None:
+    await venue.drain()
+    await oms.submit(
+        order(
+            "SS1",
+            price="10.60",
+            order_type=OrderType.STOP_LIMIT,
+            stop_price="10.50",
+            time_in_force=TimeInForce.GTC,
+        )
+    )
+    await venue.drain()
+    venue.trade_through(ACME, "10.00", "100")
+    snapshot = await venue.order_status("SS1", ACME)
+    assert snapshot is not None and snapshot.filled_quantity == 0
+
+
+async def test_an_elected_stop_limit_fills_on_a_print_at_its_limit(
+    oms: OrderManager, venue: SimVenue
+) -> None:
+    await venue.drain()
+    await oms.submit(
+        order(
+            "SS2",
+            price="10.60",
+            order_type=OrderType.STOP_LIMIT,
+            stop_price="10.50",
+            time_in_force=TimeInForce.GTC,
+        )
+    )
+    await venue.drain()
+    venue.trade_through(ACME, "10.55", "100")
+    snapshot = await venue.order_status("SS2", ACME)
+    assert snapshot is not None and snapshot.filled_quantity == 100
+
+
+# Send records
+
+
+class RecordKeepingVenue(SimVenue):
+    """A venue whose adapter keeps its own send records, as the FIX provider does."""
+
+    record_id: str | None = "store-1"
+    lost_rows: bool = False
+
+    def send_record_id(self) -> str | None:
+        return self.record_id
+
+    async def order_status(self, client_order_id, symbol):  # type: ignore[no-untyped-def]
+        found = await super().order_status(client_order_id, symbol)
+        if found is None and self.lost_rows:
+            raise NoSendRecord(f"no send record for {client_order_id}")
+        return found
+
+
+def record_venue(clock: ManualClock) -> RecordKeepingVenue:
+    sim = RecordKeepingVenue(clock=clock, instruments=[sim_instrument("ACME")])
+    sim.set_quote(ACME, "9.99", "10.01")
+    return sim
+
+
+def record_manager(
+    venue: SimVenue, journal: Journal, clock: ManualClock
+) -> OrderManager:
+    return OrderManager(
+        venue,
+        journal,
+        RiskEngine(permissive_config()),
+        clock=clock,
+        stream_settle=None,
+        reconcile_interval=3600.0,
+        unknown_grace=0.0,
+    )
+
+
+async def unknown_order(
+    venue: RecordKeepingVenue, journal: Journal, clock: ManualClock
+) -> None:
+    oms = record_manager(venue, journal, clock)
+    await oms.start()
+    await venue.drain()
+    venue.faults.append(Fault.LOSE_REQUEST)
+    await oms.submit(order("SR1", price="9.50"))
+    assert oms.order("SR1").status is S.UNKNOWN
+    await oms.abort()
+    venue.lost_rows = True
+
+
+async def test_no_record_under_the_journalled_id_closes_as_never_sent(
+    journal: Journal, clock: ManualClock
+) -> None:
+    venue = record_venue(clock)
+    await unknown_order(venue, journal, clock)
+    oms = record_manager(venue, journal, clock)
+    await oms.start()
+    try:
+        state = oms.order("SR1")
+        assert state.status is S.REJECTED and state.reject_code == "NOT_FOUND_AT_VENUE"
+        assert state.send_record_id == "store-1"
+    finally:
+        await oms.abort()
+
+
+async def test_no_record_under_a_different_id_stays_unknown_on_every_restart(
+    journal: Journal, clock: ManualClock
+) -> None:
+    venue = record_venue(clock)
+    await unknown_order(venue, journal, clock)
+    venue.record_id = "store-2"
+    for _ in range(3):
+        oms = record_manager(venue, journal, clock)
+        report = await oms.start()
+        try:
+            assert oms.order("SR1").status is S.UNKNOWN
+            assert BreakKind.QUERY_FAILED in [b.kind for b in report.breaks]
+            with pytest.raises(RiskRejected):
+                await oms.submit(order(price="9.50"))
+        finally:
+            await oms.abort()
+
+
+async def test_no_record_with_no_journalled_id_stays_unknown(
+    journal: Journal, clock: ManualClock
+) -> None:
+    venue = record_venue(clock)
+    venue.record_id = None
+    await unknown_order(venue, journal, clock)
+    venue.record_id = "store-1"
+    oms = record_manager(venue, journal, clock)
+    await oms.start()
+    try:
+        assert oms.order("SR1").status is S.UNKNOWN
+    finally:
+        await oms.abort()
+
+
+async def test_a_venue_with_no_send_records_journals_no_id(
+    oms: OrderManager, venue: SimVenue
+) -> None:
+    await venue.drain()
+    state = await oms.submit(order("SR2", price="9.50"))
+    assert state.send_record_id is None
+
+
+# Operator resolution
+
+
+async def stuck_order(
+    journal: Journal, clock: ManualClock
+) -> tuple[RecordKeepingVenue, OrderManager]:
+    venue = record_venue(clock)
+    await unknown_order(venue, journal, clock)
+    venue.record_id = "store-2"
+    oms = record_manager(venue, journal, clock)
+    await oms.start()
+    return venue, oms
+
+
+async def test_an_operator_can_close_an_unknown_order_and_it_survives_restart(
+    journal: Journal, clock: ManualClock
+) -> None:
+    venue, oms = await stuck_order(journal, clock)
+    state = await oms.resolve_unknown("SR1", operator="ops", reason="broker confirmed")
+    assert state.status is S.REJECTED
+    assert state.reject_code == "RESOLVED_BY_OPERATOR"
+    assert "ops" in str(state.reject_reason)
+    assert "broker confirmed" in str(state.reject_reason)
+    await oms.abort()
+    restarted = record_manager(venue, journal, clock)
+    await restarted.start()
+    try:
+        assert restarted.order("SR1").reject_code == "RESOLVED_BY_OPERATOR"
+    finally:
+        await restarted.abort()
+
+
+@pytest.mark.parametrize(("reason", "operator"), [(" ", "ops"), ("why", " ")])
+async def test_resolving_needs_a_name_and_a_reason(
+    journal: Journal, clock: ManualClock, reason: str, operator: str
+) -> None:
+    _, oms = await stuck_order(journal, clock)
+    try:
+        with pytest.raises(ValidationError):
+            await oms.resolve_unknown("SR1", operator=operator, reason=reason)
+        assert oms.order("SR1").status is S.UNKNOWN
+    finally:
+        await oms.abort()
+
+
+async def test_only_an_unknown_order_can_be_resolved(
+    oms: OrderManager, venue: SimVenue
+) -> None:
+    await venue.drain()
+    await oms.submit(order("SR3", price="9.50"))
+    await venue.drain()
+    with pytest.raises(OrderStateError):
+        await oms.resolve_unknown("SR3", operator="ops", reason="why")
+    assert oms.order("SR3").status is S.ACCEPTED
+
+
+async def test_resolving_refuses_a_broken_chain(
+    journal: Journal, clock: ManualClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, oms = await stuck_order(journal, clock)
+    try:
+        monkeypatch.setattr(
+            journal,
+            "verify",
+            lambda: VerifyResult(False, 1, "", 1, "altered"),
+        )
+        with pytest.raises(JournalError, match="failed verification"):
+            await oms.resolve_unknown("SR1", operator="ops", reason="why")
+        assert oms.order("SR1").status is S.UNKNOWN
     finally:
         await oms.abort()

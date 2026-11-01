@@ -170,6 +170,7 @@ class OrderState:
     reject_code: str | None = None
     anomalies: tuple[str, ...] = ()
     busted_fill_ids: frozenset[str] = frozenset()
+    send_record_id: str | None = None
 
     @property
     def client_order_id(self) -> str:
@@ -251,6 +252,13 @@ def _apply_fill(state: OrderState, fill: Fill) -> OrderState:
         filled_quantity=add(state.filled_quantity, fill.quantity),
         filled_notional=add(state.filled_notional, mul(fill.price, fill.quantity)),
     )
+    request = state.request
+    if str(fill.symbol) != str(request.symbol) or fill.side is not request.side:
+        updated = _note(
+            updated,
+            f"fill {fill.fill_id} {fill.side.value} {fill.symbol} does not match the "
+            f"order, {request.side.value} {request.symbol}",
+        )
     ceiling = _fill_ceiling(updated)
     if updated.filled_quantity > ceiling:
         updated = _note(
@@ -399,6 +407,8 @@ def _apply(state: OrderState, event: OrderEvent) -> OrderState:
         return replace(next_state, venue_order_id=event.venue_order_id)
     if isinstance(event, Rejected):
         return replace(next_state, reject_reason=event.reason, reject_code=event.code)
+    if isinstance(event, SendStarted):
+        return replace(next_state, send_record_id=event.send_record_id)
     if isinstance(event, ReplaceRequested):
         if state.status not in TRANSITIONS[event.kind]:
             return next_state  # nothing will be sent, so no new terms can go live
@@ -416,9 +426,7 @@ def _apply(state: OrderState, event: OrderEvent) -> OrderState:
         )
     if isinstance(event, CancelRejected):
         return replace(next_state, reject_reason=event.reason, reject_code=event.code)
-    if isinstance(
-        event, SendStarted | OutcomeUnknown | CancelRequested | Canceled | Expired
-    ):
+    if isinstance(event, OutcomeUnknown | CancelRequested | Canceled | Expired):
         return next_state
     raise OrderStateError(f"unhandled event kind {event.kind}")  # pragma: no cover
 

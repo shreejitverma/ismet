@@ -82,6 +82,25 @@ class RiskConfig(BaseModel):
     prevent_self_match: bool = True
     block_while_unknown: bool = True
 
+    @field_validator("per_account", "per_strategy")
+    @classmethod
+    def _no_position_limits_per_owner(
+        cls, value: dict[str, RiskLimits]
+    ) -> dict[str, RiskLimits]:
+        """Positions are tracked per symbol, so such a limit would judge the wrong net.
+
+        One strategy's holdings are not known apart from another's, so a limit on them
+        would silently compare against the net of all of them.
+        """
+        for name, limits in value.items():
+            if limits.max_position is not None or limits.max_gross_notional is not None:
+                raise ValueError(
+                    f"limits for {name!r} set max_position or max_gross_notional, "
+                    "which ismet cannot apply per account or strategy: it tracks one "
+                    "net position per symbol; set them in default or per_symbol"
+                )
+        return value
+
     @field_validator("per_symbol")
     @classmethod
     def _full_symbol_keys(cls, value: dict[str, RiskLimits]) -> dict[str, RiskLimits]:

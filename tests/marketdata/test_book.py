@@ -65,6 +65,49 @@ def test_a_bad_snapshot_leaves_the_book_exactly_as_it_was(bids, error) -> None: 
     assert snap(book) == before
 
 
+@pytest.mark.parametrize(
+    "asks",
+    [_raising_rows, lambda: [(D(11),)], lambda: [(D("NaN"), D(1))]],
+)
+def test_bad_asks_leave_the_bids_of_the_rejected_snapshot_out(asks) -> None:  # type: ignore[no-untyped-def]
+    book = synced()
+    before = snap(book)
+    with pytest.raises((RuntimeError, ValidationError)):
+        book.apply_snapshot(200, [(D(50), D(9))], asks())
+    assert book.last_sequence == 100
+    assert snap(book) == before
+
+
+def test_a_snapshot_sequence_that_is_not_an_int_is_a_validation_error() -> None:
+    book = synced()
+    with pytest.raises(ValidationError):
+        book.apply_snapshot("200", [], [])  # type: ignore[arg-type]
+
+
+def test_every_level_of_a_default_range_update_is_applied() -> None:
+    book = BookBuilder(SYM)
+    book.apply_snapshot(1, [], [])
+    assert book.apply_delta(BookDelta(BUY, D(10), D(1), 2))
+    assert book.apply_delta(BookDelta(BUY, D(9), D(1), 2))
+    assert book.depth_counts() == (2, 0)
+    assert book.stale_deltas == 0
+    assert not book.apply_delta(BookDelta(BUY, D(8), D(1), 1))
+    assert book.stale_deltas == 1
+
+
+@pytest.mark.parametrize(
+    "row", [("100.5", D(2)), (D("100.5"), "2"), (100, D(2)), (D(100), 2.5)]
+)
+def test_book_levels_must_be_decimal(row) -> None:  # type: ignore[no-untyped-def]
+    book = synced()
+    before = snap(book)
+    with pytest.raises(ValidationError):
+        book.apply_snapshot(200, [row], [])
+    with pytest.raises(ValidationError):
+        BookDelta(BUY, row[0], row[1], 101)
+    assert snap(book) == before
+
+
 def test_a_bad_snapshot_keeps_buffered_deltas_for_the_next_one() -> None:
     book = BookBuilder(SYM)
     book.apply_delta(BookDelta(BUY, D(10), D(5), 101))

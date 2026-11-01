@@ -985,3 +985,185 @@ def test_position_adjust_writes_on_a_journal_with_a_baseline(
     journal.close()
     code, out = adjust(capsys, path, "1.5")
     assert code == 0 and "adjusted: ACME@XNYS" in out and 'delta: "1.5"' in out
+    journal = SqliteJournal(path)
+    record = list(journal.records())[-1]
+    journal.close()
+    assert record.kind is RecordKind.POSITION_ADJUSTED
+    assert json.loads(record.payload) == {
+        "symbol": "ACME@XNYS",
+        "delta": "1.5",
+        "operator": "ops",
+        "reason": "fat finger",
+    }
+
+
+@pytest.mark.parametrize("payload", ["{not json", "[1]"])
+@pytest.mark.parametrize("flags", [(), ("--keep-orders",)])
+def test_kill_engage_survives_a_corrupt_kill_record(
+    capsys, tmp_path: Path, payload: str, flags: tuple[str, ...]
+) -> None:  # type: ignore[no-untyped-def]
+    path = str(tmp_path / "j.db")
+    journal = SqliteJournal(path)
+    journal.append(RecordKind.KILL_RELEASED, '{"reason": "r", "operator": "o"}')
+    journal.close()
+    connection = sqlite3.connect(path)
+    connection.execute("DROP TRIGGER journal_no_update")
+    connection.execute("UPDATE journal SET payload = ? WHERE seq = 1", (payload,))
+    connection.commit()
+    connection.close()
+    code, out = run(capsys, "kill", "engage", "--journal", path, *WHO, *flags)
+    assert code == 0 and "engaged" in out
+    journal = SqliteJournal(path)
+    state = journal.kill_state()
+    journal.close()
+    assert state.engaged
+
+
+def test_a_later_readable_release_is_not_hidden_by_a_corrupt_record(
+    capsys, tmp_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    path = str(tmp_path / "j.db")
+    broken_journal(
+        path,
+        (RecordKind.KILL_ENGAGED, KILLED),
+        (RecordKind.KILL_RELEASED, '{"reason": "r", "operator": "o"}'),
+    )
+    connection = sqlite3.connect(path)
+    connection.execute("UPDATE journal SET payload = '{bad' WHERE seq = 2")
+    connection.commit()
+    connection.close()
+    journal = SqliteJournal(path)
+    state = journal.kill_state()
+    journal.close()
+    assert not state.engaged
+
+
+def order_journal_broken(path: Path) -> None:
+    _journal_with_order(path)
+    connection = sqlite3.connect(path)
+    connection.execute("DROP TRIGGER journal_no_update")
+    connection.execute(
+        "UPDATE journal SET payload = replace(payload, '\"10\"', '\"99999\"') "
+        "WHERE seq = 1"
+    )
+    connection.commit()
+    connection.close()
+
+
+def test_journal_orders_reports_a_broken_chain(capsys, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    path = tmp_path / "j.db"
+    order_journal_broken(path)
+    code, out = run(capsys, "journal", "orders", str(path), "--all")
+    assert code == 1 and "broken at record 1" in out
+
+
+def test_journal_orders_reports_an_intact_chain(capsys, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    path = tmp_path / "j.db"
+    _journal_with_order(path)
+    code, out = run(capsys, "journal", "orders", str(path), "--all")
+    assert code == 0 and "chain: intact" in out
+
+
+def test_journal_export_reports_a_broken_chain(capsys, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    path = tmp_path / "j.db"
+    order_journal_broken(path)
+    out_path = tmp_path / "out.jsonl"
+    code, out = run(capsys, "journal", "export", str(path), "--out", str(out_path))
+    assert code == 1 and "broken at record 1" in out
+    assert out_path.exists()
+
+
+def test_export_is_on_disk_before_it_takes_its_name(
+    capsys, tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    path = tmp_path / "j.db"
+    _journal_with_order(path)
+    out_path = tmp_path / "out.jsonl"
+    steps: list[str] = []
+    fsync, link = os.fsync, os.link
+
+    def spy_fsync(descriptor: int) -> None:
+        steps.append("fsync")
+        fsync(descriptor)
+
+    def spy_link(*args: Any, **kw: Any) -> None:
+        steps.append("link")
+        link(*args, **kw)
+
+    monkeypatch.setattr(os, "fsync", spy_fsync)
+    monkeypatch.setattr(os, "link", spy_link)
+    code, _ = run(capsys, "journal", "export", str(path), "--out", str(out_path))
+    assert code == 0 and steps[-3:] == ["fsync", "link", "fsync"]
+    assert [p.name for p in tmp_path.glob(".out.jsonl.*")] == []
+
+
+def test_export_never_replaces_a_file_that_appeared_meanwhile(
+    capsys, tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    import ismet.cli as cli
+
+    path = tmp_path / "j.db"
+    _journal_with_order(path)
+    out_path = tmp_path / "out.jsonl"
+    real = cli.export_jsonl
+
+    def racing(journal: object, stream: object) -> int:
+        out_path.write_text("someone else's audit file", encoding="utf-8")
+        return real(journal, stream)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(cli, "export_jsonl", racing)
+    code, out = run(capsys, "journal", "export", str(path), "--out", str(out_path))
+    assert code == 1 and "already exists" in out
+    assert out_path.read_text(encoding="utf-8") == "someone else's audit file"
+    assert [p.name for p in tmp_path.glob(".out.jsonl.*")] == []
+
+
+def test_doctor_names_the_config_file_it_read(
+    capsys, tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    override = tmp_path / "x.toml"
+    override.write_text('providers = ["mock"]\n', encoding="utf-8")
+    monkeypatch.setenv("ISMET_CONFIG_FILE", str(override))
+    _, out = run(capsys, "doctor")
+    assert str(override) in out
+
+
+def test_home_reports_a_malformed_config_rather_than_no_providers(
+    capsys, tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    override = tmp_path / "x.toml"
+    override.write_text("not toml [[[", encoding="utf-8")
+    monkeypatch.setenv("ISMET_CONFIG_FILE", str(override))
+    monkeypatch.setenv("ISMET_PROVIDERS", "mock")
+    code, out = run(capsys)
+    assert code == 1
+    assert "providers_configured: unknown" in out
+    assert "config_error" in out and "ismet doctor" in out
+
+
+def test_bars_show_flags_and_adjustment(capsys, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from ismet.client import IsmetClient
+    from ismet.models import Adjustment, Bar, Interval, QualityFlag
+
+    ts = datetime(2026, 3, 9, 14, 30, tzinfo=timezone.utc)
+    flagged = Bar(
+        symbol=Symbol(venue="XMOK", ticker="ACME"),
+        exchange_ts=ts,
+        received_ts=ts,
+        interval=Interval.D1,
+        open="1",
+        high="1",
+        low="1",
+        close="1",
+        volume="1",
+        adjustment=Adjustment.SPLIT,
+        quality=frozenset({QualityFlag.OUTLIER}),
+    )
+
+    async def bars(self: object, *args: object, **kw: object) -> list[Bar]:
+        return [flagged]
+
+    monkeypatch.setattr(IsmetClient, "bars", bars)
+    monkeypatch.setenv("ISMET_PROVIDERS", "mock")
+    code, out = run(capsys, "bars", "ACME@XMOK")
+    assert code == 0 and "outlier" in out and "split" in out

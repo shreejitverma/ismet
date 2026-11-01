@@ -53,6 +53,13 @@ def default_config_path() -> Path:
     return Path(user_config_dir(APP_NAME)) / "config.toml"
 
 
+def config_file_path(env: Mapping[str, str] | None = None) -> Path:
+    """The file :meth:`Settings.load` reads: the override, or the default."""
+    environ = os.environ if env is None else env
+    override = environ.get(f"{ENV_PREFIX}CONFIG_FILE")
+    return Path(override) if override else default_config_path()
+
+
 class ProviderSettings(BaseModel):
     """Per-provider credentials (secret) and options (not secret)."""
 
@@ -103,10 +110,7 @@ class Settings(BaseModel):
         layers: list[dict[str, Any]] = []
         path: Path | None = None
         if use_file:
-            override = environ.get(f"{ENV_PREFIX}CONFIG_FILE")
-            path = config_file or (
-                Path(override) if override else default_config_path()
-            )
+            path = config_file or config_file_path(environ)
             layers.append(_read_file(path))
         layers.append(_read_env(environ))
         layers.append(_normalise(dict(explicit or {})))
@@ -232,5 +236,6 @@ __all__ = [
     "ENV_PREFIX",
     "ProviderSettings",
     "Settings",
+    "config_file_path",
     "default_config_path",
 ]

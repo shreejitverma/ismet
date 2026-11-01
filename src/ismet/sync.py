@@ -233,20 +233,18 @@ class IsmetSyncClient:
     def _iterate(self, stream: Any, *, maxsize: int) -> Iterator[Any]:
         """Bridge an async iterator to this thread, with a bounded queue.
 
-        Leaving the ``for`` loop for any reason cancels the producer. Closing the client
-        under a running iterator raises in the consumer, rather than looking like the
-        stream simply ended. Nothing here can block the event loop or hang the consumer.
+        Nothing starts until the first ``next``, so an iterator never consumed holds
+        nothing. Leaving the ``for`` loop for any reason cancels the producer. Closing
+        the client under a running iterator raises in the consumer, rather than looking
+        like the stream simply ended. Nothing here can block the event loop or hang the
+        consumer.
         """
         if maxsize < 1:
             raise ValidationError(f"buffer must be at least 1, got {maxsize}")
-        if self._loop is None:
-            raise ConfigError("client is not open; use it in a 'with' block")
-        loop = self._loop
         queue: Queue[Any] = Queue(maxsize=maxsize)
         stop = threading.Event()
         finished = threading.Event()
         failure: list[BaseException] = []
-        self._streams[stop] = failure
 
         def put(item: Any) -> None:
             while not stop.is_set():
@@ -273,9 +271,11 @@ class IsmetSyncClient:
                 self._streams.pop(stop, None)
                 finished.set()
 
-        future = asyncio.run_coroutine_threadsafe(pump(), loop)
-
         def generate() -> Iterator[Any]:
+            if self._loop is None:
+                raise ConfigError("client is not open; use it in a 'with' block")
+            self._streams[stop] = failure
+            future = asyncio.run_coroutine_threadsafe(pump(), self._loop)
             try:
                 while True:
                     try:

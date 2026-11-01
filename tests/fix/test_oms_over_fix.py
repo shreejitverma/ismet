@@ -677,6 +677,69 @@ class TestCrashRecovery:
             await restarted.submit(request("C2"))
         assert acceptor.of_type("D") == []
 
+    @staticmethod
+    def _lose_the_store(acceptor: FixAcceptor, rig: Rig) -> None:
+        for lost in rig.fix_path.parent.glob(f"{rig.fix_path.name}*"):
+            lost.unlink()
+        acceptor.next_in = 1
+        acceptor.next_out = 1
+        acceptor.sent.clear()
+
+    async def test_a_lost_store_stays_refused_on_every_later_restart(
+        self, acceptor: FixAcceptor, rig: Rig
+    ) -> None:
+        """Each logon consumes a number, so a lost store soon looks used. Its id does
+        not change into the one the order was sent under."""
+        oms = await rig.build(checkpoint=crash_at("after_send_started"))
+        with pytest.raises(SimulatedCrash):
+            await oms.submit(request())
+        await rig.teardown()
+        self._lose_the_store(acceptor, rig)
+        for _ in range(3):
+            restarted = await rig.build(block_while_unknown=True)
+            report = await restarted.reconcile()
+            assert restarted.order("C1").status is OrderStatus.UNKNOWN
+            assert [b for b in report.breaks if b.kind is BreakKind.QUERY_FAILED]
+            await rig.teardown()
+        assert acceptor.of_type("F") == []
+
+    async def test_a_working_order_is_not_closed_on_a_lost_store(
+        self, acceptor: FixAcceptor, rig: Rig
+    ) -> None:
+        """The venue still holds it, so no restart may report it gone."""
+        oms = await rig.build()
+        await oms.submit(request())
+        await rig.teardown()
+        self._lose_the_store(acceptor, rig)
+        for _ in range(3):
+            restarted = await rig.build()
+            await restarted.reconcile()
+            state = restarted.order("C1")
+            assert state.is_open
+            assert state.reject_code is None
+            await rig.teardown()
+        assert list(acceptor.orders) == ["C1"]
+        assert acceptor.of_type("F") == []
+
+    async def test_a_wiped_store_that_carried_a_new_order_does_not_clear_the_old_one(
+        self, acceptor: FixAcceptor, rig: Rig
+    ) -> None:
+        oms = await rig.build(checkpoint=crash_at("after_send_started"))
+        with pytest.raises(SimulatedCrash):
+            await oms.submit(request())
+        await rig.teardown()
+        self._lose_the_store(acceptor, rig)
+
+        await rig.build()
+        assert rig.provider is not None
+        await rig.provider.place_order(request("C2"))
+        assert [m.get(11) for m in acceptor.of_type("D")] == ["C2"]
+        await rig.teardown()
+
+        again = await rig.build()
+        await again.reconcile()
+        assert again.order("C1").status is OrderStatus.UNKNOWN
+
 
 class TestHaltAcrossRestart:
     async def test_the_first_order_after_a_restart_is_refused_while_halted(

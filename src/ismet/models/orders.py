@@ -281,6 +281,11 @@ class SubmitIntent(_Event):
 
 class SendStarted(_Event):
     kind: Literal["send_started"] = "send_started"
+    send_record_id: str | None = None
+    """Which of the provider's send records this order was sent under, if it keeps any.
+
+    See :class:`ismet.capabilities.SendRecordCapability`.
+    """
 
 
 class Acknowledged(_Event):

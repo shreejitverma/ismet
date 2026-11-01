@@ -174,11 +174,26 @@ def _kill_state_from(rows: Iterable[tuple[int, str, str]]) -> KillState:
     """The kill state of ``(seq, kind, payload)`` rows, oldest first.
 
     A release naming no operator is ignored, so it leaves the switch as it was: every
-    reader, including a process starting up, must agree that the halt still holds.
+    reader, including a process starting up, must agree that the halt still holds. A row
+    that cannot be read could have been either kind, so it leaves the switch engaged
+    until a later readable row says otherwise.
     """
     state = KillState(False)
     for seq, kind, payload in rows:
-        detail = json.loads(payload)
+        try:
+            detail = json.loads(payload)
+        except ValueError:
+            detail = None
+        if not isinstance(detail, dict):
+            logger.critical("kill switch record %s cannot be read", seq)
+            state = KillState(
+                True,
+                f"kill switch record {seq} cannot be read",
+                "",
+                seq,
+                state.cancel_open,
+            )
+            continue
         engaged = kind == RecordKind.KILL_ENGAGED.value
         if not engaged and not names_operator(detail):
             logger.critical("ignoring a kill switch release with no operator: %s", seq)

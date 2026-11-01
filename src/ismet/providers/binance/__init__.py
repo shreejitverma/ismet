@@ -69,9 +69,10 @@ Vendor quirks:
   :class:`~ismet.errors.RateLimited` and never retried, because sending more lengthens
   it. The ban lasts the longest of ``Retry-After``, the time stated in the body, and
   the 2 minutes the docs give as the shortest ban, so a host clock running fast cannot
-  shorten it. A 429's ``Retry-After`` is held the same way, and requests are refused
-  locally until the wait ends. A 429 whose ``Retry-After`` exceeds the retry policy's
-  cap is not retried, because retrying before it elapses is what earns the ban.
+  shorten it. A 429's ``Retry-After`` is held the same way. Until the wait ends, nothing
+  is sent: the check runs after any wait for rate limit budget, right before the send.
+  A request then waits out a hold within the retry policy's cap and is otherwise
+  refused locally, and a stream reconnect waits it out before its handshake.
 - ``serverShutdown`` frames are logged; the close that follows triggers the
   reconnect. A connection is valid for 24 hours and then dropped, handled the same
   way.
@@ -111,7 +112,7 @@ from ismet.providers.base import Provider, max_reconnects_option
 from ismet.transport.backoff import (
     ExponentialBackoff,
     RetryPolicy,
-    should_retry_after_stated_wait,
+    default_should_retry,
 )
 from ismet.transport.circuit import CircuitBreaker
 from ismet.transport.clock import SYSTEM_CLOCK, Clock
@@ -180,17 +181,36 @@ class _WeightLimiter(RateLimiter):
 
     def __init__(self, clock: Clock) -> None:
         super().__init__(dict(RATE_LIMITS), clock=clock)
+        self._hold_until = 0.0
+
+    def hold(self, seconds: float) -> None:
+        self._hold_until = max(self._hold_until, self._clock.monotonic() + seconds)
+
+    def _refuse_during_hold(self) -> None:
+        remaining = self._hold_until - self._clock.monotonic()
+        if remaining > 0:
+            raise RateLimited(
+                f"binance told this IP to wait another {remaining:.0f}s; not sending",
+                retry_after=remaining,
+            )
+
+    async def wait_out_hold(self) -> None:
+        while (remaining := self._hold_until - self._clock.monotonic()) > 0:
+            await self._sleep(remaining)
 
     async def acquire(self, key: str | None = None, tokens: int = 1) -> float:
-        if key is not None and key in ENDPOINT_WEIGHTS:
-            return await super().acquire(_WEIGHT, tokens * ENDPOINT_WEIGHTS[key])
-        return await super().acquire(key, tokens)
+        if key is None or key not in ENDPOINT_WEIGHTS:
+            return await super().acquire(key, tokens)
+        self._refuse_during_hold()
+        waited = await super().acquire(_WEIGHT, tokens * ENDPOINT_WEIGHTS[key])
+        self._refuse_during_hold()
+        return waited
 
 
 def _should_retry(exc: BaseException) -> bool:
     if isinstance(exc, RateLimited) and exc.retry_after is None:
         return False
-    return should_retry_after_stated_wait(exc)
+    return default_should_retry(exc)
 
 
 BINANCE_RETRY = RetryPolicy(should_retry=_should_retry)
@@ -259,7 +279,6 @@ class BinanceProvider(Provider):
         self._all_symbols: list[Mapping[str, Any]] | None = None
         self._all_symbols_at = 0.0
         self._streams: set[WebSocketTransport] = set()
-        self._hold_until = 0.0
 
     @classmethod
     def from_settings(cls, settings: ProviderSettings) -> BinanceProvider:
@@ -298,12 +317,6 @@ class BinanceProvider(Provider):
     async def _request(
         self, path: str, params: Mapping[str, Any], rate_key: str
     ) -> Response:
-        remaining = self._hold_until - self.clock.monotonic()
-        if remaining > 0:
-            raise RateLimited(
-                f"binance told this IP to wait another {remaining:.0f}s; not sending",
-                retry_after=remaining,
-            )
         return await self._http.request("GET", path, params=params, rate_key=rate_key)
 
     def _map_error(
@@ -324,9 +337,7 @@ class BinanceProvider(Provider):
 
     def _hold_when_limited(self, info: RequestInfo) -> None:
         if isinstance(info.error, RateLimited) and info.error.retry_after is not None:
-            self._hold_until = max(
-                self._hold_until, self.clock.monotonic() + info.error.retry_after
-            )
+            self._limiter.hold(info.error.retry_after)
 
     async def _symbol_info(self, ticker: str) -> Mapping[str, Any]:
         payload = await self._get(
@@ -489,6 +500,7 @@ class BinanceProvider(Provider):
 
         async def before_connect() -> None:
             await self._limiter.acquire(_WS_CONNECT)
+            await self._limiter.wait_out_hold()
 
         async def on_connect(ws: WebSocketTransport) -> None:
             nonlocal generation

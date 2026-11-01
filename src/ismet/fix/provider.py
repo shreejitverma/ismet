@@ -27,14 +27,15 @@ What FIX does and does not offer, and how this provider handles each:
   uses one of those; if not, override :meth:`FixDialect.is_unknown_order`. A timeout, a
   session Reject, or any other reject raises and never returns ``None``. The one other
   case that cannot be asked is an order with no row in the store: FIX requires Side,
-  which only that row holds. The row is written before the order's bytes, so when the
-  store was already in use before this provider opened it, no row proves the order
-  never left, and the query returns ``None`` without sending anything. That is how an
-  order whose process died between the order manager's ``send_started`` and this row
-  is closed. A store with no history, such as a new empty file, proves nothing, and a
-  wiped or misconfigured store must not make a live order look dead, so the query
-  raises instead. That is a declared exception to the trading conformance check
-  ``status_none_when_not_found``.
+  which only that row holds. The query raises :class:`~ismet.errors.NoSendRecord` and
+  sends nothing. The row is written before the order's bytes, so no row proves the order
+  never left, but only in the store it was sent under. A wiped or misconfigured store
+  must not make a live order look dead. So this provider is a
+  :class:`~ismet.capabilities.SendRecordCapability`: the store's random id is journalled
+  with the order manager's ``send_started``, and the manager reads the error as not
+  found only when that id equals this store's. That is how an order whose process died
+  between ``send_started`` and this row is closed. That the query raises is a declared
+  exception to the trading conformance check ``status_none_when_not_found``.
 - ``cancel_order`` and ``amend_order`` send F and G under a fresh ClOrdID, as FIX
   requires, with OrigClOrdID naming the last accepted one. The chain is durable, so a
   report under any of its ClOrdIDs maps back to the caller's client order id. They wait
@@ -103,6 +104,7 @@ from ismet.errors import (
     AmbiguousOutcome,
     ConfigError,
     DuplicateOrderId,
+    NoSendRecord,
     TransportError,
     ValidationError,
     VenueError,
@@ -462,7 +464,7 @@ class FixProvider(Provider):
         self._records_lock = asyncio.Lock()
         self._request_counter = 0
         self._begin_string = config.begin_string
-        self._store_in_use = False
+        self._store_id = store.store_id()
 
     @classmethod
     def from_settings(cls, settings: ProviderSettings) -> FixProvider:
@@ -548,22 +550,12 @@ class FixProvider(Provider):
 
     async def open(self) -> None:
         """Connect and log on. Raises if the session cannot become ready in time."""
-        self._store_in_use = await self._store_call(self._store_has_history)
         await self._session.start()
         await self._session.wait_ready(self._logon_timeout)
 
-    def _store_has_history(self) -> bool:
-        """Whether this session used the store before this provider opened it.
-
-        Every logon consumes an outbound number and a confirmed reset is recorded, so
-        a store with neither has never carried an order.
-        """
-        store = self._store
-        return (
-            store.next_outbound() > 1
-            or store.next_inbound() > 1
-            or store.reset_period() is not None
-        )
+    def send_record_id(self) -> str:
+        """The id of the store holding this provider's send records."""
+        return self._store_id
 
     async def close(self) -> None:
         """Log out and stop. Open orders stay working at the venue. Idempotent."""
@@ -659,29 +651,21 @@ class FixProvider(Provider):
 
     async def _quarantine(self, message: FixMessage, reason: str) -> None:
         """Record a message that will never be redelivered, and stop if it mattered."""
-        text = self._session.scrub(reason)
-        logger.critical("FIX message type %s quarantined: %s", message.msg_type, text)
-        halted = message.msg_type == "8" and not self._is_status(message)
-        record = QuarantinedMessage(
-            _reference(message.get(_TAG_MSG_SEQ_NUM)) or 0,
-            message.msg_type,
-            self._session.scrub(repr(message)),
-            text,
-            self.clock.now().isoformat(),
-            halted=halted,
-        )
+        record = self._quarantine_row(message, reason)
         await self._session.run_store(lambda: self._store.quarantine(record))
-        if not halted:
+        if not record.halted:
             return
         wire_id = message.get(_TAG_CLIENT_ORDER_ID)
         root = await self._resolve(wire_id, message.get(_TAG_ORIG_CLIENT_ORDER_ID))
-        target = root or wire_id
-        if target is not None:
-            # A pending report that may hold a fill: only a query can settle it.
+        self._halt_order(root or wire_id, record.reason)
+
+    def _halt_order(self, client_order_id: str | None, text: str) -> None:
+        """Tell the stream a report may hold a fill: only a query can settle it."""
+        if client_order_id is not None:
             with contextlib.suppress(pydantic.ValidationError):
                 self._publish(
                     Restated(
-                        client_order_id=target,
+                        client_order_id=client_order_id,
                         ts=self.clock.now(),
                         origin=EventOrigin.VENUE,
                         status=OrderStatus.UNKNOWN,
@@ -689,6 +673,18 @@ class FixProvider(Provider):
                     )
                 )
         self._halt(ReportQuarantinedError(f"unreadable execution report: {text}"))
+
+    def _quarantine_row(self, message: FixMessage, reason: str) -> QuarantinedMessage:
+        text = self._session.scrub(reason)
+        logger.critical("FIX message type %s quarantined: %s", message.msg_type, text)
+        return QuarantinedMessage(
+            _reference(message.get(_TAG_MSG_SEQ_NUM)) or 0,
+            message.msg_type,
+            self._session.scrub(repr(message)),
+            text,
+            self.clock.now().isoformat(),
+            halted=message.msg_type == "8" and not self._is_status(message),
+        )
 
     def _halt(self, error: ReportQuarantinedError) -> None:
         """Stop running streams. Later subscribers read the halt from the store."""
@@ -923,8 +919,14 @@ class FixProvider(Provider):
         fill = next((e.fill for e in events if isinstance(e, Filled)), None)
         bust = next((e.fill_id for e in events if isinstance(e, FillBusted)), None)
         unreported = self._unreported_quantity(record, message, fill, bust)
+        lost_report: QuarantinedMessage | None = None
         if unreported is not None:
             events = [e for e in events if isinstance(e, Filled)]
+            lost_report = self._quarantine_row(
+                message,
+                f"CumQty is {unreported} above the fills received, so a report on "
+                f"{client_order_id} was lost",
+            )
         updated = self._updated_record(record, message, wire_id, fill, bust)
         received = self.clock.now()
         execution = StoredExecution(
@@ -946,6 +948,7 @@ class FixProvider(Provider):
                     order_open=order_open,
                     execution=execution,
                     bust_exec_id=bust,
+                    quarantine=lost_report,
                 )
             )
         )
@@ -962,12 +965,8 @@ class FixProvider(Provider):
         for event in events:
             self._publish(event)
         self._answer_waiters(message, wire_id)
-        if unreported is not None:
-            await self._quarantine(
-                message,
-                f"CumQty is {unreported} above the fills received, so a report on "
-                f"{client_order_id} was lost",
-            )
+        if lost_report is not None:
+            self._halt_order(client_order_id, lost_report.reason)
         if cancelled is not None:
             raise cancelled
 
@@ -1760,14 +1759,7 @@ class FixProvider(Provider):
         """Ask the venue about an order. See the module docstring for ``None``."""
         record = await self._lookup(client_order_id)
         if record is None:
-            if self._store_in_use:
-                logger.warning(
-                    "FIX has no row for %s in a store that was in use, so it was "
-                    "never sent",
-                    client_order_id,
-                )
-                return None
-            raise TransportError(_no_record_text(client_order_id), retryable=False)
+            raise NoSendRecord(_no_record_text(client_order_id), retryable=False)
         self._session.require_ready()
         self._request_counter += 1
         key = f"S{self._request_counter}-{client_order_id}"

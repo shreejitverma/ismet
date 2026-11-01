@@ -100,6 +100,7 @@ class _Order:
     filled: Decimal = Decimal(0)
     arrived: int = 0
     ts: datetime | None = None
+    elected: bool = False
 
     @property
     def leaves(self) -> Decimal:
@@ -208,6 +209,11 @@ class SimVenue(Provider):
         """An external print: fills resting orders at or better, in price-time order."""
         print_price, remaining = Decimal(price), Decimal(quantity)
         self._markets.setdefault(symbol, _Market()).last = print_price
+        for order in self._orders.values():
+            if order.request.symbol == symbol and self._stop_reached(
+                order, print_price
+            ):
+                order.elected = True
         for order in self._resting_in_priority(symbol):
             if remaining <= 0:
                 break
@@ -388,7 +394,10 @@ class SimVenue(Provider):
             for o in self._orders.values()
             if o.request.symbol == symbol
             and o.status in (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED)
-            and o.request.order_type in (OrderType.LIMIT, OrderType.STOP_LIMIT)
+            and (
+                o.request.order_type is OrderType.LIMIT
+                or (o.request.order_type is OrderType.STOP_LIMIT and o.elected)
+            )
             and o.limit_price is not None
         ]
 
@@ -431,6 +440,13 @@ class SimVenue(Provider):
     def _would_cross(self, request: OrderRequest) -> bool:
         return self._available_at(request) > 0
 
+    @staticmethod
+    def _stop_reached(order: _Order, price: Decimal) -> bool:
+        stop = order.request.stop_price
+        if stop is None:
+            return False
+        return price >= stop if order.request.side is OrderSide.BUY else price <= stop
+
     def _elect_stops(self, symbol: Symbol) -> None:
         market = self._markets[symbol]
         for order in list(self._orders.values()):
@@ -446,7 +462,8 @@ class SimVenue(Provider):
             touch = market.ask if buying else market.bid
             if touch is None:
                 continue
-            if touch >= request.stop_price if buying else touch <= request.stop_price:
+            if self._stop_reached(order, touch):
+                order.elected = True
                 self._take_liquidity(order)
 
     # Provider lifecycle

@@ -126,7 +126,7 @@ async def test_retry_honours_retry_after_capped() -> None:
         nonlocal calls
         calls += 1
         if calls == 1:
-            raise RateLimited("slow", retry_after=500)
+            raise RateLimited("slow", retry_after=10)
         if calls == 2:
             raise RateLimited("slow", retry_after=0.25)
         return calls
@@ -137,3 +137,24 @@ async def test_retry_honours_retry_after_capped() -> None:
     policy = RetryPolicy(max_attempts=3, max_retry_after=10)
     assert await retry(fn, policy, sleep=sleep) == 3
     assert slept == [10, 0.25]
+
+
+@pytest.mark.parametrize("cap", [0.5, 10.0])
+async def test_a_stated_wait_over_the_policy_cap_is_refused_never_shortened(
+    cap: float,
+) -> None:
+    calls = 0
+    slept: list[float] = []
+
+    async def fn() -> int:
+        nonlocal calls
+        calls += 1
+        raise RateLimited("slow", retry_after=cap + 1)
+
+    async def sleep(d: float) -> None:
+        slept.append(d)
+
+    policy = RetryPolicy(max_attempts=3, max_retry_after=cap)
+    with pytest.raises(RateLimited):
+        await retry(fn, policy, sleep=sleep)
+    assert calls == 1 and slept == []

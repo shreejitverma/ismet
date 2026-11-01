@@ -12,8 +12,12 @@ from pathlib import Path
 EXAMPLES = sorted((Path(__file__).parents[2] / "examples").glob("*.py"))
 
 
-def test_examples_exist() -> None:
-    assert len(EXAMPLES) >= 3
+def test_every_published_example_has_a_test_that_runs_it() -> None:
+    assert {path.stem for path in EXAMPLES} == {
+        "quickstart_market_data",
+        "safe_order_path",
+        "sync_client",
+    }
 
 
 def _output_of(stem: str) -> str:
