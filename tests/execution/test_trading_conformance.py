@@ -1,0 +1,147 @@
+"""The trading suite passes the simulated venue and catches broken adapters."""
+
+from __future__ import annotations
+
+import pytest
+
+from ismet.errors import ConfigError, VenueError
+from ismet.models.orders import (
+    Environment,
+    OrderAck,
+    OrderRequest,
+    OrderStatus,
+)
+from ismet.providers.mock import MockProvider
+from ismet.testing.conformance import assert_conformant
+from ismet.testing.simvenue import SimVenue, sim_instrument
+from ismet.testing.trading_conformance import run_trading_conformance
+
+from .conftest import ACME, order
+
+
+def passive(client_order_id: str) -> OrderRequest:
+    return order(client_order_id, price="9.00")
+
+
+def venue(cls: type[SimVenue] = SimVenue) -> SimVenue:
+    sim = cls(instruments=[sim_instrument("ACME")])
+    sim.set_quote(ACME, "9.99", "10.01")
+    return sim
+
+
+async def test_simulated_venue_conforms() -> None:
+    report = await run_trading_conformance(venue(), passive)
+    assert_conformant(report)
+    assert len(report.checks) >= 15
+
+
+async def test_refuses_to_run_against_a_live_provider() -> None:
+    class Live(SimVenue):
+        environment = Environment.LIVE
+
+    live = venue(Live)
+    with pytest.raises(ConfigError, match="LIVE"):
+        await run_trading_conformance(live, passive)
+    assert not live.attempts
+
+
+async def test_provider_without_trading_is_reported() -> None:
+    provider = MockProvider()
+    provider.environment = Environment.SIMULATED
+    report = await run_trading_conformance(provider, passive)
+    assert not report.passed
+
+
+class AcceptsDuplicates(SimVenue):
+    async def place_order(self, request: OrderRequest) -> OrderAck:
+        try:
+            return await super().place_order(request)
+        except VenueError:
+            return OrderAck(
+                client_order_id=request.client_order_id,
+                venue_order_id="DUP",
+                ts=self.clock.now(),
+            )
+
+
+class WrongIdInAck(SimVenue):
+    async def place_order(self, request: OrderRequest) -> OrderAck:
+        ack = await super().place_order(request)
+        return ack.model_copy(update={"client_order_id": "other"})
+
+
+class StatusRaisesForMissing(SimVenue):
+    async def order_status(self, client_order_id, symbol):  # type: ignore[no-untyped-def]
+        found = await super().order_status(client_order_id, symbol)
+        if found is None:
+            raise VenueError("not found")
+        return found
+
+
+class StatusGuessesMissing(SimVenue):
+    async def order_status(self, client_order_id, symbol):  # type: ignore[no-untyped-def]
+        return None
+
+
+class CancelSwallowsUnknown(SimVenue):
+    async def cancel_order(self, client_order_id, symbol):  # type: ignore[no-untyped-def]
+        if client_order_id in self._orders:
+            await super().cancel_order(client_order_id, symbol)
+
+
+class CancelDoesNothing(SimVenue):
+    async def cancel_order(self, client_order_id, symbol):  # type: ignore[no-untyped-def]
+        if client_order_id not in self._orders:
+            raise VenueError("unknown")
+
+
+class NoStreamReports(SimVenue):
+    def _publish(self, event) -> None:  # type: ignore[no-untyped-def]
+        return
+
+
+class HidesOpenOrders(SimVenue):
+    async def open_orders(self, symbol=None):  # type: ignore[no-untyped-def]
+        return []
+
+
+class PlaceFails(SimVenue):
+    async def place_order(self, request: OrderRequest) -> OrderAck:
+        raise VenueError("account disabled")
+
+
+class ReportsWrongStatus(SimVenue):
+    def _snapshot(self, order_):  # type: ignore[no-untyped-def]
+        return (
+            super()
+            ._snapshot(order_)
+            .model_copy(update={"status": OrderStatus.PARTIALLY_FILLED})
+        )
+
+
+@pytest.mark.parametrize(
+    ("broken", "failing_check"),
+    [
+        (AcceptsDuplicates, "duplicate_client_id_refused"),
+        (WrongIdInAck, "ack_echoes_client_order_id"),
+        (StatusRaisesForMissing, "status_of_unknown_order"),
+        (StatusGuessesMissing, "status_finds_order_by_client_id"),
+        (CancelSwallowsUnknown, "cancel_unknown_is_venue_error"),
+        (CancelDoesNothing, "cancel_takes_effect"),
+        (HidesOpenOrders, "open_orders_lists_order"),
+        (PlaceFails, "place_order"),
+        (ReportsWrongStatus, "passive_order_is_working"),
+    ],
+)
+async def test_suite_catches_each_kind_of_broken_adapter(
+    broken: type[SimVenue], failing_check: str
+) -> None:
+    report = await run_trading_conformance(venue(broken), passive)
+    assert failing_check in {check.name for check in report.failures}
+
+
+async def test_suite_catches_an_adapter_with_a_silent_stream() -> None:
+    report = await run_trading_conformance(
+        venue(NoStreamReports), passive, timeout=0.05
+    )
+    assert "stream_reports_new_order" in {check.name for check in report.failures}
