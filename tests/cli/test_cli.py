@@ -163,7 +163,7 @@ def test_kill_switch_round_trip_is_idempotent_and_audited(
 ) -> None:  # type: ignore[no-untyped-def]
     path = str(tmp_path / "j.db")
     who = ("--reason", "fat finger", "--operator", "ops")
-    code, out = run(capsys, "kill", "engage", "--journal", path, *who)
+    code, out = run(capsys, "kill", "engage", "--journal", path, "--create", *who)
     assert code == 0 and "kill: engaged" in out and "cancel_open: true" in out
     code, out = run(capsys, "kill", "engage", "--journal", path, *who)
     assert code == 0 and "no-op" in out
@@ -175,12 +175,15 @@ def test_kill_switch_round_trip_is_idempotent_and_audited(
     assert code == 0 and "no-op" in out
     code, out = run(capsys, "kill", "engage", "--journal", path, *who, "--keep-orders")
     assert "cancel_open: false" in out
+    code, out = run(capsys, "kill", "engage", "--journal", path, *who)
+    assert code == 0 and "cancel_open: true" in out  # widening is recorded, not a no-op
     journal = SqliteJournal(path)
     kinds = [r.kind for r in journal.records()]
     journal.close()
     assert kinds == [
         RecordKind.KILL_ENGAGED,
         RecordKind.KILL_RELEASED,
+        RecordKind.KILL_ENGAGED,
         RecordKind.KILL_ENGAGED,
     ]
 
@@ -190,6 +193,12 @@ def test_kill_requires_flags_and_action_and_existing_journal(
 ) -> None:  # type: ignore[no-untyped-def]
     code, out = run(capsys, "kill", "engage", "--journal", str(tmp_path / "j.db"))
     assert code == 2 and "--reason" in out
+    who = ("--reason", "r", "--operator", "o")
+    typo = tmp_path / "typo.db"
+    code, out = run(capsys, "kill", "engage", "--journal", str(typo), *who)
+    assert code == 1 and "no journal" in out and not typo.exists()
+    code, out = run(capsys, "kill", "release", "--journal", str(typo), *who)
+    assert code == 1 and not typo.exists()
     code, out = run(capsys, "kill")
     assert code == 2
     code, out = run(capsys, "kill", "status", "--journal", str(tmp_path / "none.db"))
@@ -221,6 +230,11 @@ def test_journal_verify_orders_export(capsys, tmp_path: Path) -> None:  # type: 
     _journal_with_order(path)
     code, out = run(capsys, "journal", "verify", str(path))
     assert code == 0 and "ok: true" in out and "records: 2" in out
+    head = next(line for line in out.splitlines() if "head_hash" in line).split()[-1]
+    code, out = run(capsys, "journal", "verify", str(path), "--expect-head", head)
+    assert code == 0
+    code, out = run(capsys, "journal", "verify", str(path), "--expect-head", "f" * 64)
+    assert code == 1 and "truncated or replaced" in out
     code, out = run(capsys, "journal", "orders", str(path))
     assert code == 0 and "C1,ACME@XSIM,buy,submitting,0/10" in out
     target = tmp_path / "audit.jsonl"
@@ -268,7 +282,24 @@ def test_internal_errors_go_to_stderr_not_stdout(capsys, monkeypatch) -> None:  
     assert "Traceback" in captured.err and "Traceback" not in captured.out
 
 
+def test_iso_times_with_a_z_suffix_are_accepted(capsys, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("ISMET_PROVIDERS", "mock")
+    code, out = run(
+        capsys,
+        "bars",
+        "ACME@XMOK",
+        "--interval",
+        "1h",
+        "--start",
+        "2026-03-09T00:00:00Z",
+        "--end",
+        "2026-03-09T02:00:00Z",
+    )
+    assert code == 0 and "count: 2 of 2 total" in out
+
+
 def test_toon_scalars_quote_ambiguous_text() -> None:
+    assert scalar("abc\n") == '"abc\\n"'
     assert scalar("plain text") == "plain text"
     assert scalar("true") == '"true"' and scalar("123") == '"123"'
     assert scalar("a,b") == '"a,b"' and scalar("a:b") == '"a:b"'

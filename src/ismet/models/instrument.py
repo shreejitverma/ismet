@@ -18,7 +18,6 @@ from ismet.models.types import (
     PositiveDecimal,
     Price,
     Quantity,
-    Ratio,
     Timestamp,
 )
 
@@ -118,7 +117,7 @@ class Instrument(BaseModel):
     tick_size: PositiveDecimal
     tick_ladder: TickLadder | None = None
     lot_size: PositiveDecimal = Decimal(1)
-    multiplier: Ratio = Decimal(1)
+    multiplier: PositiveDecimal = Decimal(1)
     min_quantity: Quantity | None = None
     max_quantity: Quantity | None = None
     min_notional: Quantity | None = None

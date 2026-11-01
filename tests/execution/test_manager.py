@@ -513,7 +513,8 @@ async def test_order_lost_by_the_venue_is_a_recorded_break(
     report = await oms.reconcile()
     assert oms.order("L1").status is S.CANCELED
     assert [b.kind for b in report.breaks] == [BreakKind.MISSING_AT_VENUE]
-    assert not report.breaks[0].is_critical
+    assert report.breaks[0].is_critical
+    assert oms.kill_state.engaged
 
 
 async def test_halt_on_break_can_be_disabled(
@@ -771,7 +772,7 @@ async def test_stop_order_elects_and_fills(oms: OrderManager, venue: SimVenue) -
 async def test_wait_for_times_out(oms: OrderManager, venue: SimVenue) -> None:
     await venue.drain()
     await oms.submit(order("W1", price="9.50"))
-    with pytest.raises(asyncio.TimeoutError):
+    with pytest.raises(TimeoutError):
         await oms.wait_for("W1", lambda o: o.is_terminal, 0.01)
 
 

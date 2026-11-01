@@ -174,10 +174,17 @@ class OrderState:
 
     @property
     def leaves_quantity(self) -> Decimal:
-        """Quantity that may still execute. Zero once terminal or overfilled."""
+        """Quantity that may still execute. Zero once terminal or overfilled.
+
+        While a replace is pending, either the old or the new quantity may turn out to
+        be live, so this is the larger, which keeps worst-case exposure honest.
+        """
         if self.is_terminal:
             return Decimal(0)
-        return max(sub(self.quantity, self.filled_quantity), Decimal(0))
+        quantity = self.quantity
+        if self.pending_quantity is not None:
+            quantity = max(quantity, self.pending_quantity)
+        return max(sub(quantity, self.filled_quantity), Decimal(0))
 
     @property
     def average_price(self) -> Decimal | None:

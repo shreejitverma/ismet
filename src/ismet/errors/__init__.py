@@ -59,11 +59,13 @@ class AmbiguousOutcome(TransportError):
     Raised when a non-idempotent request fails after it may have been sent: a
     read timeout, a dropped connection, or a 5xx. The only correct response is to
     query the venue for what happened. Resending can create a duplicate order, so
-    this error is never retried.
+    this error is not retried, unless the caller declared the request idempotent.
     """
 
-    def __init__(self, message: str, *, status: int | None = None) -> None:
-        super().__init__(message, retryable=False, status=status)
+    def __init__(
+        self, message: str, *, status: int | None = None, retryable: bool = False
+    ) -> None:
+        super().__init__(message, retryable=retryable, status=status)
 
 
 class CircuitOpen(TransportError):
@@ -159,12 +161,21 @@ class JournalError(IsmetError):
     """
 
 
+class DuplicateOrderId(VenueError):
+    """The venue already holds an order with this client order id.
+
+    An order with this id exists at the venue, so its fate must be established by
+    query. This is not a rejection of the order the caller is tracking.
+    """
+
+
 __all__ = [
     "AmbiguousOutcome",
     "AuthError",
     "CalendarOutOfRange",
     "CircuitOpen",
     "ConfigError",
+    "DuplicateOrderId",
     "IsmetError",
     "JournalError",
     "KillSwitchEngaged",

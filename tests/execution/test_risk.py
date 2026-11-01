@@ -303,15 +303,15 @@ def test_size_and_notional_limits_include_the_multiplier() -> None:
 
 
 def test_position_limit_uses_worst_case_including_open_orders() -> None:
-    rejected_by("max_position", ctx(request(quantity="500"), position=D(1600)))
+    rejected_by("max_position", ctx(request(quantity="490"), position=D(1600)))
     working = open_order(quantity="400")
     rejected_by(
         "max_position",
-        ctx(request(quantity="500"), position=D(1200), open_orders=[working]),
+        ctx(request(quantity="490"), position=D(1200), open_orders=[working]),
     )
     assert (
         RiskEngine(config())
-        .check(ctx(request(quantity="500"), position=D(1200)))
+        .check(ctx(request(quantity="490"), position=D(1200)))
         .approved
     )
 
@@ -391,7 +391,7 @@ def test_short_sale_classification() -> None:
     reduce = request(
         side=OrderSide.SELL, limit_price="99.99", quantity="100", reduce_only=True
     )
-    assert "reduce-only" in rejected_by("short_sale", ctx(reduce, position=D(50)))
+    assert "would become" in rejected_by("reduce_only", ctx(reduce, position=D(50)))
 
 
 def test_order_rate_window_slides() -> None:

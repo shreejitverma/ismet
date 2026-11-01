@@ -75,6 +75,11 @@ def neg(a: Decimal) -> Decimal:
         return -a
 
 
+def absolute(a: Decimal) -> Decimal:
+    """``abs(a)``, exact. Builtin ``abs`` rounds to the ambient context's precision."""
+    return a.copy_abs()
+
+
 def total(values: list[Decimal] | tuple[Decimal, ...]) -> Decimal:
     with localcontext(_EXACT):
         result = Decimal(0)
@@ -117,7 +122,7 @@ def round_to_step(value: Decimal, step: Decimal, rounding: Rounding) -> Decimal:
         quotient = value // step
         remainder = value - quotient * step
         if remainder == 0:
-            return (quotient * step).quantize(step)
+            return _unsigned_zero((quotient * step).quantize(step))
         # ``//`` truncates toward zero, so quotient is the toward-zero multiple.
         toward_zero = quotient * step
         away = toward_zero + (step if value > 0 else -step)
@@ -137,7 +142,12 @@ def round_to_step(value: Decimal, step: Decimal, rounding: Rounding) -> Decimal:
                 result = away
             else:
                 result = toward_zero if quotient % 2 == 0 else away
-        return result.quantize(step)
+        return _unsigned_zero(result.quantize(step))
+
+
+def _unsigned_zero(value: Decimal) -> Decimal:
+    """Avoid ``-0.00``, which compares as zero but serializes with a sign."""
+    return value.copy_abs() if value.is_zero() else value
 
 
 __all__ = [
@@ -146,6 +156,7 @@ __all__ = [
     "DivisionByZero",
     "Inexact",
     "Rounding",
+    "absolute",
     "add",
     "is_multiple",
     "midpoint",

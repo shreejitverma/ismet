@@ -18,13 +18,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ismet.calendars import TradingCalendar
 from ismet.errors import CalendarOutOfRange
 from ismet.execution.state import OrderState
 from ismet.models import AssetClass, BookState, Instrument, ListingStatus, Quote, Symbol
-from ismet.models.decimals import add, mul, ratio, sub
+from ismet.models.decimals import absolute, add, mul, ratio, sub
 from ismet.models.orders import (
     OrderRequest,
     OrderSide,
@@ -36,12 +36,9 @@ from ismet.models.orders import (
 )
 from ismet.models.types import PositiveDecimal, Quantity
 
-_SESSION_ORDER_TIF = (
-    TimeInForce.OPG,
-    TimeInForce.CLS,
-    TimeInForce.GTC,
-    TimeInForce.GTD,
-)
+_ANY_SESSION_TIF = (TimeInForce.OPG, TimeInForce.CLS)
+_RESTING_TIF = (TimeInForce.GTC, TimeInForce.GTD)
+_MAX_FUTURE_QUOTE = timedelta(seconds=5)
 
 
 class RiskLimits(BaseModel):
@@ -78,6 +75,17 @@ class RiskConfig(BaseModel):
     enforce_session: bool = True
     prevent_self_match: bool = True
     block_while_unknown: bool = True
+
+    @field_validator("per_symbol")
+    @classmethod
+    def _full_symbol_keys(cls, value: dict[str, RiskLimits]) -> dict[str, RiskLimits]:
+        """A key that matches no symbol would silently apply no limit, so refuse it."""
+        normalized: dict[str, RiskLimits] = {}
+        for key, limits in value.items():
+            if "@" not in key:
+                raise ValueError(f"per_symbol key {key!r} must be TICKER@MIC")
+            normalized[str(Symbol.parse(key))] = limits
+        return normalized
 
     def limits_for(self, request: OrderRequest) -> list[tuple[str, RiskLimits]]:
         """Every scope that applies to ``request``, labelled for messages."""
@@ -138,11 +146,21 @@ def _reference_price(ctx: RiskContext) -> Decimal | None:
 
 
 def _pricing_for_notional(ctx: RiskContext) -> Decimal | None:
-    if ctx.request.limit_price is not None:
-        return ctx.request.limit_price
-    if ctx.request.stop_price is not None:
-        return ctx.request.stop_price
-    return _reference_price(ctx)
+    """The price to judge an order's size at: its own, or the market's if larger.
+
+    An order's stated price says little about where it can execute. A sell limit at
+    0.01 trades at the bid, and a buy stop at 0.01 triggers at once and trades at the
+    ask, so judging either at its own price would defeat a notional limit.
+    """
+    own = ctx.request.limit_price
+    if own is None:
+        own = ctx.request.stop_price
+    market = _reference_price(ctx)
+    if own is None:
+        return market
+    if market is None:
+        return own
+    return own if absolute(own) >= absolute(market) else market
 
 
 def check_supported(ctx: RiskContext) -> RiskDecision:
@@ -175,12 +193,20 @@ def check_instrument(ctx: RiskContext) -> RiskDecision:
         ListingStatus.HALTED,
         ListingStatus.SUSPENDED,
         ListingStatus.DELISTED,
+        ListingStatus.PENDING,
     ):
         return _reject(
             "instrument", f"{request.symbol} is not tradable: {instrument.status.value}"
         )
     if instrument.expiry is not None and instrument.expiry <= ctx.now:
         return _reject("instrument", f"{request.symbol} expired {instrument.expiry}")
+    today = ctx.now.date()
+    if instrument.delisting_date is not None and instrument.delisting_date <= today:
+        return _reject("instrument", f"{request.symbol} was delisted")
+    if instrument.listing_date is not None and instrument.listing_date > today:
+        return _reject("instrument", f"{request.symbol} is not listed yet")
+    if request.expire_at is not None and request.expire_at <= ctx.now:
+        return _reject("time_in_force", f"expire_at {request.expire_at} has passed")
     for label, price in (("limit", request.limit_price), ("stop", request.stop_price)):
         if price is not None and not instrument.is_tick_aligned(price):
             return _reject(
@@ -206,7 +232,12 @@ def check_instrument(ctx: RiskContext) -> RiskDecision:
 
 
 def check_session(ctx: RiskContext, config: RiskConfig) -> RiskDecision:
-    if not config.enforce_session or ctx.request.time_in_force in _SESSION_ORDER_TIF:
+    request = ctx.request
+    rests_for_later = request.time_in_force in _ANY_SESSION_TIF or (
+        request.time_in_force in _RESTING_TIF
+        and request.order_type in (OrderType.LIMIT, OrderType.STOP_LIMIT)
+    )
+    if not config.enforce_session or rests_for_later:
         return APPROVED
     if ctx.calendar is None:
         return _reject("session", f"no trading calendar for {ctx.request.symbol.venue}")
@@ -233,6 +264,25 @@ def check_restricted(ctx: RiskContext, config: RiskConfig) -> RiskDecision:
     return APPROVED
 
 
+def check_reduce_only(ctx: RiskContext) -> RiskDecision:
+    """A reduce-only order may shrink the position, including pending orders, only."""
+    request = ctx.request
+    if not request.reduce_only:
+        return APPROVED
+    if ctx.position is None:
+        return _reject("reduce_only", "position unknown")
+    pending = _sum_leaves(ctx.open_orders, request.symbol, request.side)
+    resulting = add(
+        ctx.position, mul(Decimal(request.side.sign), add(pending, request.quantity))
+    )
+    position = ctx.position
+    closes = position != 0 and (position > 0) == (request.side is OrderSide.SELL)
+    crosses = resulting != 0 and (resulting > 0) != (position > 0)
+    if not closes or crosses:
+        return _reject("reduce_only", f"position {position} would become {resulting}")
+    return APPROVED
+
+
 def check_short_sale(ctx: RiskContext, config: RiskConfig) -> RiskDecision:
     request = ctx.request
     if request.side is not OrderSide.SELL:
@@ -244,8 +294,6 @@ def check_short_sale(ctx: RiskContext, config: RiskConfig) -> RiskDecision:
     marked_short = request.short_sale is not ShortSaleMark.NOT_SHORT
     if resulting >= 0:
         return APPROVED
-    if request.reduce_only:
-        return _reject("short_sale", "reduce-only sale would open a short position")
     if not marked_short:
         return _reject(
             "short_sale",
@@ -277,6 +325,11 @@ def check_reference(ctx: RiskContext, config: RiskConfig) -> RiskDecision:
         return _reject("reference_price", "no reference quote")
     age = ctx.now - quote.exchange_ts
     limit = timedelta(seconds=float(config.max_reference_age_seconds))
+    if age < -_MAX_FUTURE_QUOTE:
+        return _reject(
+            "stale_data",
+            f"reference quote is dated {-age.total_seconds():.3f}s in the future",
+        )
     if age > limit:
         return _reject(
             "stale_data",
@@ -295,13 +348,25 @@ def check_reference(ctx: RiskContext, config: RiskConfig) -> RiskDecision:
             "reference_price",
             f"market order with a {quote.book_state.value} book",
         )
+    stop = ctx.request.stop_price
+    if stop is not None:
+        buying = ctx.request.side is OrderSide.BUY
+        touch = quote.ask if buying else quote.bid
+        if touch is not None and (stop <= touch if buying else stop >= touch):
+            return _reject(
+                "stop_price",
+                f"stop {stop} is already through the market at {touch}, so it would "
+                "execute immediately",
+            )
     return APPROVED
 
 
 def _price_diff_bps(price: Decimal, reference: Decimal) -> Decimal | None:
     if reference == 0:
         return None
-    return ratio(mul(abs(sub(price, reference)), Decimal(10000)), abs(reference))
+    return ratio(
+        mul(absolute(sub(price, reference)), Decimal(10000)), absolute(reference)
+    )
 
 
 def check_collar(ctx: RiskContext, limits: RiskLimits, scope: str) -> RiskDecision:
@@ -331,7 +396,7 @@ def check_collar(ctx: RiskContext, limits: RiskLimits, scope: str) -> RiskDecisi
 
 def _notional(ctx: RiskContext, price: Decimal) -> Decimal:
     multiplier = ctx.instrument.multiplier if ctx.instrument is not None else Decimal(1)
-    return abs(mul(mul(price, ctx.request.quantity), multiplier))
+    return absolute(mul(mul(price, ctx.request.quantity), multiplier))
 
 
 def check_size(ctx: RiskContext, limits: RiskLimits, scope: str) -> RiskDecision:
@@ -385,7 +450,9 @@ def check_position(ctx: RiskContext, limits: RiskLimits, scope: str) -> RiskDeci
         ctx.position,
         mul(Decimal(request.side.sign), add(same_side, request.quantity)),
     )
-    if abs(worst) > limits.max_position and abs(worst) > abs(ctx.position):
+    flips = (worst > 0) != (ctx.position > 0) and worst != 0 and ctx.position != 0
+    grows = absolute(worst) > absolute(ctx.position)
+    if absolute(worst) > limits.max_position and (grows or flips):
         return _reject(
             "max_position",
             f"worst-case position {worst} exceeds {scope} limit {limits.max_position}",
@@ -393,8 +460,18 @@ def check_position(ctx: RiskContext, limits: RiskLimits, scope: str) -> RiskDeci
     return APPROVED
 
 
+def _reduces_position(ctx: RiskContext) -> bool:
+    """Whether this order only shrinks a known position, which must never be blocked."""
+    if ctx.position is None or ctx.position == 0:
+        return False
+    signed = mul(Decimal(ctx.request.side.sign), ctx.request.quantity)
+    resulting = add(ctx.position, signed)
+    same_direction = (resulting >= 0) == (ctx.position > 0)
+    return same_direction and absolute(resulting) < absolute(ctx.position)
+
+
 def check_gross(ctx: RiskContext, limits: RiskLimits, scope: str) -> RiskDecision:
-    if limits.max_gross_notional is None:
+    if limits.max_gross_notional is None or _reduces_position(ctx):
         return APPROVED
     if ctx.gross_notional is None:
         return _reject("max_gross_notional", "gross exposure unknown")
@@ -414,13 +491,24 @@ def check_gross(ctx: RiskContext, limits: RiskLimits, scope: str) -> RiskDecisio
 def check_open_orders(ctx: RiskContext, limits: RiskLimits, scope: str) -> RiskDecision:
     if limits.max_open_orders is None:
         return APPROVED
-    if len(ctx.open_orders) >= limits.max_open_orders:
+    count = sum(1 for order in ctx.open_orders if _in_scope(order.request, scope))
+    if count >= limits.max_open_orders:
         return _reject(
             "max_open_orders",
-            f"{len(ctx.open_orders)} open orders; {scope} limit "
-            f"{limits.max_open_orders}",
+            f"{count} open orders; {scope} limit {limits.max_open_orders}",
         )
     return APPROVED
+
+
+def _in_scope(request: OrderRequest, scope: str) -> bool:
+    kind, _, name = scope.partition(":")
+    if kind == "account":
+        return request.account == name
+    if kind == "strategy":
+        return request.strategy == name
+    if kind == "symbol":
+        return str(request.symbol) == name
+    return True
 
 
 def check_unknown(ctx: RiskContext, config: RiskConfig) -> RiskDecision:
@@ -464,15 +552,19 @@ def check_self_match(ctx: RiskContext, config: RiskConfig) -> RiskDecision:
 
 @dataclass
 class _Throttle:
-    """Sliding one-second window of accepted orders."""
+    """Sliding one-second window of accepted orders, per scope."""
 
-    sent: deque[datetime] = field(default_factory=deque)
+    sent: dict[str, deque[datetime]] = field(default_factory=dict)
 
-    def count(self, now: datetime) -> int:
+    def count(self, scope: str, now: datetime) -> int:
+        window = self.sent.setdefault(scope, deque())
         cutoff = now - timedelta(seconds=1)
-        while self.sent and self.sent[0] <= cutoff:
-            self.sent.popleft()
-        return len(self.sent)
+        while window and window[0] <= cutoff:
+            window.popleft()
+        return len(window)
+
+    def record(self, scope: str, now: datetime) -> None:
+        self.sent.setdefault(scope, deque()).append(now)
 
 
 class RiskEngine:
@@ -488,7 +580,10 @@ class RiskEngine:
         return self._config
 
     def update_config(self, config: RiskConfig) -> None:
-        """Replace limits atomically. The order manager journals the change."""
+        """Replace limits atomically.
+
+        Use :meth:`OrderManager.update_risk_config`, which journals the change.
+        """
         self._config = config
 
     def check(self, ctx: RiskContext, *, is_amend: bool = False) -> RiskDecision:
@@ -514,6 +609,7 @@ class RiskEngine:
             lambda: check_session(ctx, config),
             lambda: check_unknown(ctx, config),
             lambda: check_reference(ctx, config),
+            lambda: check_reduce_only(ctx),
             lambda: check_short_sale(ctx, config),
             lambda: check_self_match(ctx, config),
         ]
@@ -535,7 +631,7 @@ class RiskEngine:
                 if not decision.approved:
                     return decision
             if limits.max_orders_per_second is not None:
-                sent = self._throttle.count(ctx.now)
+                sent = self._throttle.count(scope, ctx.now)
                 if sent >= limits.max_orders_per_second:
                     return _reject(
                         "order_rate",
@@ -572,7 +668,8 @@ class RiskEngine:
         return APPROVED
 
     def _record(self, ctx: RiskContext) -> None:
-        self._throttle.sent.append(ctx.now)
+        for scope, _ in self._config.limits_for(ctx.request):
+            self._throttle.record(scope, ctx.now)
         if self._config.duplicate_window_seconds > 0:
             self._recent.append((ctx.now, self._fingerprint(ctx.request)))
 

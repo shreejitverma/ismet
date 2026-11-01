@@ -9,7 +9,7 @@ edits a price, because a quietly "repaired" price is worse than a visibly bad on
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -17,7 +17,7 @@ from enum import Enum
 
 from ismet.errors import SequenceGap
 from ismet.models import MarketEvent, Quote, Symbol, Trade
-from ismet.models.decimals import mul, ratio, sub
+from ismet.models.decimals import absolute, mul, ratio, sub
 from ismet.models.types import QualityFlag
 from ismet.transport.ws import SequenceObservation, SequenceOutcome, SequenceTracker
 
@@ -50,9 +50,9 @@ class StreamStats:
 class SequenceGuard:
     """Tracks per-symbol sequences. Events with no sequence pass through unchecked.
 
-    Exact duplicates are dropped and counted. A late, out-of-order event is delivered
-    with :attr:`QualityFlag.OUT_OF_ORDER`, because it may be the data a gap reported
-    missing. Events after a gap carry :attr:`QualityFlag.AFTER_GAP`.
+    Duplicates are dropped and counted. A late event that a gap reported missing is
+    delivered with :attr:`QualityFlag.OUT_OF_ORDER`. Events after a gap carry
+    :attr:`QualityFlag.AFTER_GAP`.
     """
 
     def __init__(
@@ -135,6 +135,8 @@ class QualityThresholds:
     max_clock_skew: timedelta = timedelta(seconds=1)
     outlier_bps: Decimal = Decimal(1000)
     divergence_bps: Decimal = Decimal(100)
+    outlier_confirmations: int = 3
+    """Repeats of an outlying price needed before it becomes the new level."""
 
 
 @dataclass
@@ -144,6 +146,7 @@ class QualityMonitor:
     thresholds: QualityThresholds = field(default_factory=QualityThresholds)
     _last_price: dict[Symbol, Decimal] = field(default_factory=dict)
     _last_seen: dict[Symbol, datetime] = field(default_factory=dict)
+    _candidate: dict[Symbol, tuple[Decimal, int]] = field(default_factory=dict)
 
     @staticmethod
     def _price_of(event: MarketEvent) -> Decimal | None:
@@ -159,6 +162,14 @@ class QualityMonitor:
         symbol = event.symbol
         limits = self.thresholds
         self._last_seen[symbol] = event.received_ts
+        if event.latency > limits.max_age:
+            issues.append(
+                QualityIssue(
+                    symbol,
+                    Issue.STALE,
+                    f"event is {event.latency.total_seconds():.1f}s old on arrival",
+                )
+            )
         if event.clock_skew > limits.max_clock_skew:
             issues.append(
                 QualityIssue(
@@ -183,12 +194,32 @@ class QualityMonitor:
                         f"{price} moved {move:.1f} bps from {previous}",
                     )
                 )
+                if not self._confirmed(symbol, price):
+                    return issues  # the good level stands until this is confirmed
+        self._candidate.pop(symbol, None)
         self._last_price[symbol] = price
         return issues
 
-    def stale_symbols(self, now: datetime) -> list[QualityIssue]:
-        """Symbols with no event within ``max_age``."""
-        return [
+    def _confirmed(self, symbol: Symbol, price: Decimal) -> bool:
+        held, count = self._candidate.get(symbol, (price, 0))
+        count = count + 1 if held == price else 1
+        self._candidate[symbol] = (price, count)
+        return count >= self.thresholds.outlier_confirmations
+
+    def stale_symbols(
+        self, now: datetime, *, expected: Iterable[Symbol] = ()
+    ) -> list[QualityIssue]:
+        """Symbols with no event within ``max_age``.
+
+        Pass ``expected`` to also report symbols that have never produced an event,
+        which otherwise stay invisible.
+        """
+        never_seen = [
+            QualityIssue(symbol, Issue.STALE, "no event received")
+            for symbol in expected
+            if symbol not in self._last_seen
+        ]
+        return never_seen + [
             QualityIssue(
                 symbol,
                 Issue.STALE,
@@ -204,6 +235,8 @@ class QualityMonitor:
         self, symbol: Symbol, price_a: Decimal, price_b: Decimal
     ) -> QualityIssue | None:
         """Flag two sources disagreeing on a price by more than ``divergence_bps``."""
+        if price_a == price_b:
+            return None
         if price_b == 0:
             return QualityIssue(symbol, Issue.SOURCE_DIVERGENCE, "second price is zero")
         gap = _bps_between(price_a, price_b)
@@ -217,7 +250,9 @@ class QualityMonitor:
 
 
 def _bps_between(price: Decimal, reference: Decimal) -> Decimal:
-    return ratio(mul(abs(sub(price, reference)), Decimal(10000)), abs(reference))
+    return ratio(
+        mul(absolute(sub(price, reference)), Decimal(10000)), absolute(reference)
+    )
 
 
 __all__ = [

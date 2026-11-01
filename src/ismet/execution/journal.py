@@ -3,8 +3,10 @@
 Before an order is sent, its intent is on disk. After a crash, the journal says
 what was attempted, and for each order whether a send could have started. It is
 also the audit trail: every record carries the SHA-256 of its content and of the
-previous record, so editing, removing, or reordering history breaks the chain and
-:meth:`Journal.verify` reports where.
+previous record, so editing, removing from the middle, or reordering history breaks
+the chain and :meth:`Journal.verify` reports where. Removing the newest records leaves
+a shorter chain that is still valid, so detecting that requires a head hash saved
+elsewhere: see ``expected_head_hash`` on :meth:`OrderManager.start`.
 
 :class:`SqliteJournal` commits with ``synchronous=FULL`` and ``fullfsync``, so a
 record has reached stable storage when ``append`` returns, as far as the drive honours
@@ -113,6 +115,13 @@ class Journal(Protocol):
     def head_hash(self) -> str: ...
 
     def close(self) -> None: ...
+
+
+def chain_contains(journal: Journal, record_hash: str) -> bool:
+    """Whether a previously saved head hash is still part of the journal's chain."""
+    if record_hash == GENESIS_HASH:
+        return True
+    return any(record.hash == record_hash for record in journal.records())
 
 
 def _verify_chain(records: Iterator[JournalRecord]) -> VerifyResult:
@@ -415,5 +424,6 @@ __all__ = [
     "RecordKind",
     "SqliteJournal",
     "VerifyResult",
+    "chain_contains",
     "export_jsonl",
 ]

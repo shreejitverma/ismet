@@ -13,17 +13,21 @@ This is the system of record rather than a columnar analytics engine.
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
 import sqlite3
 from collections.abc import Awaitable, Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from ismet.calendars import TradingCalendar
-from ismet.errors import IsmetError, ValidationError
+from ismet.errors import CalendarOutOfRange, IsmetError, ValidationError
 from ismet.export import BarSeries
 from ismet.models import Bar, Interval, Symbol
 from ismet.transport.clock import SYSTEM_CLOCK, Clock
+
+logger = logging.getLogger("ismet.store")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS bars (
@@ -50,8 +54,16 @@ CREATE TABLE IF NOT EXISTS backfill_progress (
 
 def _content_digest(bar: Bar) -> str:
     # received_ts and source describe the delivery, not the data.
-    payload = bar.model_dump_json(exclude={"received_ts", "source"})
+    fields = bar.model_dump(mode="json", exclude={"received_ts", "source"})
+    fields["quality"] = sorted(fields["quality"])  # a set's order varies by process
+    payload = json.dumps(fields, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _utc_text(moment: datetime, name: str) -> str:
+    if moment.tzinfo is None:
+        raise ValidationError(f"{name} must be timezone-aware")
+    return moment.astimezone(timezone.utc).isoformat()
 
 
 @dataclass(frozen=True)
@@ -83,7 +95,7 @@ class BarStore:
 
     def write(self, bars: Iterable[Bar]) -> WriteResult:
         """Store bars. Idempotent: rewriting identical data adds nothing."""
-        known_at = self._clock.now().astimezone(timezone.utc).isoformat()
+        now = self._clock.now().astimezone(timezone.utc)
         inserted = unchanged = revised = 0
         with self._conn:
             for bar in bars:
@@ -94,7 +106,8 @@ class BarStore:
                     bar.exchange_ts.isoformat(),
                 )
                 latest = self._conn.execute(
-                    "SELECT digest FROM bars WHERE venue=? AND ticker=? AND interval=? "
+                    "SELECT digest, known_at FROM bars WHERE venue=? AND ticker=? "
+                    "AND interval=? "
                     "AND bar_ts=? ORDER BY known_at DESC LIMIT 1",
                     key,
                 ).fetchone()
@@ -106,9 +119,14 @@ class BarStore:
                     inserted += 1
                 else:
                     revised += 1
+                # Each version of a bar needs its own, strictly later, knowledge time.
+                known_at = now
+                if latest is not None:
+                    prior = datetime.fromisoformat(latest[1])
+                    known_at = max(now, prior + timedelta(microseconds=1))
                 self._conn.execute(
                     "INSERT INTO bars VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (*key, known_at, digest, bar.model_dump_json()),
+                    (*key, known_at.isoformat(), digest, bar.model_dump_json()),
                 )
         return WriteResult(inserted, unchanged, revised)
 
@@ -122,9 +140,9 @@ class BarStore:
         as_of: datetime | None = None,
     ) -> BarSeries:
         """Bars with ``start <= time < end``, as they were known at ``as_of``."""
-        if start.tzinfo is None or end.tzinfo is None:
-            raise ValidationError("start and end must be timezone-aware")
-        cutoff = (as_of or self._clock.now()).astimezone(timezone.utc).isoformat()
+        begin = _utc_text(start, "start")
+        finish = _utc_text(end, "end")
+        cutoff = _utc_text(as_of or self._clock.now(), "as_of")
         rows = self._conn.execute(
             "SELECT payload FROM bars AS b WHERE venue=? AND ticker=? AND interval=? "
             "AND bar_ts>=? AND bar_ts<? AND known_at=("
@@ -135,8 +153,8 @@ class BarStore:
                 symbol.venue,
                 symbol.ticker,
                 interval.value,
-                start.astimezone(timezone.utc).isoformat(),
-                end.astimezone(timezone.utc).isoformat(),
+                begin,
+                finish,
                 cutoff,
             ),
         ).fetchall()
@@ -151,7 +169,7 @@ class BarStore:
                 symbol.venue,
                 symbol.ticker,
                 interval.value,
-                bar_ts.astimezone(timezone.utc).isoformat(),
+                _utc_text(bar_ts, "bar_ts"),
             ),
         ).fetchone()
         return int(row[0])
@@ -167,7 +185,9 @@ class BarStore:
     ) -> str:
         """A digest of a dataset as of a time, for a research manifest."""
         digest = hashlib.sha256()
-        for bar in self.read(symbol, interval, start, end, as_of=as_of):
+        bars = self.read(symbol, interval, start, end, as_of=as_of)
+        digest.update(f"{len(bars)} bars\n".encode("ascii"))
+        for bar in bars:
             digest.update(_content_digest(bar).encode("ascii"))
         return digest.hexdigest()
 
@@ -175,10 +195,15 @@ class BarStore:
         self, symbol: Symbol, calendar: TradingCalendar, start: date, end: date
     ) -> list[date]:
         """Trading dates with no daily bar stored, per the venue's calendar."""
+        # A venue's trading date can differ from the UTC date, so read a day wider.
         begin = datetime.combine(start, datetime.min.time(), tzinfo=timezone.utc)
         finish = datetime.combine(end, datetime.min.time(), tzinfo=timezone.utc)
-        bars = self.read(symbol, Interval.D1, begin, finish + timedelta(days=2))
-        present = {bar.session_date or bar.exchange_ts.date() for bar in bars}
+        bars = self.read(
+            symbol, Interval.D1, begin - timedelta(days=1), finish + timedelta(days=2)
+        )
+        present = {
+            bar.session_date or calendar.local_date(bar.exchange_ts) for bar in bars
+        }
         return [
             session.date
             for session in calendar.sessions(start, end)
@@ -230,22 +255,50 @@ FetchBars = Callable[[Symbol, Interval, datetime, datetime], Awaitable[list[Bar]
 
 @dataclass
 class BackfillReport:
-    """Hard accounting for a backfill. It is complete only if no window failed."""
+    """Hard accounting for a backfill.
+
+    Complete only if every window was fetched and none came back empty without proof
+    that empty was right. A vendor outage can look exactly like an empty window, so
+    such a window stays open and is fetched again next time.
+    """
 
     windows_total: int = 0
     windows_skipped: int = 0
     windows_fetched: int = 0
-    windows_empty: int = 0
+    windows_empty_unproven: int = 0
     windows_failed: int = 0
     bars_fetched: int = 0
     bars_inserted: int = 0
     bars_unchanged: int = 0
     bars_revised: int = 0
+    failures: list[tuple[datetime, str]] = field(default_factory=list)
 
     @property
     def complete(self) -> bool:
-        accounted = self.windows_skipped + self.windows_fetched + self.windows_failed
-        return self.windows_failed == 0 and accounted == self.windows_total
+        return (
+            self.windows_failed == 0
+            and self.windows_empty_unproven == 0
+            and self.windows_skipped + self.windows_fetched == self.windows_total
+        )
+
+
+def _check_window(
+    bars: list[Bar],
+    symbol: Symbol,
+    interval: Interval,
+    start: datetime,
+    end: datetime,
+) -> None:
+    for bar in bars:
+        if bar.symbol != symbol or bar.interval is not interval:
+            raise ValidationError(
+                f"fetch for {symbol} {interval.value} returned {bar.symbol} "
+                f"{bar.interval.value}"
+            )
+        if not start <= bar.exchange_ts < end:
+            raise ValidationError(
+                f"bar at {bar.exchange_ts} is outside the window {start} to {end}"
+            )
 
 
 async def backfill(
@@ -257,13 +310,13 @@ async def backfill(
     end: datetime,
     *,
     window: timedelta = timedelta(days=30),
+    calendar: TradingCalendar | None = None,
 ) -> BackfillReport:
     """Fetch ``[start, end)`` in windows into ``store``. Safe to rerun after a failure.
 
-    Finished windows are recorded and skipped next time. A window's failure is
-    counted and the rest continue, so one bad window costs one retry. A finished
-    window that returned no bars is counted separately, because "empty" and "fine" are
-    different answers. Check :attr:`BackfillReport.complete`.
+    Finished windows are recorded and skipped next time. A window's failure is logged
+    and counted, and the rest continue. An empty window counts as finished only if
+    ``calendar`` shows no session in it. Check :attr:`BackfillReport.complete`.
     """
     if window <= timedelta(0):
         raise ValidationError("window must be positive")
@@ -275,21 +328,53 @@ async def backfill(
         if store.window_done(symbol, interval, cursor, upper):
             report.windows_skipped += 1
         else:
-            try:
-                bars = await fetch(symbol, interval, cursor, upper)
-            except IsmetError:
-                report.windows_failed += 1
-            else:
-                result = store.write(bars)
-                store.mark_window_done(symbol, interval, cursor, upper, len(bars))
-                report.windows_fetched += 1
-                report.windows_empty += 0 if bars else 1
-                report.bars_fetched += len(bars)
-                report.bars_inserted += result.inserted
-                report.bars_unchanged += result.unchanged
-                report.bars_revised += result.revised
+            await _backfill_window(
+                fetch, store, symbol, interval, cursor, upper, calendar, report
+            )
         cursor = upper
     return report
+
+
+async def _backfill_window(
+    fetch: FetchBars,
+    store: BarStore,
+    symbol: Symbol,
+    interval: Interval,
+    start: datetime,
+    end: datetime,
+    calendar: TradingCalendar | None,
+    report: BackfillReport,
+) -> None:
+    try:
+        bars = await fetch(symbol, interval, start, end)
+        _check_window(bars, symbol, interval, start, end)
+        result = store.write(bars)
+    except (IsmetError, sqlite3.Error) as exc:
+        logger.warning("backfill window %s failed: %s", start, exc)
+        report.windows_failed += 1
+        report.failures.append((start, repr(exc)))
+        return
+    report.bars_fetched += len(bars)
+    report.bars_inserted += result.inserted
+    report.bars_unchanged += result.unchanged
+    report.bars_revised += result.revised
+    if not bars and not _proven_empty(calendar, start, end):
+        report.windows_empty_unproven += 1
+        return
+    store.mark_window_done(symbol, interval, start, end, len(bars))
+    report.windows_fetched += 1
+
+
+def _proven_empty(
+    calendar: TradingCalendar | None, start: datetime, end: datetime
+) -> bool:
+    if calendar is None:
+        return False
+    last = calendar.local_date(end - timedelta(microseconds=1))
+    try:
+        return not calendar.sessions(calendar.local_date(start), last)
+    except CalendarOutOfRange:
+        return False
 
 
 __all__ = ["BackfillReport", "BarStore", "WriteResult", "backfill"]

@@ -35,7 +35,12 @@ from ismet.errors import (
     NotSupported,
     ValidationError,
 )
-from ismet.execution.journal import RecordKind, SqliteJournal, export_jsonl
+from ismet.execution.journal import (
+    RecordKind,
+    SqliteJournal,
+    chain_contains,
+    export_jsonl,
+)
 from ismet.execution.manager import events_of
 from ismet.execution.state import replay
 from ismet.providers import ProviderRegistry
@@ -142,6 +147,10 @@ def _build_parser() -> _Parser:
         action.add_argument("path", help="journal file")
         if name == "export":
             action.add_argument("--out", required=True, help="output file")
+        if name == "verify":
+            action.add_argument(
+                "--expect-head", help="a saved head hash, to detect truncation"
+            )
         if name == "orders":
             action.add_argument("--all", action="store_true", help="include closed")
 
@@ -154,6 +163,12 @@ def _build_parser() -> _Parser:
     ):
         action = kill_commands.add_parser(name, help=summary, description=summary)
         action.add_argument("--journal", required=True, help="journal file")
+        if name == "engage":
+            action.add_argument(
+                "--create",
+                action="store_true",
+                help="create the journal if absent; otherwise a mistyped path errors",
+            )
         if name != "status":
             action.add_argument("--reason", required=True, help="recorded in the audit")
             action.add_argument("--operator", required=True, help="who is doing this")
@@ -212,10 +227,15 @@ async def _with_client(call: Callable[[IsmetClient], Awaitable[int]]) -> int:
         return await call(client)
 
 
+def _normalize_iso(text: str) -> str:
+    """Python 3.10's ``fromisoformat`` does not accept a trailing ``Z``."""
+    return f"{text[:-1]}+00:00" if text.endswith(("Z", "z")) else text
+
+
 def _parse_time(text: str | None, default: datetime) -> datetime:
     if text is None:
         return default
-    value = datetime.fromisoformat(text)
+    value = datetime.fromisoformat(_normalize_iso(text))
     return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
 
@@ -426,6 +446,16 @@ def _journal(args: argparse.Namespace) -> int:
     try:
         if args.action == "verify":
             result = journal.verify()
+            if args.expect_head and not chain_contains(journal, args.expect_head):
+                _print(
+                    {
+                        "ok": False,
+                        "records": result.records,
+                        "head_hash": result.head_hash,
+                        "detail": "expected head not found: truncated or replaced",
+                    }
+                )
+                return EXIT_FAILED
             _print(
                 {
                     "ok": result.ok,
@@ -473,14 +503,16 @@ def _journal(args: argparse.Namespace) -> int:
 def _kill(args: argparse.Namespace) -> int:
     if args.action is None:
         raise _UsageError("kill needs an action", "ismet kill --help")
-    if args.action == "status":
-        journal = _existing_journal(args.journal)
-    else:
-        journal = SqliteJournal(args.journal)
+    creating = args.action == "engage" and args.create
+    # A mistyped path must not look like a successful halt while trading continues.
+    journal = (
+        SqliteJournal(args.journal) if creating else _existing_journal(args.journal)
+    )
     try:
         state = journal.kill_state()
         if args.action == "engage":
-            if state.engaged:
+            wants_cancel = not args.keep_orders
+            if state.engaged and (state.cancel_open or not wants_cancel):
                 _print({"kill": "already engaged (no-op)", "reason": state.reason})
                 return EXIT_OK
             journal.append(
@@ -489,7 +521,7 @@ def _kill(args: argparse.Namespace) -> int:
                     {
                         "reason": args.reason,
                         "operator": args.operator,
-                        "cancel_open": not args.keep_orders,
+                        "cancel_open": wants_cancel,
                     }
                 ),
             )

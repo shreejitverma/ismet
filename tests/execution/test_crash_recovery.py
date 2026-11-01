@@ -65,6 +65,7 @@ def build(
         unknown_grace=0.0,
         reconcile_interval=3600.0,
         kill_poll_interval=0.01,
+        stream_settle=None,
         **kw,  # type: ignore[arg-type]
     )
     return manager, journal

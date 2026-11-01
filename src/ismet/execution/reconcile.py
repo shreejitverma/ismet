@@ -23,6 +23,7 @@ CRITICAL_BREAKS = frozenset(
         BreakKind.ORPHAN_ORDER,
         BreakKind.ORPHAN_FILL,
         BreakKind.FILL_MISMATCH,
+        BreakKind.MISSING_AT_VENUE,
         BreakKind.POSITION_MISMATCH,
     }
 )
@@ -46,7 +47,9 @@ class ReconReport:
 
     ``resolved`` lists client order ids whose state changed to match the venue.
     ``complete`` is false if any query failed, so a clean ``breaks`` list is not
-    proof of agreement unless ``complete`` is true.
+    proof of agreement unless ``complete`` is true. ``positions_verified`` is false
+    when positions could not be compared, for example on a venue with no account API,
+    which leaves a real class of error undetectable by this pass.
     """
 
     at: datetime
@@ -54,6 +57,7 @@ class ReconReport:
     resolved: list[str] = field(default_factory=list)
     breaks: list[ReconBreak] = field(default_factory=list)
     complete: bool = True
+    positions_verified: bool = True
 
     @property
     def clean(self) -> bool:

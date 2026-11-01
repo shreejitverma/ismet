@@ -25,7 +25,13 @@ SYM = Symbol(venue="XSIM", ticker="ACME")
 _n = {"i": 0}
 
 
-def fill(side: OrderSide, quantity: str, price: str, fee: str | None = None) -> Fill:
+def fill(
+    side: OrderSide,
+    quantity: str,
+    price: str,
+    fee: str | None = None,
+    fee_currency: str = "USD",
+) -> Fill:
     _n["i"] += 1
     return Fill(
         fill_id=f"F{_n['i']:06d}",
@@ -36,6 +42,7 @@ def fill(side: OrderSide, quantity: str, price: str, fee: str | None = None) -> 
         quantity=quantity,
         ts=TS + timedelta(seconds=_n["i"]),
         fee=fee,
+        fee_currency=None if fee is None else fee_currency,
     )
 
 
@@ -90,7 +97,7 @@ def test_multiplier_scales_money_and_fees_are_tracked_separately() -> None:
         multiplier=D(100),
     )
     assert ledger.realized_pnl == D(200)
-    assert ledger.fees == D("3.00")
+    assert ledger.fees == {"USD": D("3.00")}
 
 
 def test_negative_prices_book_correctly() -> None:

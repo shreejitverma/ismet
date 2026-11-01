@@ -19,8 +19,8 @@ from decimal import Decimal
 
 from ismet.errors import SequenceGap
 from ismet.models import Level, OrderBook, Symbol
+from ismet.models.decimals import neg
 from ismet.models.orders import OrderSide
-from ismet.models.types import QualityFlag
 
 
 @dataclass(frozen=True)
@@ -28,8 +28,9 @@ class BookDelta:
     """Set a price level to an absolute size. A size of zero removes the level.
 
     ``first_sequence`` to ``sequence`` is the range this delta covers, for venues
-    that batch updates (such as Binance's ``U`` and ``u``). Single-update feeds use
-    the default, where the range is one number.
+    that batch updates (such as Binance's ``U`` and ``u``). Every level of one venue
+    update carries the same range. Single-update feeds use the default, where the
+    range is one number.
     """
 
     side: OrderSide
@@ -50,7 +51,7 @@ class _Side:
         self._keys: list[Decimal] = []
 
     def _key(self, price: Decimal) -> Decimal:
-        return -price if self._descending else price
+        return neg(price) if self._descending else price
 
     def set(self, price: Decimal, size: Decimal) -> None:
         key = self._key(price)
@@ -90,6 +91,8 @@ class BookBuilder:
         self.gaps = 0
         self.stale_deltas = 0
         self.overflowed = False
+        self.stale_snapshots = 0
+        self._batch: tuple[int, int] | None = None
 
     @property
     def is_synced(self) -> bool:
@@ -105,8 +108,15 @@ class BookBuilder:
         sequence: int,
         bids: Iterable[tuple[Decimal, Decimal]],
         asks: Iterable[tuple[Decimal, Decimal]],
-    ) -> None:
-        """Replace the book, then apply any buffered deltas newer than ``sequence``."""
+    ) -> bool:
+        """Replace the book, then apply any buffered deltas newer than ``sequence``.
+
+        A snapshot older than a book in sync is ignored and counted, because applying
+        it would roll the book back. Returns whether it was applied.
+        """
+        if self._synced and self._last is not None and sequence < self._last:
+            self.stale_snapshots += 1
+            return False
         self._bids.clear()
         self._asks.clear()
         for price, size in bids:
@@ -121,6 +131,7 @@ class BookBuilder:
         for delta in buffered:
             if delta.sequence > sequence:
                 self.apply_delta(delta)
+        return True
 
     def apply_delta(self, delta: BookDelta) -> bool:
         """Apply one delta. Returns false if it was buffered or ignored as old.
@@ -132,7 +143,9 @@ class BookBuilder:
             self._buffer_delta(delta)
             return False
         assert self._last is not None
-        if delta.sequence <= self._last:
+        batch = (delta.start, delta.sequence)
+        same_batch = delta.first_sequence is not None and batch == self._batch
+        if delta.sequence <= self._last and not same_batch:
             self.stale_deltas += 1
             return False
         if delta.start > self._last + 1:
@@ -143,6 +156,7 @@ class BookBuilder:
         side = self._bids if delta.side is OrderSide.BUY else self._asks
         side.set(delta.price, delta.size)
         self._last = delta.sequence
+        self._batch = batch
         return True
 
     def _buffer_delta(self, delta: BookDelta) -> None:
@@ -163,7 +177,6 @@ class BookBuilder:
             expected = 0 if self._last is None else self._last + 1
             newest = self._buffer[-1].sequence if self._buffer else expected
             raise SequenceGap(self.symbol, expected, newest)
-        quality = frozenset({QualityFlag.AFTER_GAP}) if self.gaps else frozenset()
         return OrderBook(
             symbol=self.symbol,
             exchange_ts=exchange_ts,
@@ -171,7 +184,6 @@ class BookBuilder:
             sequence=self._last,
             bids=self._bids.top(depth),
             asks=self._asks.top(depth),
-            quality=quality,
         )
 
     def depth_counts(self) -> tuple[int, int]:

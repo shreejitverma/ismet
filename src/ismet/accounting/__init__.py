@@ -16,8 +16,9 @@ from decimal import Decimal
 from enum import Enum
 
 from ismet.errors import ValidationError
-from ismet.models.decimals import add, mul, ratio, sub
+from ismet.models.decimals import absolute, add, mul, ratio, sub
 from ismet.models.orders import Fill, OrderSide
+from ismet.models.symbol import Symbol
 
 _ZERO = Decimal(0)
 
@@ -55,14 +56,19 @@ class RealizedTrade:
 class PositionLedger:
     """The books for one instrument. Apply fills in execution order.
 
-    ``multiplier`` converts price points to money, for options and futures.
+    ``multiplier`` converts price points to money, for options and futures. ``fees``
+    are kept per currency, because a fee in BNB and a fee in USDT cannot be added.
+    ``fills_with_unknown_fee`` counts fills that reported no fee, which is not the same
+    as a zero fee.
     """
 
     method: LotMethod = LotMethod.FIFO
     multiplier: Decimal = Decimal(1)
     lots: list[Lot] = field(default_factory=list)
     realized_trades: list[RealizedTrade] = field(default_factory=list)
-    fees: Decimal = _ZERO
+    fees: dict[str, Decimal] = field(default_factory=dict)
+    fills_with_unknown_fee: int = 0
+    symbol: Symbol | None = None
     _seen: set[str] = field(default_factory=set)
 
     @property
@@ -106,9 +112,21 @@ class PositionLedger:
         """
         if fill.fill_id in self._seen:
             return []
+        if self.symbol is None:
+            self.symbol = fill.symbol
+        elif fill.symbol != self.symbol:
+            raise ValidationError(
+                f"ledger for {self.symbol} was given a fill in {fill.symbol}"
+            )
+        if fill.fee is not None and fill.fee != 0 and fill.fee_currency is None:
+            raise ValidationError(f"fill {fill.fill_id} has a fee with no currency")
         self._seen.add(fill.fill_id)
-        if fill.fee is not None:
-            self.fees = add(self.fees, fill.fee)
+        if fill.fee is None:
+            self.fills_with_unknown_fee += 1
+        elif fill.fee_currency is not None:
+            self.fees[fill.fee_currency] = add(
+                self.fees.get(fill.fee_currency, _ZERO), fill.fee
+            )
         signed = mul(Decimal(fill.side.sign), fill.quantity)
         closing: list[RealizedTrade] = []
         remaining = signed
@@ -117,7 +135,7 @@ class PositionLedger:
         while remaining != 0 and self.lots and self._opposes(remaining):
             index = -1 if self.method is LotMethod.LIFO else 0
             lot = self.lots[index]
-            matched = min(abs(remaining), abs(lot.quantity))
+            matched = min(absolute(remaining), absolute(lot.quantity))
             sign = 1 if lot.quantity > 0 else -1
             pnl = mul(
                 mul(mul(Decimal(sign), matched), sub(fill.price, lot.price)),
@@ -128,7 +146,7 @@ class PositionLedger:
                     matched, lot.price, fill.price, pnl, lot.opened_by, fill.fill_id
                 )
             )
-            left = sub(abs(lot.quantity), matched)
+            left = sub(absolute(lot.quantity), matched)
             if left == 0:
                 self.lots.pop(index)
             else:
@@ -219,7 +237,8 @@ def value_books(
         realized = add(
             realized, convert(ledger.realized_pnl, quote_currency, currency, rates)
         )
-        fees = add(fees, convert(ledger.fees, quote_currency, currency, rates))
+        for fee_currency, amount in ledger.fees.items():
+            fees = add(fees, convert(amount, fee_currency, currency, rates))
         if mark is not None:
             unrealized = add(
                 unrealized,
@@ -236,7 +255,7 @@ def slippage_bps(side: OrderSide, arrival: Decimal, average: Decimal) -> Decimal
     if arrival == 0:
         raise ValidationError("arrival price is zero; slippage in bps is undefined")
     cost = mul(Decimal(side.sign), sub(average, arrival))
-    return ratio(mul(cost, Decimal(10000)), abs(arrival))
+    return ratio(mul(cost, Decimal(10000)), absolute(arrival))
 
 
 __all__ = [

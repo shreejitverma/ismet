@@ -102,6 +102,7 @@ def make_manager(venue: SimVenue, journal: Journal, clock: ManualClock) -> Facto
             "unknown_grace": 0.0,
             "reconcile_interval": 3600.0,
             "kill_poll_interval": 0.01,
+            "stream_settle": None,
         }
         risk = kw.pop("risk", None) or RiskEngine(permissive_config())
         options.update(kw)

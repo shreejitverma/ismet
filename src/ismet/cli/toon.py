@@ -13,8 +13,8 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any
 
-_SAFE = re.compile(r"^[^\s,:\"\\\[\]{}#-][^,:\"\\\[\]{}\n\r\t]*(?<!\s)$")
-_NUMBER_LIKE = re.compile(r"^-?\d+(\.\d+)?([eE][+-]?\d+)?$")
+_SAFE = re.compile(r"[^\s,:\"\\\[\]{}#-][^,:\"\\\[\]{}\n\r\t]*(?<!\s)")
+_NUMBER_LIKE = re.compile(r"-?\d+(\.\d+)?([eE][+-]?\d+)?")
 _RESERVED = {"true", "false", "null"}
 
 
@@ -33,7 +33,11 @@ def scalar(value: Any) -> str:
     if isinstance(value, datetime | date):
         return f'"{value.isoformat()}"'
     text = str(value)
-    if _SAFE.match(text) and text not in _RESERVED and not _NUMBER_LIKE.match(text):
+    if (
+        _SAFE.fullmatch(text)
+        and text not in _RESERVED
+        and not _NUMBER_LIKE.fullmatch(text)
+    ):
         return text
     escaped = (
         text.replace("\\", "\\\\")

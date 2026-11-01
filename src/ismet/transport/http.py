@@ -12,10 +12,14 @@ Every provider REST call goes through :class:`HttpTransport.request`, which:
 Retries depend on whether a repeat is safe. ``GET``, ``HEAD``, and ``OPTIONS``
 are retried under the policy. Any other method is sent exactly once unless the
 caller passes ``idempotent=True``, which it may do only when the venue contract
-makes a repeat harmless. A failure that may have reached the server (read timeout,
-broken connection, 5xx) on a non-idempotent request raises
-:class:`~ismet.errors.AmbiguousOutcome`; a failure that cannot have reached it
-(connect failure, pool timeout) raises a plain :class:`~ismet.errors.TransportError`.
+makes a repeat harmless.
+
+For any method other than those reads, a failure that may have reached the server
+raises :class:`~ismet.errors.AmbiguousOutcome`, whether or not it was declared
+idempotent: a read timeout, a broken connection, a 5xx, a redirect, or a success
+status with an unreadable body. Only a failure that cannot have reached the server
+(connect failure, pool timeout) raises a plain
+:class:`~ismet.errors.TransportError`.
 
 Response bodies are decoded with ``parse_float=Decimal`` so vendor floats never
 touch a Python ``float``.
@@ -261,10 +265,9 @@ class HttpTransport:
         raises :class:`~ismet.errors.AmbiguousOutcome`.
         """
         await self.open()
-        safe = (
-            method.upper() in IDEMPOTENT_METHODS if idempotent is None else idempotent
-        )
-        policy = (retry_policy or self.retry_policy) if safe else NO_RETRY
+        is_read = method.upper() in IDEMPOTENT_METHODS
+        repeatable = is_read if idempotent is None else idempotent
+        policy = (retry_policy or self.retry_policy) if repeatable else NO_RETRY
         attempt = 0
 
         async def once() -> Response:
@@ -272,12 +275,28 @@ class HttpTransport:
             attempt += 1
             if self.breaker is None:
                 return await self._send(
-                    method, path, params, json_body, headers, rate_key, attempt, safe
+                    method,
+                    path,
+                    params,
+                    json_body,
+                    headers,
+                    rate_key,
+                    attempt,
+                    is_read,
+                    repeatable,
                 )
             self.breaker.check()
             try:
                 return await self._send(
-                    method, path, params, json_body, headers, rate_key, attempt, safe
+                    method,
+                    path,
+                    params,
+                    json_body,
+                    headers,
+                    rate_key,
+                    attempt,
+                    is_read,
+                    repeatable,
                 )
             finally:
                 self.breaker.release_probe()
@@ -293,7 +312,8 @@ class HttpTransport:
         headers: Mapping[str, str] | None,
         rate_key: str | None,
         attempt: int,
-        safe: bool,
+        is_read: bool,
+        repeatable: bool,
     ) -> Response:
         if self.rate_limiter is not None:
             await self.rate_limiter.acquire(rate_key)
@@ -305,17 +325,18 @@ class HttpTransport:
             )
         except httpx.HTTPError as exc:
             latency = self._clock.monotonic() - started
-            err = self._network_error(exc, method, path, safe)
+            err = self._network_error(exc, method, path, is_read, repeatable)
             self._fail(method, path, attempt, latency, err)
             raise err from exc
         latency = self._clock.monotonic() - started
         if not 200 <= raw.status_code < 300:
             mapped = map_response_error(raw.status_code, raw.content, raw.headers)
-            if not safe and raw.status_code >= 500:
+            if not is_read and (raw.status_code >= 500 or raw.status_code < 400):
                 mapped = AmbiguousOutcome(
                     f"{method} {path} returned HTTP {raw.status_code}; the venue "
                     "may have processed it",
                     status=raw.status_code,
+                    retryable=repeatable and raw.status_code >= 500,
                 )
             self._fail(method, path, attempt, latency, mapped, raw.status_code)
             raise mapped
@@ -326,18 +347,19 @@ class HttpTransport:
 
     @staticmethod
     def _network_error(
-        exc: httpx.HTTPError, method: str, path: str, safe: bool
+        exc: httpx.HTTPError, method: str, path: str, is_read: bool, repeatable: bool
     ) -> TransportError:
         kind = (
             "timeout"
             if isinstance(exc, httpx.TimeoutException)
             else "transport failure"
         )
-        if safe or isinstance(exc, _NOT_SENT_ERRORS):
-            return TransportError(f"{kind}: {exc}", retryable=safe)
+        if is_read or isinstance(exc, _NOT_SENT_ERRORS):
+            return TransportError(f"{kind}: {exc}", retryable=repeatable)
         return AmbiguousOutcome(
             f"{method} {path} failed after it may have been sent ({kind}: {exc}); "
-            "query the venue before acting"
+            "query the venue before acting",
+            retryable=repeatable,
         )
 
     def _fail(
@@ -385,7 +407,14 @@ class HttpTransport:
             rate_key=rate_key,
             idempotent=idempotent,
         )
-        return response.json()
+        try:
+            return response.json()
+        except TransportError as exc:
+            # The server accepted the request and its answer cannot be read.
+            raise AmbiguousOutcome(
+                f"POST {path} succeeded with an unreadable response: {exc}",
+                status=response.status,
+            ) from exc
 
 
 __all__ = [

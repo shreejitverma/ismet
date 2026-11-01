@@ -85,7 +85,9 @@ class TradingCapability(Protocol):
 
     - ``place_order`` sends the request at most once and uses
       ``request.client_order_id`` as the venue's client order id. A venue-level
-      refusal raises :class:`~ismet.errors.VenueError`. A failure where the order
+      refusal raises :class:`~ismet.errors.VenueError`, or its subclass
+      :class:`~ismet.errors.DuplicateOrderId` when the venue already holds that client
+      order id. A failure where the order
       may have arrived raises :class:`~ismet.errors.AmbiguousOutcome`. A failure
       that certainly did not deliver raises another
       :class:`~ismet.errors.TransportError`.
@@ -94,7 +96,9 @@ class TradingCapability(Protocol):
     - ``cancel_order`` accepts a client order id whether or not an ack was seen.
     - ``stream_executions`` yields venue events until cancelled, and raises if the
       connection is lost and cannot be restored. Reports may be duplicated or
-      reordered; fills must carry a stable ``fill_id``.
+      reordered; fills must carry a stable ``fill_id``. Subscribe as early as possible;
+      the order manager reconciles again shortly after connecting, to cover the time a
+      subscription takes to go live.
     """
 
     def trading_rules(self) -> TradingRules: ...

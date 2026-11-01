@@ -56,8 +56,15 @@ class Symbol(BaseModel):
 
     @classmethod
     def parse(cls, text: str, *, venue: str | None = None) -> Symbol:
-        """Parse ``"TICKER@MIC"`` or ``"TICKER"`` with an explicit ``venue``."""
-        ticker, sep, parsed_venue = text.partition("@")
+        """Parse ``"TICKER@MIC"`` or ``"TICKER"`` with an explicit ``venue``.
+
+        The venue is what follows the last ``@``, since some vendors' tickers contain
+        one, such as ``@ES@XCME``. With ``venue`` given, a text whose final part is not
+        a four-character code is all ticker.
+        """
+        ticker, sep, parsed_venue = text.rpartition("@")
+        if not sep or (venue is not None and (not ticker or len(parsed_venue) != 4)):
+            ticker, sep, parsed_venue = text, "", ""
         if sep:
             if venue is not None and venue.upper() != parsed_venue.upper():
                 raise ValueError(

@@ -116,10 +116,14 @@ class SequenceObservation:
 class SequenceTracker:
     """Classify a stream of sequence numbers for one feed or symbol.
 
-    A value equal to the last is a duplicate. A value below the last is out of
-    order: it may be a late delivery of something counted as missing, so it is
-    reported separately and never lowers the high-water mark.
+    A value at or below the high-water mark is a duplicate, unless a gap reported it
+    missing: then it is a late, out-of-order delivery of real data. The high-water mark
+    never moves down. Missing ranges are kept in a bounded list, so memory stays bounded
+    however many gaps a feed has; a very late delivery past that bound counts as a
+    duplicate.
     """
+
+    MAX_TRACKED_GAPS = 1024
 
     def __init__(self) -> None:
         self.last: int | None = None
@@ -127,24 +131,45 @@ class SequenceTracker:
         self.missing = 0
         self.duplicates = 0
         self.out_of_order = 0
+        self._missing: list[tuple[int, int]] = []
+        self._first: int | None = None
+
+    def _take_missing(self, sequence: int) -> bool:
+        for index, (low, high) in enumerate(self._missing):
+            if low <= sequence <= high:
+                pieces = []
+                if low < sequence:
+                    pieces.append((low, sequence - 1))
+                if sequence < high:
+                    pieces.append((sequence + 1, high))
+                self._missing[index : index + 1] = pieces
+                return True
+        return False
 
     def classify(self, sequence: int) -> SequenceObservation:
         """Record ``sequence`` and return how it relates to the prior ones."""
         last = self.last
         if last is None:
             self.last = sequence
+            self._first = sequence
             return SequenceObservation(SequenceOutcome.FIRST, sequence, None)
         expected = last + 1
         if sequence == expected:
             self.last = sequence
             return SequenceObservation(SequenceOutcome.IN_ORDER, sequence, expected)
-        if sequence == last:
+        if sequence <= last:
+            # Below the first number seen is data from before this stream's start.
+            before_start = self._first is not None and sequence < self._first
+            if before_start or self._take_missing(sequence):
+                self.out_of_order += 1
+                return SequenceObservation(
+                    SequenceOutcome.OUT_OF_ORDER, sequence, expected
+                )
             self.duplicates += 1
             return SequenceObservation(SequenceOutcome.DUPLICATE, sequence, expected)
-        if sequence < last:
-            self.out_of_order += 1
-            return SequenceObservation(SequenceOutcome.OUT_OF_ORDER, sequence, expected)
         missing = sequence - expected
+        self._missing.append((expected, sequence - 1))
+        del self._missing[: -self.MAX_TRACKED_GAPS]
         self.last = sequence
         self.gaps += 1
         self.missing += missing
@@ -157,6 +182,7 @@ class SequenceTracker:
     def reset(self) -> None:
         """Forget the position, for a venue that restarts sequences on reconnect."""
         self.last = None
+        self._missing.clear()
 
 
 class WebSocketTransport:

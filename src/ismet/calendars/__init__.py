@@ -16,6 +16,7 @@ sessions are venue-specific and are not modelled yet.
 
 from __future__ import annotations
 
+import copy
 import json
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
@@ -138,17 +139,14 @@ class TradingCalendar:
         extra: frozenset[date] | None = None,
         special: dict[date, _Hours] | None = None,
     ) -> TradingCalendar:
-        return TradingCalendar(
-            self.venue,
-            self.tz.key,
-            self.first_date,
-            self.last_date,
-            self._eras,
-            self._closed if closed is None else closed,
-            self._extra if extra is None else extra,
-            self._special if special is None else special,
-            source=self.source,
-        )
+        edited = copy.copy(self)
+        if closed is not None:
+            edited._closed = closed
+        if extra is not None:
+            edited._extra = extra
+        if special is not None:
+            edited._special = special
+        return edited
 
     def with_closure(self, day: date) -> TradingCalendar:
         """A copy with ``day`` closed, for an announced unscheduled closure."""
@@ -171,6 +169,14 @@ class TradingCalendar:
         self._check_range(day)
         if not open_time < close_time:
             raise ValidationError("open must be before close")
+        if (break_start is None) != (break_end is None):
+            raise ValidationError("a break needs both a start and an end")
+        if (
+            break_start is not None
+            and break_end is not None
+            and not (open_time < break_start < break_end < close_time)
+        ):
+            raise ValidationError("a break must fall within the session, in order")
         hours = _Hours(open_time, close_time, break_start, break_end)
         extra = self._extra | {day} if day.weekday() >= 5 else self._extra
         return self._replace(
@@ -290,20 +296,21 @@ class TradingCalendar:
 
     # Instants
 
-    def _local_date(self, instant: datetime) -> date:
-        return instant.astimezone(self.tz).date()
+    def local_date(self, instant: datetime) -> date:
+        """The date at the venue at ``instant``."""
+        return _aware(instant).astimezone(self.tz).date()
 
     def session_of(self, instant: datetime) -> Session | None:
         """The session containing ``instant``, including its break, or ``None``."""
         utc = _aware(instant)
-        session = self.session(self._local_date(utc))
+        session = self.session(self.local_date(utc))
         if session is not None and session.open <= utc < session.close:
             return session
         return None
 
     def phase_at(self, instant: datetime) -> MarketPhase:
         utc = _aware(instant)
-        session = self.session(self._local_date(utc))
+        session = self.session(self.local_date(utc))
         return MarketPhase.CLOSED if session is None else session.phase_at(utc)
 
     def is_open(self, instant: datetime) -> bool:
@@ -316,7 +323,7 @@ class TradingCalendar:
         A return from an intraday break counts as an open.
         """
         utc = _aware(instant)
-        day = self._local_date(utc)
+        day = self.local_date(utc)
         while True:
             session = self.session(day)
             if session is not None:
@@ -332,7 +339,7 @@ class TradingCalendar:
         The start of an intraday break counts as a close.
         """
         utc = _aware(instant)
-        day = self._local_date(utc)
+        day = self.local_date(utc)
         while True:
             session = self.session(day)
             if session is not None:
@@ -360,8 +367,8 @@ class AlwaysOpenCalendar(TradingCalendar):
             source=source,
         )
 
-    def _is_session_unchecked(self, day: date) -> bool:  # noqa: ARG002
-        return True
+    def _is_session_unchecked(self, day: date) -> bool:
+        return day not in self._closed
 
 
 def calendar_from_dict(

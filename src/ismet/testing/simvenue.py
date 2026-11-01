@@ -20,7 +20,12 @@ from decimal import Decimal
 from enum import Enum
 from typing import ClassVar
 
-from ismet.errors import AmbiguousOutcome, TransportError, VenueError
+from ismet.errors import (
+    AmbiguousOutcome,
+    DuplicateOrderId,
+    TransportError,
+    VenueError,
+)
 from ismet.models import (
     AssetClass,
     DataSource,
@@ -439,7 +444,7 @@ class SimVenue(Provider):
         if fault is Fault.REJECT:
             raise VenueError("simulated: insufficient funds", code="INSUFFICIENT_FUNDS")
         if cid in self._orders:
-            raise VenueError(
+            raise DuplicateOrderId(
                 "duplicate client order id", code="DUPLICATE_CLIENT_ORDER_ID"
             )
         if request.post_only and self._would_cross(request):
@@ -589,9 +594,15 @@ class SimVenue(Provider):
             if f.ts >= since and (symbol is None or f.symbol == symbol)
         ]
 
-    async def stream_executions(self) -> AsyncIterator[OrderEvent]:
+    def stream_executions(self) -> AsyncIterator[OrderEvent]:
+        """Subscribe now, so nothing published after this call is missed."""
         queue: asyncio.Queue[OrderEvent | Exception] = asyncio.Queue()
         self._subscribers.append(queue)
+        return self._drain_subscription(queue)
+
+    async def _drain_subscription(
+        self, queue: asyncio.Queue[OrderEvent | Exception]
+    ) -> AsyncIterator[OrderEvent]:
         try:
             while True:
                 item = await queue.get()

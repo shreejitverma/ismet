@@ -126,15 +126,14 @@ async def test_backfill_accounts_for_every_window_and_resumes(store: BarStore) -
         if start == DAY + timedelta(days=1) and fail_once["armed"]:
             fail_once["armed"] = False
             raise TransportError("flaky")
-        if start == DAY + timedelta(days=2):
-            return []
         return [bar(start)]
 
     args = (fetch, store, SYM, Interval.D1, DAY, DAY + timedelta(days=3))
     first = await backfill(*args, window=timedelta(days=1))
     assert first.windows_total == 3 and first.windows_failed == 1
-    assert first.windows_empty == 1 and first.bars_inserted == 1
-    assert not first.complete
+    assert first.bars_inserted == 2 and not first.complete
+    assert first.failures[0][0] == DAY + timedelta(days=1)
+    assert "flaky" in first.failures[0][1]
     calls.clear()
     second = await backfill(*args, window=timedelta(days=1))
     assert second.complete
@@ -142,6 +141,122 @@ async def test_backfill_accounts_for_every_window_and_resumes(store: BarStore) -
     assert calls == [DAY + timedelta(days=1)]
     with pytest.raises(ValidationError):
         await backfill(*args, window=timedelta(0))
+
+
+async def test_backfill_never_treats_an_empty_answer_as_final_without_proof(
+    store: BarStore,
+) -> None:
+    answers: list[list[Bar]] = [[], [bar()]]
+
+    async def fetch(symbol, interval, start, end):  # type: ignore[no-untyped-def]
+        return answers.pop(0)
+
+    span_args = (fetch, store, SYM, Interval.D1, DAY, DAY + timedelta(days=1))
+    outage = await backfill(*span_args, window=timedelta(days=1))
+    assert outage.windows_empty_unproven == 1 and not outage.complete
+    recovered = await backfill(*span_args, window=timedelta(days=1))
+    assert recovered.complete and recovered.bars_inserted == 1
+
+
+async def test_backfill_accepts_an_empty_window_the_calendar_says_has_no_session(
+    store: BarStore,
+) -> None:
+    async def fetch(symbol, interval, start, end):  # type: ignore[no-untyped-def]
+        return []
+
+    saturday = datetime(2026, 3, 7, 12, tzinfo=UTC)  # Saturday in New York too
+    report = await backfill(
+        fetch,
+        store,
+        SYM,
+        Interval.D1,
+        saturday,
+        saturday + timedelta(days=1),
+        window=timedelta(days=1),
+        calendar=get_calendar("XNYS"),
+    )
+    assert report.complete and report.windows_fetched == 1
+
+
+@pytest.mark.parametrize(
+    "wrong",
+    [
+        {"symbol": Symbol(venue="XNYS", ticker="OTHER")},
+        {"interval": Interval.H1},
+        {
+            "exchange_ts": DAY + timedelta(days=9),
+            "received_ts": DAY + timedelta(days=9),
+        },
+    ],
+)
+async def test_backfill_rejects_data_that_is_not_what_was_asked_for(
+    store: BarStore, wrong: dict[str, object]
+) -> None:
+    async def fetch(symbol, interval, start, end):  # type: ignore[no-untyped-def]
+        return [bar(**wrong)]
+
+    report = await backfill(
+        fetch,
+        store,
+        SYM,
+        Interval.D1,
+        DAY,
+        DAY + timedelta(days=1),
+        window=timedelta(days=1),
+    )
+    assert report.windows_failed == 1 and not report.complete
+    assert store.read(SYM, Interval.D1, *span()) == []
+
+
+def test_same_clock_tick_and_same_batch_restatements_are_stored_in_order(
+    store: BarStore,
+) -> None:
+    result = store.write([bar(close="10.10"), bar(close="10.20")])
+    assert (result.inserted, result.revised) == (1, 1)
+    store.write([bar(close="10.30")])
+    assert store.revisions(SYM, Interval.D1, DAY) == 3
+    assert store.read(
+        SYM, Interval.D1, *span(), as_of=datetime(2030, 1, 1, tzinfo=UTC)
+    )[0].close == D("10.30")
+
+
+def test_digest_does_not_depend_on_set_ordering(store: BarStore) -> None:
+    flags = {
+        QualityFlag.STALE,
+        QualityFlag.OUTLIER,
+        QualityFlag.RESTATED,
+        QualityFlag.LOCKED,
+    }
+    store.write([bar(quality=frozenset(flags))])
+    rewrite = store.write(
+        [bar(quality=frozenset(sorted(flags, key=str, reverse=True)))]
+    )
+    assert rewrite.unchanged == 1
+
+
+def test_naive_times_are_refused_and_empty_checksums_differ(store: BarStore) -> None:
+    start, end = span()
+    with pytest.raises(ValidationError, match="as_of"):
+        store.read(SYM, Interval.D1, start, end, as_of=datetime(2026, 3, 10))
+    with pytest.raises(ValidationError, match="bar_ts"):
+        store.revisions(SYM, Interval.D1, datetime(2026, 3, 9))
+    empty = store.checksum(SYM, Interval.D1, start, end)
+    store.write([bar()])
+    assert store.checksum(SYM, Interval.D1, start, end) != empty
+
+
+def test_missing_sessions_handle_venues_whose_date_differs_from_utc(
+    store: BarStore,
+) -> None:
+    sydney = Symbol(venue="XASX", ticker="BHP")
+    calendar = get_calendar("XASX")
+    session = calendar.session(date(2025, 1, 6))
+    assert session is not None and session.open.date() == date(2025, 1, 5)
+    store.write([bar(session.open, symbol=sydney, session_date=None)])
+    missing = store.missing_sessions(
+        sydney, calendar, date(2025, 1, 6), date(2025, 1, 6)
+    )
+    assert missing == []
 
 
 def test_dataframes_keep_decimals_exact_by_default() -> None:

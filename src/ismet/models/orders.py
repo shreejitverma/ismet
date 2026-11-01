@@ -30,11 +30,11 @@ from ismet.models.types import (
     Timestamp,
 )
 
-_CLIENT_ORDER_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+_CLIENT_ORDER_ID = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
 
 
 def _client_order_id(value: str) -> str:
-    if not _CLIENT_ORDER_ID.match(value):
+    if not _CLIENT_ORDER_ID.fullmatch(value):
         raise ValueError(
             f"invalid client order id {value!r}: 1-64 characters of A-Z a-z 0-9 _ . : -"
         )

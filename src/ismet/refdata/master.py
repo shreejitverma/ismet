@@ -17,6 +17,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from enum import Enum
 
+from ismet.calendars import TradingCalendar, get_calendar
 from ismet.errors import ValidationError
 from ismet.models import Adjustment, Bar, Symbol
 from ismet.models.decimals import mul, ratio, sub
@@ -154,8 +155,32 @@ class _Factors:
     volume: Decimal
 
 
+def _rounded(value: Decimal) -> Decimal:
+    """Keep adjusted values within what the models accept. The raw bars stay exact."""
+    return ratio(value, Decimal(1))
+
+
+def _dividend_factor(action: CorporateAction, prior: Decimal | None) -> Decimal:
+    assert action.amount is not None
+    if prior is None:
+        raise ValidationError(
+            f"no close before ex-date {action.ex_date} to scale the dividend"
+        )
+    if prior <= 0:
+        raise ValidationError(
+            f"the ratio method needs a positive close before ex-date {action.ex_date}"
+        )
+    factor = ratio(sub(prior, action.amount), prior)
+    if factor <= 0:
+        raise ValidationError(
+            f"dividend {action.amount} is not below the prior close {prior}; "
+            "supply an explicit price_factor"
+        )
+    return factor
+
+
 def _factors_for(
-    bar: Bar,
+    bar_date: date,
     actions: Sequence[CorporateAction],
     closes_before: dict[date, Decimal],
     *,
@@ -163,25 +188,30 @@ def _factors_for(
 ) -> _Factors:
     price = Decimal(1)
     volume = Decimal(1)
-    bar_date = bar.session_date or bar.exchange_ts.date()
     for action in actions:
         if action.ex_date <= bar_date:
             continue
+        is_dividend = action.kind is ActionKind.CASH_DIVIDEND
+        if is_dividend and not include_dividends:
+            continue
         if action.price_factor is not None:
-            price = mul(price, action.price_factor)
+            price = _rounded(mul(price, action.price_factor))
         elif action.kind in (ActionKind.SPLIT, ActionKind.STOCK_DIVIDEND):
             assert action.ratio is not None
             price = ratio(price, action.ratio)
-            volume = mul(volume, action.ratio)
-        elif action.kind is ActionKind.CASH_DIVIDEND and include_dividends:
-            assert action.amount is not None
-            prior = closes_before.get(action.ex_date)
-            if prior is None:
-                raise ValidationError(
-                    f"no close before ex-date {action.ex_date} to scale the dividend"
-                )
-            price = mul(price, ratio(sub(prior, action.amount), prior))
+            volume = _rounded(mul(volume, action.ratio))
+        elif is_dividend:
+            factor = _dividend_factor(action, closes_before.get(action.ex_date))
+            price = _rounded(mul(price, factor))
     return _Factors(price, volume)
+
+
+def _trading_date(bar: Bar, calendar: TradingCalendar | None) -> date:
+    """A bar's venue trading date, which can differ from its UTC date."""
+    if bar.session_date is not None:
+        return bar.session_date
+    resolved = calendar if calendar is not None else get_calendar(bar.symbol.venue)
+    return resolved.local_date(bar.exchange_ts)
 
 
 def adjust_bars(
@@ -190,6 +220,7 @@ def adjust_bars(
     *,
     include_dividends: bool = False,
     known_at: datetime | None = None,
+    calendar: TradingCalendar | None = None,
 ) -> list[Bar]:
     """Back-adjust raw bars for actions, so a series is continuous at today's scale.
 
@@ -198,43 +229,37 @@ def adjust_bars(
     which gives the series a backtest would have seen on that date. Dividends use the
     standard ratio method, ``(close_before - dividend) / close_before``, with the raw
     close of the session before the ex-date. Results round to 50 significant digits;
-    the raw series remains the source of truth.
+    the raw series remains the source of truth. A bar with no ``session_date`` gets its
+    trading date from ``calendar``, or the bundled calendar for its venue.
     """
     ordered = sorted(bars, key=lambda bar: bar.exchange_ts)
     usable = [a for a in actions if known_at is None or a.known_from <= known_at]
+    dates = [_trading_date(bar, calendar) for bar in ordered]
     closes_before: dict[date, Decimal] = {}
     for action in usable:
         before = [
-            bar
-            for bar in ordered
-            if (bar.session_date or bar.exchange_ts.date()) < action.ex_date
+            bar for bar, day in zip(ordered, dates, strict=True) if day < action.ex_date
         ]
         if before:
             closes_before[action.ex_date] = before[-1].close
     result: list[Bar] = []
     target = Adjustment.SPLIT_DIVIDEND if include_dividends else Adjustment.SPLIT
-    for bar in ordered:
+    for bar, day in zip(ordered, dates, strict=True):
         if bar.adjustment is not Adjustment.RAW:
             raise ValidationError(
                 f"adjust_bars needs raw bars; got {bar.adjustment.value} at "
                 f"{bar.exchange_ts.isoformat()}"
             )
         factors = _factors_for(
-            bar, usable, closes_before, include_dividends=include_dividends
+            day, usable, closes_before, include_dividends=include_dividends
         )
-        result.append(
-            bar.model_copy(
-                update={
-                    "open": mul(bar.open, factors.price),
-                    "high": mul(bar.high, factors.price),
-                    "low": mul(bar.low, factors.price),
-                    "close": mul(bar.close, factors.price),
-                    "volume": mul(bar.volume, factors.volume),
-                    "vwap": None if bar.vwap is None else mul(bar.vwap, factors.price),
-                    "adjustment": target,
-                }
-            )
-        )
+        fields = bar.model_dump()
+        for name in ("open", "high", "low", "close", "vwap"):
+            if fields[name] is not None:
+                fields[name] = _rounded(mul(fields[name], factors.price))
+        fields["volume"] = _rounded(mul(bar.volume, factors.volume))
+        fields["adjustment"] = target
+        result.append(Bar.model_validate(fields))
     return result
 
 

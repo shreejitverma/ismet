@@ -74,7 +74,7 @@ def test_gap_makes_the_book_refuse_to_answer_until_resynced() -> None:
     result = snap(book)
     assert result.bids[0].size == 8  # delta 105 is covered by the snapshot
     assert result.asks[0].size == 1  # delta 106 is newer and is replayed
-    assert QualityFlag.AFTER_GAP in result.quality
+    assert not result.quality  # fully resynced, so nothing is wrong with this book
 
 
 def test_book_before_any_snapshot_refuses_to_answer() -> None:
