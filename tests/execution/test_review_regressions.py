@@ -483,9 +483,11 @@ async def test_venue_purging_a_filled_order_does_not_lose_the_fill(
         venue.report_faults.drop_next = 1
         venue.trade_through(ACME, "9.50", "100")
         venue.forget_order("FL2")
-        await oms.reconcile()
+        report = await oms.reconcile()
         assert oms.order("FL2").status is S.FILLED
         assert oms.net_position(ACME) == 100
+        # The fill explains the disappearance, so this is not a break and must not halt.
+        assert not report.breaks and not oms.kill_state.engaged
     finally:
         await oms.abort()
 
@@ -1196,6 +1198,10 @@ def test_full_close_leaves_exactly_zero_beyond_the_ambient_context() -> None:
     ledger = build_ledger([fill("A", BUY, size, "2"), fill("B", SELL, size, "3")])
     assert ledger.quantity == 0 and not ledger.lots
     assert ledger.realized_pnl == D(size)
+    assert (
+        len(ledger.realized_trades) == 1
+    )  # one exact match, not a rounded one and a rest
+    assert ledger.realized_trades[0].quantity == D(size)
 
 
 def test_rounding_never_produces_negative_zero() -> None:
@@ -1470,29 +1476,85 @@ async def test_fill_recovery_survives_a_venue_clock_behind_ours(
 
 
 async def test_a_failed_sweep_leaves_the_fill_for_the_next_pass(
-    oms: OrderManager,
-    venue: SimVenue,
-    clock: ManualClock,
-    monkeypatch: pytest.MonkeyPatch,
+    clock: ManualClock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    await venue.drain()
-    await oms.submit(order("TR5", price="9.50"))
-    await venue.drain()
-    venue.report_faults.drop_next = 1
-    venue.trade_through(ACME, "9.50", "40")
-    await venue.cancel_order("TR5", ACME)
-    await venue.drain()
-    real = venue.fills_since
+    # No account API, so the sweep is the only thing that can find this fill.
+    venue = account_free(clock)
+    oms = bare_manager(venue, clock)
+    await oms.start()
+    try:
+        await venue.drain()
+        await oms.submit(order("TR5", price="9.50"))
+        await venue.drain()
+        venue.report_faults.drop_next = 1
+        venue.trade_through(ACME, "9.50", "40")
+        await venue.cancel_order("TR5", ACME)
+        await venue.drain()
+        real = venue.fills_since
 
-    async def down(*_: object) -> list[Fill]:
-        raise ValidationError("down")
+        async def down(*_: object) -> list[Fill]:
+            raise ValidationError("down")
 
-    monkeypatch.setattr(venue, "fills_since", down)
-    assert not (await oms.reconcile()).complete
-    clock.advance(7200)
-    monkeypatch.setattr(venue, "fills_since", real)
-    await oms.reconcile()
-    assert oms.order("TR5").filled_quantity == 40
+        monkeypatch.setattr(venue, "fills_since", down)
+        clock.advance(7200)  # longer than the lookback, so only a held window finds it
+        assert not (await oms.reconcile()).complete
+        monkeypatch.setattr(venue, "fills_since", real)
+        clock.advance(7200)
+        await oms.reconcile()
+        assert oms.order("TR5").filled_quantity == 40
+    finally:
+        await oms.abort()
+
+
+async def test_sweep_looks_back_past_the_current_moment(clock: ManualClock) -> None:
+    venue = account_free(clock)
+    oms = bare_manager(venue, clock)
+    await oms.start()
+    try:
+        await venue.drain()
+        await oms.submit(order("TR5B", price="9.50"))
+        await venue.drain()
+        venue.report_faults.drop_next = 1
+        venue.trade_through(ACME, "9.50", "40")
+        await venue.cancel_order("TR5B", ACME)
+        await venue.drain()
+        clock.advance(10)
+        await oms.reconcile()
+        assert oms.order("TR5B").filled_quantity == 40
+    finally:
+        await oms.abort()
+
+
+async def test_unknown_multiplier_fails_gross_closed_rather_than_assuming_one(
+    journal_path: Path, clock: ManualClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    venue = SimVenue(
+        clock=clock,
+        instruments=[sim_instrument("ACME", multiplier="50")],
+        initial_positions={ACME: D(30)},
+    )
+    venue.set_quote(ACME, "9.99", "10.01")
+
+    async def down(_: Symbol) -> None:
+        raise ValidationError("reference data down")
+
+    monkeypatch.setattr(venue, "instrument", down)
+    journal = SqliteJournal(journal_path)
+    oms = OrderManager(
+        venue,
+        journal,
+        RiskEngine(permissive_config()),
+        clock=clock,
+        reconcile_interval=3600,
+        stream_settle=None,
+    )
+    await oms.start()
+    try:
+        oms._last_fill_price[ACME] = D(10)
+        assert oms._gross_notional() is None
+    finally:
+        await oms.abort()
+        journal.close()
 
 
 async def test_fill_after_a_cancel_is_recorded_without_halting(

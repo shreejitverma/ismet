@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import importlib
+import os
+import subprocess
+import sys
+import textwrap
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -232,6 +236,35 @@ def test_digest_does_not_depend_on_set_ordering(store: BarStore) -> None:
         [bar(quality=frozenset(sorted(flags, key=str, reverse=True)))]
     )
     assert rewrite.unchanged == 1
+
+
+def test_digest_is_the_same_in_every_process() -> None:
+    """A set's order varies with the hash seed, so it must not reach the digest."""
+    script = textwrap.dedent(
+        """
+        from datetime import datetime, timezone
+        from ismet.models import Adjustment, Bar, Interval, QualityFlag, Symbol
+        from ismet.store import _content_digest
+
+        ts = datetime(2026, 3, 9, 14, 30, tzinfo=timezone.utc)
+        print(_content_digest(Bar(
+            symbol=Symbol(venue="XNYS", ticker="A"), exchange_ts=ts, received_ts=ts,
+            interval=Interval.D1, open="1", high="1", low="1", close="1", volume="1",
+            adjustment=Adjustment.RAW, quality=frozenset(QualityFlag),
+        )))
+        """
+    )
+    digests = {
+        subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            check=True,
+            env={**os.environ, "PYTHONHASHSEED": str(seed)},
+        ).stdout
+        for seed in (1, 2, 3, 4, 5, 6)
+    }
+    assert len(digests) == 1
 
 
 def test_naive_times_are_refused_and_empty_checksums_differ(store: BarStore) -> None:
