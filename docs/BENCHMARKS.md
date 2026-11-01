@@ -8,22 +8,22 @@ These are service times, not latency under load, which adds queueing.
 
 | Operation | p50 | p99 | p99.9 |
 |---|---|---|---|
-| `decimal_midpoint` | 0.62 us | 1.54 us | 8.79 us |
-| `decimal_round_to_step` | 1.0 us | 2.5 us | 13.25 us |
-| Construct a validated `Trade` | 2.58 us | 7.38 us | 38.29 us |
-| Book delta, 1000 levels | 0.88 us | 2.17 us | 11.0 us |
-| Full risk check | 8.12 us | 30.21 us | 94.88 us |
-| Journal append with full flush | 4.0 ms | 6.0 ms | 9.9 ms |
-| Read kill state from journal | 3.83 us | 9.96 us | 46.5 us |
-| `OrderManager.submit`, end to end, simulated venue | 19.8 ms | 53.3 ms | 94.7 ms |
+| `decimal_midpoint` | 0.58 us | 1.38 us | 1.75 us |
+| `decimal_round_to_step` | 1.0 us | 2.17 us | 2.54 us |
+| Construct a validated `Trade` | 2.54 us | 2.71 us | 7.71 us |
+| Book delta, 1000 levels | 1.29 us | 1.42 us | 3.21 us |
+| Full risk check | 9.83 us | 12.42 us | 55.0 us |
+| Journal append with full flush | 5.0 ms | 11.8 ms | 15.0 ms |
+| Read kill state from journal | 3.79 us | 10.17 us | 75.12 us |
+| `OrderManager.submit`, end to end, simulated venue | 24.0 ms | 108.6 ms | 404 ms |
 
 ## What limits throughput
 
 The bottleneck is durable journal writes.
 A submit makes at least three (intent, send started, ack), and each waits for a real flush.
-On this machine that means roughly 50 orders per second per order manager.
+On this machine that means roughly 40 orders per second per order manager.
 Filesystem and drive determine this far more than Python does, so measure your own hardware.
-The flush is what makes crash recovery true, and turning it off would make the 4 ms figure disappear along with the guarantee.
+The flush is what makes crash recovery true, and turning it off would make the 5 ms figure disappear along with the guarantee.
 Before `fullfsync` was enabled this measured about 45 us, because macOS `fsync()` does not flush the drive cache.
 
 ## What this is not for

@@ -24,5 +24,5 @@ Retrying creates duplicates, and assuming failure leaves unmanaged risk.
 
 ## Consequences
 
-Each order costs two durable writes before it leaves, about 8 ms on the machine in `docs/BENCHMARKS.md`.
+Each order costs two durable writes before it leaves, about 10 ms on the machine in `docs/BENCHMARKS.md`.
 This suits strategies measured in tens of orders per second, not colocated market making.

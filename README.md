@@ -4,7 +4,7 @@ The safety-critical layer between Python and a market.
 One typed, async interface to market data, trading calendars, reference data, and orders, built so an order is never sent twice, a fill is never lost, and a price is never silently wrong.
 
 **Status: alpha.**
-The order path has been tested against a simulated venue and through a FIX test double, and never against a real broker's order entry.
+The order path has been tested against a simulated venue and a local QuickFIX acceptor, and never against a real broker's order entry.
 Do not trade real money with this yet.
 [docs/GAP_MATRIX.md](docs/GAP_MATRIX.md) states exactly what is built, what is proven, and what is not.
 
@@ -129,7 +129,7 @@ It is not for colocated, sub-millisecond strategies.
 | `coinbase` | `ZCBS` spot | market data, bars, streams, reference | Conformance on recorded responses and live, public data only |
 | `mock` | `XMOK` | market data, bars, streams, reference | Deterministic, ships with the package |
 | `SimVenue` (`ismet.testing.simvenue`) | `XSIM` | everything, with scriptable faults | Trading conformance |
-| `FixProvider` (`ismet.fix`) | Configured per counterparty | order entry over FIX | See the gap matrix |
+| `FixProvider` (`ismet.fix`) | Configured per counterparty | order entry over FIX 4.2, 4.4, 5.0 SP2 | Experimental: QuickFIX interop only, no real counterparty |
 
 Interactive Brokers, Alpaca, Zerodha Kite, and Polygon need accounts or API keys to record real fixtures, and an adapter is not shipped without them.
 
