@@ -173,6 +173,11 @@ class OrderManager:
         self._checkpoint = checkpoint
 
         self._orders: dict[str, OrderState] = {}
+        # Derived indexes, kept so submit does not slow as finished orders accumulate.
+        self._open: dict[str, OrderState] = {}
+        self._filled_net: dict[Symbol, Decimal] = {}
+        self._last_fill_price: dict[Symbol, Decimal] = {}
+        self._symbols_seen: set[Symbol] = set()
         self._created_at: dict[str, datetime] = {}
         self._baseline: dict[Symbol, Decimal] | None = None
         self._unknown_since: dict[str, float] = {}
@@ -304,10 +309,10 @@ class OrderManager:
                 event = parse_order_event(record.payload)
                 cid = event.client_order_id
                 if isinstance(event, SubmitIntent) and cid not in self._orders:
-                    self._orders[cid] = new_order(event)
+                    self._store(new_order(event))
                     self._created_at[cid] = event.ts
                 elif cid in self._orders:
-                    self._orders[cid] = apply_event(self._orders[cid], event)
+                    self._store(apply_event(self._orders[cid], event))
                 else:
                     raise JournalError(f"event {event.kind} for {cid} has no intent")
             elif record.kind is RecordKind.POSITION_BASELINE:
@@ -359,25 +364,42 @@ class OrderManager:
     def open_orders(self, symbol: Symbol | None = None) -> list[OrderState]:
         return [
             o
-            for o in self._orders.values()
-            if o.is_open and (symbol is None or o.request.symbol == symbol)
+            for o in self._open.values()
+            if symbol is None or o.request.symbol == symbol
         ]
+
+    def _store(self, state: OrderState) -> None:
+        """The one place order state changes, so the indexes cannot drift from it."""
+        cid = state.client_order_id
+        symbol = state.request.symbol
+        prior = self._orders.get(cid)
+        filled_before = prior.filled_quantity if prior is not None else Decimal(0)
+        self._orders[cid] = state
+        self._symbols_seen.add(symbol)
+        if state.is_open:
+            self._open[cid] = state
+        else:
+            self._open.pop(cid, None)
+        change = sub(state.filled_quantity, filled_before)
+        if change != 0:
+            signed = mul(Decimal(state.request.side.sign), change)
+            self._filled_net[symbol] = add(
+                self._filled_net.get(symbol, Decimal(0)), signed
+            )
+        if state.fills:
+            self._last_fill_price[symbol] = state.fills[-1].price
 
     def net_position(self, symbol: Symbol) -> Decimal | None:
         """Baseline plus every recorded fill, or ``None`` if the baseline is unknown."""
         if self._baseline is None:
             return None
-        position = self._baseline.get(symbol, Decimal(0))
-        for order in self._orders.values():
-            if order.request.symbol == symbol and order.filled_quantity != 0:
-                position = add(
-                    position,
-                    mul(Decimal(order.request.side.sign), order.filled_quantity),
-                )
-        return position
+        return add(
+            self._baseline.get(symbol, Decimal(0)),
+            self._filled_net.get(symbol, Decimal(0)),
+        )
 
     def _tracked_symbols(self) -> set[Symbol]:
-        symbols = {o.request.symbol for o in self._orders.values()}
+        symbols = set(self._symbols_seen)
         if self._baseline:
             symbols |= set(self._baseline)
         return symbols
@@ -412,7 +434,7 @@ class OrderManager:
                 prior = self._orders[cid]
                 before = prior.anomalies
                 state = apply_event(prior, event)
-            self._orders[cid] = state
+            self._store(state)
             anomalies = state.anomalies[len(before) :]
             if state.status is OrderStatus.UNKNOWN:
                 self._unknown_since.setdefault(cid, self._clock.monotonic())
@@ -559,10 +581,7 @@ class OrderManager:
 
         ``None`` if any position has no known price, which fails a gross limit closed.
         """
-        last_price: dict[Symbol, Decimal] = {}
-        for order in self._orders.values():
-            if order.fills:
-                last_price[order.request.symbol] = order.fills[-1].price
+        last_price = self._last_fill_price
         gross = Decimal(0)
         for symbol in self._tracked_symbols():
             position = self.net_position(symbol)
@@ -898,7 +917,7 @@ class OrderManager:
         while True:
             await asyncio.sleep(interval)
             elapsed += interval
-            has_unknown = any(o.status in _RESOLVE for o in self._orders.values())
+            has_unknown = any(o.status in _RESOLVE for o in self._open.values())
             if has_unknown or elapsed >= self._reconcile_interval:
                 elapsed = 0.0
                 try:
@@ -1130,6 +1149,7 @@ class OrderManager:
                 )
 
     async def _recover_missing_fills(self, symbol: Symbol, report: ReconReport) -> None:
+        # Rare by design: this runs only after a position disagreement.
         times = [
             self._created_at[o.client_order_id]
             for o in self._orders.values()

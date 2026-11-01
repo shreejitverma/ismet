@@ -93,6 +93,15 @@ def test_records_survive_reopening_and_chain_continues(tmp_path: Path) -> None:
     second.close()
 
 
+def test_commits_ask_for_a_real_flush_to_disk(tmp_path: Path) -> None:
+    journal = SqliteJournal(tmp_path / "j.db")
+    settings = journal.durability_settings()
+    journal.close()
+    assert settings["synchronous"] == 2  # FULL
+    assert settings["fullfsync"] == 1
+    assert settings["checkpoint_fullfsync"] == 1
+
+
 def test_two_connections_extend_one_chain(tmp_path: Path) -> None:
     path = tmp_path / "j.db"
     oms, cli = SqliteJournal(path), SqliteJournal(path)

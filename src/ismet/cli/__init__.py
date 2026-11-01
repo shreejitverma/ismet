@@ -407,9 +407,8 @@ def _doctor() -> int:
         }
     )
     if not configured:
-        print(
-            f"help[1]:\n  Set {ENV_PREFIX}PROVIDERS, for example {ENV_PREFIX}PROVIDERS=mock"
-        )
+        example = f"{ENV_PREFIX}PROVIDERS=mock"
+        print(f"help[1]:\n  Set {ENV_PREFIX}PROVIDERS, for example {example}")
     return EXIT_FAILED if problems else EXIT_OK
 
 

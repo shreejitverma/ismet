@@ -6,8 +6,9 @@ also the audit trail: every record carries the SHA-256 of its content and of the
 previous record, so editing, removing, or reordering history breaks the chain and
 :meth:`Journal.verify` reports where.
 
-:class:`SqliteJournal` commits with ``synchronous=FULL``, so a record has been
-fsynced when ``append`` returns. SQLite triggers forbid UPDATE and DELETE. Those
+:class:`SqliteJournal` commits with ``synchronous=FULL`` and ``fullfsync``, so a
+record has reached stable storage when ``append`` returns, as far as the drive honours
+flush requests. SQLite triggers forbid UPDATE and DELETE. Those
 stop accidents; the hash chain is what detects a deliberate edit, unless the editor
 recomputes the whole chain, which only an anchored :attr:`Journal.head_hash`
 copied elsewhere can catch. It uses only the standard library, so it works the same
@@ -257,6 +258,10 @@ class SqliteJournal:
             )
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=FULL")
+            # On macOS fsync() does not flush the drive's cache, so without these a
+            # power cut can lose a committed record. Ignored on other platforms.
+            self._conn.execute("PRAGMA fullfsync=ON")
+            self._conn.execute("PRAGMA checkpoint_fullfsync=ON")
             self._conn.executescript(_SCHEMA)
         except (sqlite3.Error, OSError) as exc:
             raise JournalError(f"cannot open journal {self.path}: {exc}") from exc
@@ -357,6 +362,14 @@ class SqliteJournal:
 
     def verify(self) -> VerifyResult:
         return _verify_chain(self.records())
+
+    def durability_settings(self) -> dict[str, int]:
+        """The pragmas durability depends on, for tests and ``ismet doctor``."""
+        with self._lock:
+            return {
+                name: int(self._conn.execute(f"PRAGMA {name}").fetchone()[0])
+                for name in ("synchronous", "fullfsync", "checkpoint_fullfsync")
+            }
 
     def head_hash(self) -> str:
         with self._lock:

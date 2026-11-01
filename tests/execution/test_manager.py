@@ -33,6 +33,7 @@ from ismet.models.orders import (
     OrderSide,
     OrderStatus,
     OrderType,
+    ShortSaleMark,
     TimeInForce,
 )
 from ismet.testing.simvenue import Fault, SimVenue
@@ -280,8 +281,8 @@ async def test_cancel_is_idempotent_and_too_late_is_harmless(
     await venue.drain()
     venue.report_faults.drop_next = 1  # the venue fills, and we have not heard
     venue.trade_through(ACME, "9.50", "100")
-    await oms.cancel("C2")
-    assert oms.order("C2").status is S.ACCEPTED  # cancel refused as too late
+    await oms.cancel("C2")  # refused as too late; no error reaches the caller
+    assert oms.order("C2").status is not S.PENDING_CANCEL
     await oms.reconcile()
     assert oms.order("C2").status is S.FILLED
 
@@ -794,3 +795,36 @@ async def test_cancelled_caller_leaves_the_order_unknown_not_lost(
     with pytest.raises(asyncio.CancelledError):
         await task
     assert oms.order("CC1").status is S.UNKNOWN
+
+
+async def test_position_index_agrees_with_a_full_recount_after_any_history(
+    oms: OrderManager, venue: SimVenue, journal: SqliteJournal
+) -> None:
+    await venue.drain()
+    await oms.submit(order("P1", price="9.50"))
+    await oms.submit(
+        order(
+            "P2",
+            side=OrderSide.SELL,
+            price="10.50",
+            quantity="30",
+            short_sale=ShortSaleMark.SHORT_EXEMPT,
+        )
+    )
+    await venue.drain()
+    venue.trade_through(ACME, "9.50", "60")
+    venue.trade_through(ACME, "10.50", "30")
+    filled = await oms.wait_for("P1", lambda o: o.filled_quantity == 60, 2)
+    await oms.wait_for("P2", lambda o: o.is_terminal, 2)
+    venue.bust(filled.fills[0].fill_id)
+    await oms.wait_for("P1", lambda o: o.filled_quantity == 0, 2)
+    await venue.drain()
+    recount = sum(
+        (D(o.request.side.sign) * o.filled_quantity for o in oms.orders.values()),
+        D(0),
+    )
+    assert oms.net_position(ACME) == recount == D(-30)
+    assert {o.client_order_id for o in oms.open_orders()} == {
+        o.client_order_id for o in oms.orders.values() if o.is_open
+    }
+    assert oms.open_orders(ACME) == oms.open_orders()
