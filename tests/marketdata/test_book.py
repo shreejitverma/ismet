@@ -77,6 +77,12 @@ def test_gap_makes_the_book_refuse_to_answer_until_resynced() -> None:
     assert not result.quality  # fully resynced, so nothing is wrong with this book
 
 
+def test_missing_exactly_one_update_is_a_gap() -> None:
+    book = synced()
+    assert not book.apply_delta(BookDelta(BUY, D(10), D(1), 102))
+    assert not book.is_synced and book.gaps == 1
+
+
 def test_book_before_any_snapshot_refuses_to_answer() -> None:
     book = BookBuilder(SYM)
     book.apply_delta(BookDelta(BUY, D(10), D(1), 1))

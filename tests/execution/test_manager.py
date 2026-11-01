@@ -19,6 +19,7 @@ from ismet.errors import (
 )
 from ismet.execution import (
     BreakKind,
+    KillState,
     MemoryJournal,
     OrderManager,
     RecordKind,
@@ -872,9 +873,9 @@ async def test_kill_switch_stays_engaged_when_the_journal_cannot_record_it(
 async def test_a_stale_journal_read_cannot_undo_a_local_engage(
     oms: OrderManager, journal: SqliteJournal
 ) -> None:
-    before = journal.kill_state()
+    stale = KillState(False, "an earlier release", "ops", journal.kill_state().seq)
     await oms.engage_kill("halt", cancel_open=False)
-    await oms._merge_kill(before)
+    await oms._merge_kill(stale)  # well-formed, but older than what is known here
     assert oms.kill_state.engaged
 
 

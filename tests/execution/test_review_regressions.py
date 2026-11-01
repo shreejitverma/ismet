@@ -1553,7 +1553,9 @@ async def test_forged_release_is_not_adopted_by_a_running_manager(
 
     await venue.drain()
     await oms.engage_kill("halt", operator="ops", cancel_open=False)
-    conn = sqlite3.connect(journal_path)
+    # Hold the write lock, since the running manager can append at any moment.
+    conn = sqlite3.connect(journal_path, isolation_level=None, timeout=30)
+    conn.execute("BEGIN IMMEDIATE")
     row = conn.execute("SELECT MAX(seq) FROM journal").fetchone()
     conn.execute(
         "INSERT INTO journal (seq, ts, kind, client_order_id, payload, unique_intent, "
@@ -1561,7 +1563,7 @@ async def test_forged_release_is_not_adopted_by_a_running_manager(
         "VALUES (?, ?, 'kill_released', NULL, ?, 0, 'forged', 'forged')",
         (row[0] + 1, NOW.isoformat(), '{"reason": "x", "operator": "mallory"}'),
     )
-    conn.commit()
+    conn.execute("COMMIT")
     conn.close()
     with pytest.raises(KillSwitchEngaged):
         await oms.submit(order("TR9", price="9.50"))
