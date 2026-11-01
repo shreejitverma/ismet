@@ -1,0 +1,15 @@
+{
+ "recorded_at": "2026-11-01T02:07:45.980633Z",
+ "url": "wss://data-stream.binance.vision/ws",
+ "sent": [
+  {
+   "method": "NOPE",
+   "params": [],
+   "id": 1
+  }
+ ],
+ "control": [
+  "{\"error\":{\"code\":2,\"msg\":\"Invalid request: unknown variant `NOPE`, expected one of `SUBSCRIBE`, `UNSUBSCRIBE`, `LIST_SUBSCRIPTIONS`, `SET_PROPERTY`, `GET_PROPERTY`\"},\"id\":1}"
+ ],
+ "frames": []
+}

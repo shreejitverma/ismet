@@ -63,6 +63,8 @@ dev = [
 
 [project.entry-points."ismet.providers"]
 mock = "ismet.providers.mock:MockProvider"
+binance = "ismet.providers.binance:BinanceProvider"
+coinbase = "ismet.providers.coinbase:CoinbaseProvider"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ismet"]

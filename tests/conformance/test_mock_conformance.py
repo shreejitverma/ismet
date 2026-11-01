@@ -18,7 +18,8 @@ async def test_mock_provider_is_conformant(sym: Symbol) -> None:
     report = await run_conformance(MockProvider(tick_interval=0), symbol=sym)
     assert_conformant(report)
     names = {(c.capability, c.name) for c in report.checks}
-    assert (Capability.TRADING, "not_supported_raises") not in names
+    assert (Capability.TRADING, "not_supported_raises") in names
+    assert (Capability.TRADING, "place_order") not in names
     assert (Capability.STREAMING, "stream_quotes") in names
     assert "PASS" in report.summary()
 

@@ -1,0 +1,31 @@
+{
+ "recorded_at": "2026-11-01T02:07:45.980633Z",
+ "exchanges": [
+  {
+   "method": "GET",
+   "url": "https://data-api.binance.vision/api/v3/exchangeInfo?symbol=BTCUSDT&showPermissionSets=false",
+   "status": 200,
+   "headers": {
+    "date": "Sun, 01 Nov 2026 02:07:52 GMT",
+    "content-type": "application/json;charset=UTF-8",
+    "x-mbx-used-weight": "203",
+    "x-mbx-used-weight-1m": "203",
+    "cache-control": "no-cache, no-store, must-revalidate"
+   },
+   "body": "{\"timezone\":\"UTC\",\"serverTime\":1793498872305,\"rateLimits\":[{\"rateLimitType\":\"REQUEST_WEIGHT\",\"interval\":\"MINUTE\",\"intervalNum\":1,\"limit\":6000},{\"rateLimitType\":\"ORDERS\",\"interval\":\"SECOND\",\"intervalNum\":10,\"limit\":100},{\"rateLimitType\":\"ORDERS\",\"interval\":\"DAY\",\"intervalNum\":1,\"limit\":200000},{\"rateLimitType\":\"RAW_REQUESTS\",\"interval\":\"MINUTE\",\"intervalNum\":5,\"limit\":300000}],\"exchangeFilters\":[],\"symbols\":[{\"symbol\":\"BTCUSDT\",\"status\":\"TRADING\",\"baseAsset\":\"BTC\",\"baseAssetPrecision\":8,\"quoteAsset\":\"USDT\",\"quotePrecision\":8,\"quoteAssetPrecision\":8,\"baseCommissionPrecision\":8,\"quoteCommissionPrecision\":8,\"orderTypes\":[\"LIMIT\",\"LIMIT_MAKER\",\"MARKET\",\"STOP_LOSS\",\"STOP_LOSS_LIMIT\",\"TAKE_PROFIT\",\"TAKE_PROFIT_LIMIT\"],\"icebergAllowed\":true,\"ocoAllowed\":true,\"otoAllowed\":true,\"opoAllowed\":true,\"quoteOrderQtyMarketAllowed\":true,\"allowTrailingStop\":true,\"cancelReplaceAllowed\":true,\"amendAllowed\":true,\"pegInstructionsAllowed\":true,\"isSpotTradingAllowed\":true,\"isMarginTradingAllowed\":true,\"filters\":[{\"filterType\":\"PRICE_FILTER\",\"minPrice\":\"0.01000000\",\"maxPrice\":\"1000000.00000000\",\"tickSize\":\"0.01000000\"},{\"filterType\":\"LOT_SIZE\",\"minQty\":\"0.00001000\",\"maxQty\":\"9000.00000000\",\"stepSize\":\"0.00001000\"},{\"filterType\":\"ICEBERG_PARTS\",\"limit\":100},{\"filterType\":\"MARKET_LOT_SIZE\",\"minQty\":\"0.00000000\",\"maxQty\":\"87.17218462\",\"stepSize\":\"0.00000000\"},{\"filterType\":\"TRAILING_DELTA\",\"minTrailingAboveDelta\":10,\"maxTrailingAboveDelta\":2000,\"minTrailingBelowDelta\":10,\"maxTrailingBelowDelta\":2000},{\"filterType\":\"PERCENT_PRICE_BY_SIDE\",\"bidMultiplierUp\":\"1.2\",\"bidMultiplierDown\":\"0.5\",\"askMultiplierUp\":\"2\",\"askMultiplierDown\":\"0.8\",\"avgPriceMins\":5},{\"filterType\":\"NOTIONAL\",\"minNotional\":\"5.00000000\",\"applyMinToMarket\":true,\"maxNotional\":\"9000000.00000000\",\"applyMaxToMarket\":false,\"avgPriceMins\":5},{\"filterType\":\"MAX_NUM_ORDERS\",\"maxNumOrders\":200},{\"filterType\":\"MAX_NUM_ORDER_LISTS\",\"maxNumOrderLists\":20},{\"filterType\":\"MAX_NUM_ALGO_ORDERS\",\"maxNumAlgoOrders\":5},{\"filterType\":\"MAX_NUM_ORDER_AMENDS\",\"maxNumOrderAmends\":10}],\"permissions\":[],\"permissionSets\":[],\"defaultSelfTradePreventionMode\":\"EXPIRE_MAKER\",\"allowedSelfTradePreventionModes\":[\"EXPIRE_TAKER\",\"EXPIRE_MAKER\",\"EXPIRE_BOTH\",\"DECREMENT\",\"TRANSFER\"]}]}"
+  },
+  {
+   "method": "GET",
+   "url": "https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=1d&startTime=1793232000000&endTime=1793491199999&limit=1000",
+   "status": 200,
+   "headers": {
+    "date": "Sun, 01 Nov 2026 02:07:52 GMT",
+    "content-type": "application/json;charset=UTF-8",
+    "x-mbx-used-weight": "205",
+    "x-mbx-used-weight-1m": "205",
+    "cache-control": "no-cache, no-store, must-revalidate"
+   },
+   "body": "[[1793232000000,\"81343.51000000\",\"81971.00000000\",\"77910.00000000\",\"77991.89000000\",\"23832.18298000\",1793318399999,\"1905694751.28867070\",4200501,\"11606.74159000\",\"928951404.35168380\",\"0\"],[1793318400000,\"77991.89000000\",\"78804.01000000\",\"76325.98000000\",\"77368.77000000\",\"24295.94848000\",1793404799999,\"1883010706.67806380\",4894043,\"11423.34439000\",\"885326734.15352940\",\"0\"],[1793404800000,\"77368.76000000\",\"77796.01000000\",\"77114.01000000\",\"77582.02000000\",\"6287.54041000\",1793491199999,\"487228251.53818390\",1200486,\"3868.35650000\",\"299797061.82441890\",\"0\"]]"
+  }
+ ]
+}

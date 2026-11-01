@@ -296,7 +296,7 @@ def test_private_venues_cannot_shadow_real_mics() -> None:
         register_private_venue("TOOLONG", "nope")
 
 
-@pytest.mark.parametrize("code", ["ZZZ", "XXX", "XTS", "US", "BAD-CODE"])
+@pytest.mark.parametrize("code", ["ZZZ", "XXX", "XTS", "US", "BAD-CODE", "A B"])
 def test_unknown_and_non_monetary_currencies_are_rejected(code: str) -> None:
     with pytest.raises(ValidationError):
         Codes(currency=code)
@@ -316,6 +316,8 @@ def test_currency_registry_separates_fiat_crypto_and_quote_units() -> None:
     assert not is_crypto_asset("USD")
     with pytest.raises(ValueError):
         register_crypto_asset("!")
+    assert Codes(currency=register_crypto_asset("t")).currency == "T"
+    assert Codes(currency=register_crypto_asset("币安人生")).currency == "币安人生"
 
 
 @pytest.mark.parametrize(

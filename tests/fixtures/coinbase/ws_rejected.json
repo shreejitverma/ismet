@@ -1,0 +1,20 @@
+{
+ "recorded_at": "2026-11-01T02:08:38.324382Z",
+ "url": "wss://ws-feed.exchange.coinbase.com",
+ "sent": [
+  {
+   "type": "subscribe",
+   "product_ids": [
+    "NOPE-USD"
+   ],
+   "channels": [
+    "matches"
+   ]
+  }
+ ],
+ "control": [
+  "{\"type\":\"error\",\"message\":\"Failed to subscribe\",\"reason\":\"NOPE-USD is not a valid product\"}",
+  "{\"type\":\"subscriptions\",\"channels\":[]}"
+ ],
+ "frames": []
+}

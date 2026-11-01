@@ -1,0 +1,44 @@
+{
+ "recorded_at": "2026-11-01T02:07:45.980633Z",
+ "exchanges": [
+  {
+   "method": "GET",
+   "url": "https://data-api.binance.vision/api/v3/depth?symbol=NOSUCHSYMBOL&limit=1",
+   "status": 400,
+   "headers": {
+    "date": "Sun, 01 Nov 2026 02:07:54 GMT",
+    "content-type": "application/json;charset=UTF-8",
+    "x-mbx-used-weight": "232",
+    "x-mbx-used-weight-1m": "232",
+    "cache-control": "no-cache, no-store, must-revalidate"
+   },
+   "body": "{\"code\":-1121,\"msg\":\"Invalid symbol.\"}"
+  },
+  {
+   "method": "GET",
+   "url": "https://data-api.binance.vision/api/v3/exchangeInfo?symbol=NOSUCHSYMBOL&showPermissionSets=false",
+   "status": 400,
+   "headers": {
+    "date": "Sun, 01 Nov 2026 02:07:54 GMT",
+    "content-type": "application/json;charset=UTF-8",
+    "x-mbx-used-weight": "252",
+    "x-mbx-used-weight-1m": "252",
+    "cache-control": "no-cache, no-store, must-revalidate"
+   },
+   "body": "{\"code\":-1121,\"msg\":\"Invalid symbol.\"}"
+  },
+  {
+   "method": "GET",
+   "url": "https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=7m",
+   "status": 400,
+   "headers": {
+    "date": "Sun, 01 Nov 2026 02:07:54 GMT",
+    "content-type": "application/json;charset=UTF-8",
+    "x-mbx-used-weight": "254",
+    "x-mbx-used-weight-1m": "254",
+    "cache-control": "no-cache, no-store, must-revalidate"
+   },
+   "body": "{\"code\":-1120,\"msg\":\"Invalid interval.\"}"
+  }
+ ]
+}

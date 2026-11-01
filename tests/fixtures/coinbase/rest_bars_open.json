@@ -1,0 +1,16 @@
+{
+ "recorded_at": "2026-11-01T02:08:38.324382Z",
+ "exchanges": [
+  {
+   "method": "GET",
+   "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=60&start=2026-11-01T02%3A05%3A00Z&end=2026-11-01T02%3A09%3A00Z",
+   "status": 200,
+   "headers": {
+    "date": "Sun, 01 Nov 2026 02:08:39 GMT",
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "public, max-age=300, must-revalidate"
+   },
+   "body": "[[1793498880,77561.61,77616.97,77616.96,77561.62,0.81083987],[1793498820,77612.65,77635.71,77635.7,77616.97,0.65184405],[1793498760,77633.2,77665.93,77665.92,77635.7,2.29284229],[1793498700,77665.92,77702.87,77702.87,77665.92,1.28611039]]"
+  }
+ ]
+}

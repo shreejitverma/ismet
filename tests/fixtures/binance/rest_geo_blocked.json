@@ -1,0 +1,15 @@
+{
+ "recorded_at": "2026-11-01T02:07:45.980633Z",
+ "exchanges": [
+  {
+   "method": "GET",
+   "url": "https://api.binance.com/api/v3/time",
+   "status": 451,
+   "headers": {
+    "date": "Sun, 01 Nov 2026 02:07:54 GMT",
+    "content-type": "application/json"
+   },
+   "body": "{\n  \"code\": 0,\n  \"msg\": \"Service unavailable from a restricted location according to 'b. Eligibility' in https://www.binance.com/en/terms. Please contact customer service if you believe you received this message in error.\"\n}"
+  }
+ ]
+}

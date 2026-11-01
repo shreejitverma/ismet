@@ -22,7 +22,8 @@ from importlib import resources
 from types import MappingProxyType
 
 _MIC_FORMAT = re.compile(r"^[A-Z0-9]{4}$")
-_ASSET_FORMAT = re.compile(r"^[A-Z0-9]{2,20}$")
+# Crypto tickers include single letters and non-Latin names, so only shape is checked.
+_ASSET_FORMAT = re.compile(r"^[^\W_]{1,20}$")
 
 NON_MONETARY_ISO_CODES = frozenset({"XTS", "XXX"})
 """ISO 4217 codes for testing and for "no currency"; never valid on a price."""
