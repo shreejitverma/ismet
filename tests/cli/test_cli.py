@@ -886,3 +886,102 @@ def test_a_journal_held_open_by_a_running_process_can_be_read(
     code, out = run(capsys, "kill", "status", "--journal", str(path))
     assert code == 0 and "kill: not engaged" in out
     journal.close()
+
+
+def broken_journal(path: str, *rows: tuple[RecordKind, str]) -> None:
+    journal = SqliteJournal(path)
+    journal.append(RecordKind.ANOMALY, "{}")
+    for kind, payload in rows:
+        journal.append(kind, payload)
+    journal.close()
+    connection = sqlite3.connect(path)
+    connection.execute("DROP TRIGGER journal_no_update")
+    connection.execute("UPDATE journal SET payload = '{\"x\": 1}' WHERE seq = 1")
+    connection.commit()
+    connection.close()
+
+
+KILLED = '{"reason": "r", "operator": "o", "cancel_open": false}'
+WHO = ("--reason", "fat finger", "--operator", "ops")
+
+
+def test_kill_release_refuses_a_broken_chain(capsys, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    path = str(tmp_path / "j.db")
+    broken_journal(path, (RecordKind.KILL_ENGAGED, KILLED))
+    code, out = run(capsys, "kill", "release", "--journal", path, *WHO)
+    assert code == 1 and "failed verification" in out
+    journal = SqliteJournal(path)
+    kinds = [r.kind for r in journal.records()]
+    journal.close()
+    assert RecordKind.KILL_RELEASED not in kinds
+
+
+def test_kill_status_shows_a_broken_chain(capsys, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    path = str(tmp_path / "j.db")
+    broken_journal(path)
+    code, out = run(capsys, "kill", "status", "--journal", path)
+    assert code == 1 and "broken at record 1" in out
+
+
+def test_kill_engage_still_works_on_a_broken_chain(capsys, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    path = str(tmp_path / "j.db")
+    broken_journal(path)
+    code, out = run(capsys, "kill", "engage", "--journal", path, *WHO)
+    assert code == 0 and "kill: engaged" in out
+
+
+def adjust(capsys, path: str, delta: str = "10"):  # type: ignore[no-untyped-def]
+    return run(
+        capsys,
+        "position",
+        "adjust",
+        "ACME@XNYS",
+        "--journal",
+        path,
+        "--delta",
+        delta,
+        *WHO,
+    )
+
+
+def test_position_adjust_refuses_a_broken_chain(capsys, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    path = str(tmp_path / "j.db")
+    broken_journal(path, (RecordKind.POSITION_BASELINE, "{}"))
+    code, out = adjust(capsys, path)
+    assert code == 1 and "failed verification" in out
+
+
+def test_position_adjust_refuses_a_journal_with_no_baseline(
+    capsys, tmp_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    path = str(tmp_path / "j.db")
+    SqliteJournal(path).close()
+    code, out = adjust(capsys, path)
+    assert code == 1 and "no position baseline" in out
+
+
+@pytest.mark.parametrize("delta", ["NaN", "sNaN", "Infinity", "1E+1000", "ten"])
+def test_position_adjust_refuses_a_delta_out_of_range(
+    capsys, tmp_path: Path, delta: str
+) -> None:  # type: ignore[no-untyped-def]
+    path = str(tmp_path / "j.db")
+    journal = SqliteJournal(path)
+    journal.append(RecordKind.POSITION_BASELINE, "{}")
+    journal.close()
+    code, out = adjust(capsys, path, delta)
+    assert code == 2 and "--delta" in out
+    journal = SqliteJournal(path)
+    kinds = [r.kind for r in journal.records()]
+    journal.close()
+    assert kinds == [RecordKind.POSITION_BASELINE]
+
+
+def test_position_adjust_writes_on_a_journal_with_a_baseline(
+    capsys, tmp_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    path = str(tmp_path / "j.db")
+    journal = SqliteJournal(path)
+    journal.append(RecordKind.POSITION_BASELINE, "{}")
+    journal.close()
+    code, out = adjust(capsys, path, "1.5")
+    assert code == 0 and "adjusted: ACME@XNYS" in out and 'delta: "1.5"' in out

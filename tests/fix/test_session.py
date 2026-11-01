@@ -9,7 +9,7 @@ import pytest
 from pydantic import SecretStr
 
 from ismet.errors import AmbiguousOutcome, ConfigError, TransportError
-from ismet.fix.message import format_utc_timestamp
+from ismet.fix.message import FixMessage, format_utc_timestamp
 from ismet.fix.session import (
     APPL_VER_FIX50SP2,
     ApplicationRejectError,
@@ -434,6 +434,32 @@ class TestInboundSequencing:
         await session.wait_ready(5.0)
         await eventually(lambda: len(listener.messages) == 1)
         assert listener.messages[0].get(58) == "lost to a crash"
+
+    async def test_a_message_whose_handler_always_fails_runs_out_of_attempts(
+        self, acceptor: FixAcceptor
+    ) -> None:
+        """Redelivery of the same number during sync counts against the limit."""
+
+        class AlwaysCrashing(RecordingListener):
+            async def on_application_message(self, message: FixMessage) -> None:
+                raise RuntimeError("cannot read this one")
+
+        listener = AlwaysCrashing()
+        session = FixSession(
+            session_config(acceptor, max_reconnect_attempts=3),
+            MemoryFixStore(),
+            listener,
+        )
+        await session.start()
+        try:
+            await session.wait_ready(5.0)
+            expected = session.next_inbound
+            await acceptor.send("8", [(58, "poison")])
+            await eventually(lambda: session.failure is not None, timeout=5.0)
+            assert isinstance(session.failure, SessionFailedError)
+            assert session.next_inbound == expected
+        finally:
+            await session.stop()
 
     async def test_application_reject_sends_a_session_reject_and_advances(
         self, acceptor: FixAcceptor, make_session: SessionFactory

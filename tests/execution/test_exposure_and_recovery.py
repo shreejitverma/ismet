@@ -948,7 +948,7 @@ async def test_a_restart_does_not_search_older_than_the_durable_mark_needs(
     oms = manager(venue, journal, clock, fill_lookback=3600.0)
     await oms.start()
     await venue.drain()
-    clock.advance(3600)
+    clock.advance(7200)
     marked_at = clock.now()
     await oms.reconcile()
     await oms.abort()

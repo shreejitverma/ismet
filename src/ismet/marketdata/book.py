@@ -17,10 +17,26 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 
-from ismet.errors import SequenceGap
+from ismet.errors import SequenceGap, ValidationError
 from ismet.models import Level, OrderBook, Symbol
 from ismet.models.decimals import neg
 from ismet.models.orders import OrderSide
+from ismet.models.types import to_decimal
+
+
+def _check_level(price: Decimal, size: Decimal) -> None:
+    try:
+        to_decimal(price)
+        checked_size = to_decimal(size)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(f"invalid book level: {exc}") from exc
+    if checked_size < 0:
+        raise ValidationError(f"book level size must be >= 0, got {size}")
+
+
+def _check_sequence(sequence: int) -> None:
+    if isinstance(sequence, bool) or not isinstance(sequence, int):
+        raise ValidationError(f"book sequence must be an int, got {sequence!r}")
 
 
 @dataclass(frozen=True)
@@ -30,7 +46,9 @@ class BookDelta:
     ``first_sequence`` to ``sequence`` is the range this delta covers, for venues
     that batch updates (such as Binance's ``U`` and ``u``). Every level of one venue
     update carries the same range. Single-update feeds use the default, where the
-    range is one number.
+    range is one number. An impossible delta raises
+    :class:`~ismet.errors.ValidationError` here, so it can never reach a book or its
+    buffer.
     """
 
     side: OrderSide
@@ -38,6 +56,19 @@ class BookDelta:
     size: Decimal
     sequence: int
     first_sequence: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.side, OrderSide):
+            raise ValidationError(f"book delta side is invalid: {self.side!r}")
+        _check_level(self.price, self.size)
+        _check_sequence(self.sequence)
+        if self.first_sequence is not None:
+            _check_sequence(self.first_sequence)
+            if self.first_sequence > self.sequence:
+                raise ValidationError(
+                    f"first_sequence {self.first_sequence} is above sequence "
+                    f"{self.sequence}"
+                )
 
     @property
     def start(self) -> int:
@@ -64,10 +95,6 @@ class _Side:
             insort(self._keys, key)
         self._levels[price] = size
 
-    def clear(self) -> None:
-        self._levels.clear()
-        self._keys.clear()
-
     def top(self, depth: int | None) -> tuple[Level, ...]:
         keys = self._keys if depth is None else self._keys[:depth]
         prices = [self._key(key) for key in keys]
@@ -81,6 +108,8 @@ class BookBuilder:
     """One instrument's book. Not thread-safe; own it from one task."""
 
     def __init__(self, symbol: Symbol, *, max_buffered: int = 100_000) -> None:
+        if max_buffered < 1:
+            raise ValidationError(f"max_buffered must be >= 1, got {max_buffered}")
         self.symbol = symbol
         self._bids = _Side(descending=True)
         self._asks = _Side(descending=False)
@@ -120,6 +149,9 @@ class BookBuilder:
         it would roll the book back. So is one older than a delta the bounded buffer
         dropped, because nothing could restore that delta: the book stays out of sync
         until a snapshot covering it arrives. Returns whether it was applied.
+
+        Rows are read and checked before anything changes, so a bad row raises
+        :class:`~ismet.errors.ValidationError` and leaves the book as it was.
         """
         rolls_back = self._synced and self._last is not None and sequence < self._last
         misses_dropped = (
@@ -128,12 +160,9 @@ class BookBuilder:
         if rolls_back or misses_dropped:
             self.stale_snapshots += 1
             return False
-        self._bids.clear()
-        self._asks.clear()
-        for price, size in bids:
-            self._bids.set(price, size)
-        for price, size in asks:
-            self._asks.set(price, size)
+        _check_sequence(sequence)
+        self._bids = self._side_from(bids, descending=True)
+        self._asks = self._side_from(asks, descending=False)
         self._last = sequence
         self._synced = True
         self._dropped_through = None
@@ -144,6 +173,20 @@ class BookBuilder:
             if delta.sequence > sequence:
                 self.apply_delta(delta)
         return True
+
+    @staticmethod
+    def _side_from(
+        rows: Iterable[tuple[Decimal, Decimal]], *, descending: bool
+    ) -> _Side:
+        side = _Side(descending=descending)
+        for row in rows:
+            try:
+                price, size = row
+            except (TypeError, ValueError) as exc:
+                raise ValidationError(f"invalid book row {row!r}: {exc}") from exc
+            _check_level(price, size)
+            side.set(price, size)
+        return side
 
     def apply_delta(self, delta: BookDelta) -> bool:
         """Apply one delta. Returns false if it was buffered or ignored as old.
@@ -185,6 +228,8 @@ class BookBuilder:
         received_ts: datetime,
     ) -> OrderBook:
         """The current book. Raises if it may be wrong; see :attr:`is_synced`."""
+        if depth is not None and depth < 1:
+            raise ValidationError(f"depth must be >= 1, got {depth}")
         if not self._synced or self._last is None:
             expected = 0 if self._last is None else self._last + 1
             newest = self._buffer[-1].sequence if self._buffer else expected

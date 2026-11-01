@@ -157,10 +157,6 @@ class FixMessage:
             raise FieldFormatError(f"required tag {tag} is missing", tag=tag)
         return value
 
-    def get_all(self, tag: int) -> list[str]:
-        """Every occurrence of ``tag``, in message order."""
-        return [_text(v) for t, v in self._fields if t == tag]
-
     def __contains__(self, tag: int) -> bool:
         return tag in self._index
 
@@ -273,16 +269,6 @@ def parse_utc_timestamp(text: str, tag: int = 0) -> datetime:
 def checksum(frame: bytes | bytearray | memoryview) -> int:
     """The FIX CheckSum of ``frame``: its byte sum modulo 256."""
     return sum(frame) % 256
-
-
-def normalize_fields(
-    fields: Iterable[tuple[int, str | int | bool | Decimal | SecretStr]],
-) -> list[Field]:
-    """Render values to text, except secrets, which stay wrapped until encoding."""
-    return [
-        (tag, value if isinstance(value, SecretStr) else format_value(value, tag))
-        for tag, value in fields
-    ]
 
 
 def encode_fields(
@@ -531,11 +517,6 @@ class FixStreamParser:
             + _TRAILER_LENGTH
         )
 
-    def reset(self) -> None:
-        """Forget buffered bytes, as for a new connection."""
-        self._buffer.clear()
-        self._synced = True
-
     def feed(self, data: bytes) -> list[FixMessage | GarbledFrame]:
         """Consume ``data`` and return what it completes, in order."""
         buf = self._buffer
@@ -633,7 +614,6 @@ __all__ = [
     "encode_frame",
     "format_utc_timestamp",
     "format_value",
-    "normalize_fields",
     "parse_decimal",
     "parse_fields",
     "parse_seq_num",

@@ -193,6 +193,20 @@ def test_gate_drops_repeats_and_flags_late_numbers() -> None:
         assert late.quality == {QualityFlag.OUT_OF_ORDER}
 
 
+def test_a_number_below_the_first_is_delivered_once_then_dropped_as_a_repeat() -> None:
+    gate = StreamGate(contiguous=True)
+    gate.admit("K", 100, _trade(100))
+    late = gate.admit("K", 50, _trade(50))
+    assert late is not None
+    assert late.quality == {QualityFlag.OUT_OF_ORDER}
+    assert gate.admit("K", 50, _trade(50)) is None
+    assert gate.admit("K", 50, _trade(50)) is None
+    between = gate.admit("K", 60, _trade(60))
+    assert between is not None
+    assert between.quality == {QualityFlag.OUT_OF_ORDER}
+    assert gate.admit("K", 60, _trade(60)) is None
+
+
 def test_sparse_gate_ignores_jumps_but_flags_the_first_event_after_reconnect() -> None:
     gate = StreamGate(contiguous=False)
     gate.admit("K", 10, _trade(10))

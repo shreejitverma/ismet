@@ -58,6 +58,20 @@ def default_should_retry(exc: BaseException) -> bool:
     return isinstance(exc, RateLimited)
 
 
+_MAX_RETRY_AFTER = 60.0
+
+
+def should_retry_after_stated_wait(exc: BaseException) -> bool:
+    """:func:`default_should_retry`, but refuse a wait longer than the policy's cap.
+
+    :meth:`RetryPolicy.delay_for` caps a wait, so retrying past the cap would send
+    before the time the venue stated. The error reaches the caller instead.
+    """
+    if isinstance(exc, RateLimited) and exc.retry_after is not None:
+        return exc.retry_after <= _MAX_RETRY_AFTER
+    return default_should_retry(exc)
+
+
 @dataclass(frozen=True)
 class RetryPolicy:
     """How many times to retry, with what backoff, on which exceptions."""
@@ -65,7 +79,7 @@ class RetryPolicy:
     max_attempts: int = 3
     backoff: ExponentialBackoff = ExponentialBackoff()
     should_retry: Callable[[BaseException], bool] = default_should_retry
-    max_retry_after: float = 60.0
+    max_retry_after: float = _MAX_RETRY_AFTER
 
     def __post_init__(self) -> None:
         if self.max_attempts < 1:
@@ -115,4 +129,5 @@ __all__ = [
     "RetryPolicy",
     "default_should_retry",
     "retry",
+    "should_retry_after_stated_wait",
 ]

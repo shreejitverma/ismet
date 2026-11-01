@@ -22,8 +22,9 @@ Binance counts a fixed minute, while a token bucket admits ``capacity + rate * 6
 in any 60 seconds, so the bucket is 4800 per minute with a burst of 1200, which can
 never exceed 6000. Streams: 5 incoming messages per second per connection, 1024
 streams per connection, 300 connections per 5 minutes per IP. This adapter sends
-one message per connection, and a bucket of 150 plus 0.5 per second covers the
-connection limit.
+one message per connection. A bucket of 150 plus 0.5 per second is charged before
+every handshake, accepted or not, so it bounds connection attempts as well as
+connections.
 
 Timestamps. REST ``depth`` and the ``bookTicker`` stream carry no time at all, so
 ``exchange_ts`` on those quotes and books is the received time: an upper bound, with
@@ -42,8 +43,10 @@ normal operation, so it only orders quotes, and the first quote per symbol after
 reconnect is flagged instead. Repeats are dropped; a lower number is delivered
 flagged ``OUT_OF_ORDER``. Nothing is backfilled, because neither stream can replay
 and ``/api/v3/trades`` only holds recent trades. A consumer that must have every
-trade should act on ``AFTER_GAP``. ``IsmetClient`` takes its gap policy from those
-flags, because this adapter declares ``gates_streams``.
+trade should act on ``AFTER_GAP``. A frame a dropping ``ws_backpressure`` policy
+discarded counts the same as a reconnect, so the next quote per symbol is flagged.
+``IsmetClient`` takes its gap policy from those flags, because this adapter declares
+``gates_streams``.
 
 Outages. Reconnects never stop by default, since a long-lived stream should survive a
 network outage. Each one is logged at WARNING; pass ``ws_on_state`` to watch them, or
@@ -63,10 +66,12 @@ Vendor quirks:
   :class:`~ismet.errors.AuthError` by the transport's mapping even though this
   adapter sends no credentials.
 - HTTP 418 is an IP ban for continuing after 429s. It is raised as
-  :class:`~ismet.errors.RateLimited` and never retried, and requests are refused
-  locally until the ban ends, because sending more lengthens it. A 429 whose
-  ``Retry-After`` exceeds the retry policy's cap is not retried either, because
-  retrying before it elapses is what earns the ban.
+  :class:`~ismet.errors.RateLimited` and never retried, because sending more lengthens
+  it. The ban lasts the longest of ``Retry-After``, the time stated in the body, and
+  the 2 minutes the docs give as the shortest ban, so a host clock running fast cannot
+  shorten it. A 429's ``Retry-After`` is held the same way, and requests are refused
+  locally until the wait ends. A 429 whose ``Retry-After`` exceeds the retry policy's
+  cap is not retried, because retrying before it elapses is what earns the ban.
 - ``serverShutdown`` frames are logged; the close that follows triggers the
   reconnect. A connection is valid for 24 hours and then dropped, handled the same
   way.
@@ -83,7 +88,7 @@ from typing import Any, ClassVar, TypeVar
 import httpx
 
 from ismet.config import ProviderSettings
-from ismet.errors import RateLimited, TransportError, ValidationError, VenueError
+from ismet.errors import IsmetError, RateLimited, TransportError, ValidationError
 from ismet.models import (
     Bar,
     Instrument,
@@ -95,16 +100,30 @@ from ismet.models import (
 )
 from ismet.models import Trade as TradeEvent
 from ismet.normalize import binance as normalize
-from ismet.normalize._common import StreamGate, check_range, merge_bars, search_rank
+from ismet.normalize._common import (
+    StreamGate,
+    check_range,
+    copy_made_at,
+    merge_bars,
+    search_rank,
+)
 from ismet.providers.base import Provider, max_reconnects_option
 from ismet.transport.backoff import (
     ExponentialBackoff,
     RetryPolicy,
-    default_should_retry,
+    should_retry_after_stated_wait,
 )
 from ismet.transport.circuit import CircuitBreaker
 from ismet.transport.clock import SYSTEM_CLOCK, Clock
-from ismet.transport.http import Hook, HttpTransport, Response, loads_decimal
+from ismet.transport.http import (
+    Hook,
+    HttpTransport,
+    RequestInfo,
+    Response,
+    loads_decimal,
+    map_response_error,
+    retry_after_seconds,
+)
 from ismet.transport.ratelimit import RateLimiter, RateLimitSpec
 from ismet.transport.ws import (
     DEFAULT_WS_BACKOFF,
@@ -119,8 +138,6 @@ BINANCE_VENUE = "BNCX"
 REST_URL = "https://data-api.binance.vision"
 WS_URL = "wss://data-stream.binance.vision/ws"
 
-REQUEST_WEIGHT_PER_MINUTE = 6000
-WS_CONNECTIONS_PER_5_MINUTES = 300
 MAX_STREAMS_PER_CONNECTION = 1024
 MAX_KLINES_PER_REQUEST = 1000
 MAX_DEPTH = 5000
@@ -171,12 +188,9 @@ class _WeightLimiter(RateLimiter):
 
 
 def _should_retry(exc: BaseException) -> bool:
-    if isinstance(exc, RateLimited):
-        return (
-            exc.retry_after is not None
-            and exc.retry_after <= BINANCE_RETRY.max_retry_after
-        )
-    return default_should_retry(exc)
+    if isinstance(exc, RateLimited) and exc.retry_after is None:
+        return False
+    return should_retry_after_stated_wait(exc)
 
 
 BINANCE_RETRY = RetryPolicy(should_retry=_should_retry)
@@ -236,15 +250,16 @@ class BinanceProvider(Provider):
             retry_policy=retry_policy,
             rate_limiter=self._limiter,
             breaker=CircuitBreaker(self.name, clock=clock),
-            hooks=hooks,
+            hooks=[self._hold_when_limited, *(hooks or [])],
             clock=clock,
             transport=http_transport,
+            map_error=self._map_error,
         )
         self._currencies: dict[str, str | None] = {}
         self._all_symbols: list[Mapping[str, Any]] | None = None
         self._all_symbols_at = 0.0
         self._streams: set[WebSocketTransport] = set()
-        self._banned_until = 0.0
+        self._hold_until = 0.0
 
     @classmethod
     def from_settings(cls, settings: ProviderSettings) -> BinanceProvider:
@@ -283,31 +298,35 @@ class BinanceProvider(Provider):
     async def _request(
         self, path: str, params: Mapping[str, Any], rate_key: str
     ) -> Response:
-        remaining = self._banned_until - self.clock.monotonic()
+        remaining = self._hold_until - self.clock.monotonic()
         if remaining > 0:
             raise RateLimited(
-                f"binance has banned this IP for another {remaining:.0f}s; not sending",
+                f"binance told this IP to wait another {remaining:.0f}s; not sending",
                 retry_after=remaining,
             )
-        try:
-            return await self._http.request(
-                "GET", path, params=params, rate_key=rate_key
-            )
-        except VenueError as exc:
-            if exc.status != 418:
-                raise
-            found = _BANNED_UNTIL.search(str(exc))
-            retry_after = (
+        return await self._http.request("GET", path, params=params, rate_key=rate_key)
+
+    def _map_error(
+        self, status: int, body: bytes, headers: Mapping[str, str]
+    ) -> IsmetError:
+        if status != 418:
+            return map_response_error(status, body, headers)
+        text = body.decode("utf-8", errors="replace")[:500]
+        waits = [_SHORTEST_BAN_SECONDS, retry_after_seconds(headers) or 0.0]
+        found = _BANNED_UNTIL.search(text)
+        if found:
+            waits.append(
                 int(found.group(1)) / _MS_PER_SECOND - self.clock.now().timestamp()
-                if found
-                else None
             )
-            self._banned_until = self.clock.monotonic() + (
-                _SHORTEST_BAN_SECONDS if retry_after is None else retry_after
+        return RateLimited(
+            f"binance has banned this IP: HTTP 418: {text}", retry_after=max(waits)
+        )
+
+    def _hold_when_limited(self, info: RequestInfo) -> None:
+        if isinstance(info.error, RateLimited) and info.error.retry_after is not None:
+            self._hold_until = max(
+                self._hold_until, self.clock.monotonic() + info.error.retry_after
             )
-            raise RateLimited(
-                f"binance has banned this IP: {exc}", retry_after=retry_after
-            ) from exc
 
     async def _symbol_info(self, ticker: str) -> Mapping[str, Any]:
         payload = await self._get(
@@ -406,7 +425,7 @@ class BinanceProvider(Provider):
                     interval,
                     received,
                     currency,
-                    as_of=normalize.copy_made_at(response.headers, received),
+                    as_of=copy_made_at(response.headers, received),
                 )
             )
             if len(rows) < self._klines_per_request:
@@ -465,34 +484,45 @@ class BinanceProvider(Provider):
         }
         generation = 0
 
-        def decode(raw: str | bytes) -> tuple[datetime, int, Any]:
-            return self.clock.now(), generation, loads_decimal(raw)
+        def decode(raw: str | bytes) -> tuple[datetime, int, int, Any]:
+            return self.clock.now(), generation, ws.stats.dropped, loads_decimal(raw)
+
+        async def before_connect() -> None:
+            await self._limiter.acquire(_WS_CONNECT)
 
         async def on_connect(ws: WebSocketTransport) -> None:
             nonlocal generation
             generation += 1
-            await self._limiter.acquire(_WS_CONNECT)
             await ws.send_json(request)
 
         ws = WebSocketTransport(
             self._ws_url,
             on_connect=on_connect,
+            before_connect=before_connect,
             on_state=self._ws_on_state,
             backoff=self._ws_backoff,
             max_reconnects=self._ws_max_reconnects,
             queue_size=self._ws_queue_size,
             backpressure=self._ws_backpressure,
             decode=decode,
-            is_data=lambda item: number_field in item[2],
+            is_data=lambda item: number_field in item[3],
         )
         gate = StreamGate(contiguous=contiguous)
         seen_generation = 1
+        seen_dropped = 0
+        newest_drop = self._ws_backpressure is BackpressurePolicy.DROP_NEWEST
         self._streams.add(ws)
         try:
             await ws.start()
-            async for received, frame_generation, frame in ws.messages():
-                if frame_generation != seen_generation:
-                    seen_generation = frame_generation
+            async for (
+                received,
+                frame_generation,
+                dropped_before,
+                frame,
+            ) in ws.messages():
+                dropped = dropped_before if newest_drop else ws.stats.dropped
+                if frame_generation != seen_generation or dropped != seen_dropped:
+                    seen_generation, seen_dropped = frame_generation, dropped
                     gate.mark_reconnected()
                 if number_field not in frame:
                     self._control(frame)
@@ -557,10 +587,10 @@ class BinanceProvider(Provider):
             rank = search_rank(needle, ticker, info["baseAsset"], info["quoteAsset"])
             if rank is None:
                 continue
-            target = Symbol(venue=BINANCE_VENUE, ticker=ticker)
             try:
+                target = Symbol(venue=BINANCE_VENUE, ticker=ticker)
                 instrument = normalize.instrument_from_symbol_info(info, target)
-            except ValidationError:
+            except (ValidationError, TransportError, ValueError):
                 skipped += 1
                 continue
             ranked.append((not instrument.active, rank, ticker, instrument))
@@ -580,9 +610,7 @@ __all__ = [
     "MAX_DEPTH",
     "MAX_KLINES_PER_REQUEST",
     "RATE_LIMITS",
-    "REQUEST_WEIGHT_PER_MINUTE",
     "REST_URL",
-    "WS_CONNECTIONS_PER_5_MINUTES",
     "WS_URL",
     "BinanceProvider",
 ]

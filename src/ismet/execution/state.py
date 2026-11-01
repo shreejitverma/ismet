@@ -52,9 +52,9 @@ class _Next(Enum):
     """Back to a replace whose outcome is still open, else the fill count's status."""
 
 
-_LIVE_WORKING = (S.ACCEPTED, S.PARTIALLY_FILLED)
-_PENDING = (S.PENDING_CANCEL, S.PENDING_REPLACE)
-_ALL_LIVE = (S.SUBMITTING, S.UNKNOWN, *_LIVE_WORKING, *_PENDING)
+WORKING_STATUSES = (S.ACCEPTED, S.PARTIALLY_FILLED)
+PENDING_STATUSES = (S.PENDING_CANCEL, S.PENDING_REPLACE)
+_ALL_LIVE = (S.SUBMITTING, S.UNKNOWN, *WORKING_STATUSES, *PENDING_STATUSES)
 
 Target = OrderStatus | _Next
 
@@ -373,7 +373,9 @@ def apply_event(state: OrderState, event: OrderEvent) -> OrderState:
     Requested terms last only while the outcome of the request is open.
     """
     updated = _apply(state, event)
-    if updated.status in (*_PENDING, S.UNKNOWN) or not _has_pending_terms(updated):
+    if updated.status in (*PENDING_STATUSES, S.UNKNOWN) or not _has_pending_terms(
+        updated
+    ):
         return updated
     return replace(updated, pending_quantity=None, pending_limit_price=None)
 
@@ -408,14 +410,10 @@ def _apply(state: OrderState, event: OrderEvent) -> OrderState:
     if isinstance(event, Replaced):
         return _apply_replaced(state, next_state, event)
     if isinstance(event, ReplaceRejected):
-        settled = replace(next_state, pending_quantity=None, pending_limit_price=None)
-        if settled.filled_quantity > settled.quantity:
-            return _note(
-                settled,
-                f"overfill: {settled.filled_quantity} filled against "
-                f"{settled.quantity}",
-            )
-        return settled
+        return _note_exposed_overfill(
+            state,
+            replace(next_state, pending_quantity=None, pending_limit_price=None),
+        )
     if isinstance(event, CancelRejected):
         return replace(next_state, reject_reason=event.reason, reject_code=event.code)
     if isinstance(
@@ -423,6 +421,17 @@ def _apply(state: OrderState, event: OrderEvent) -> OrderState:
     ):
         return next_state
     raise OrderStateError(f"unhandled event kind {event.kind}")  # pragma: no cover
+
+
+def _note_exposed_overfill(before: OrderState, after: OrderState) -> OrderState:
+    """A replace settling below what has filled is an overfill the fill did not see."""
+    if before.filled_quantity > _fill_ceiling(before):
+        return after  # already raised when the fill landed
+    if after.filled_quantity <= after.quantity:
+        return after
+    return _note(
+        after, f"overfill: {after.filled_quantity} filled against {after.quantity}"
+    )
 
 
 def _apply_replaced(
@@ -448,7 +457,8 @@ def _apply_replaced(
         pending_limit_price=None,
         venue_order_id=event.venue_order_id or state.venue_order_id,
     )
-    if next_state.status in _LIVE_WORKING or next_state.status is S.FILLED:
+    updated = _note_exposed_overfill(state, updated)
+    if next_state.status in WORKING_STATUSES or next_state.status is S.FILLED:
         return replace(updated, status=_working_status(updated))
     return updated
 
@@ -468,7 +478,9 @@ def replay(events: Iterable[OrderEvent]) -> dict[str, OrderState]:
 
 
 __all__ = [
+    "PENDING_STATUSES",
     "TRANSITIONS",
+    "WORKING_STATUSES",
     "OrderState",
     "apply_event",
     "fill_adds_detail",

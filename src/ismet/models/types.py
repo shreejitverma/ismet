@@ -12,6 +12,7 @@ tick sizes, and lot sizes have narrower domains and their own types.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from enum import Enum
@@ -29,11 +30,17 @@ from ismet.refdata.identifiers import (
     validate_sedol,
 )
 
+_DECIMAL_TEXT = re.compile(
+    r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?|[+-]?(?:nan|snan|inf|infinity)",
+    re.ASCII | re.IGNORECASE,
+)
+
 
 def to_decimal(value: Any) -> Decimal:
     """Coerce ``value`` to a finite ``Decimal`` without going through float.
 
-    Accepts ``Decimal``, ``int`` (not ``bool``), and numeric strings.
+    Accepts ``Decimal``, ``int`` (not ``bool``), and numeric strings in ASCII digits
+    with no separators, which is narrower than what ``Decimal()`` itself reads.
     Rejects ``float``, ``bool``, NaN, infinities, and magnitudes outside the
     range exact arithmetic is guaranteed for (see :mod:`ismet.models.decimals`).
     """
@@ -49,8 +56,11 @@ def to_decimal(value: Any) -> Decimal:
     elif isinstance(value, int):
         result = Decimal(value)
     elif isinstance(value, str):
+        text = value.strip()
+        if _DECIMAL_TEXT.fullmatch(text) is None:
+            raise ValueError(f"not a decimal number: {value!r}")
         try:
-            result = Decimal(value.strip())
+            result = Decimal(text)
         except InvalidOperation as exc:
             raise ValueError(f"not a decimal number: {value!r}") from exc
     else:

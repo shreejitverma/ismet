@@ -20,7 +20,6 @@ import tempfile
 import traceback
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -36,18 +35,20 @@ from ismet.errors import (
     CalendarOutOfRange,
     ConfigError,
     IsmetError,
+    JournalError,
     NotSupported,
     ValidationError,
 )
 from ismet.execution.journal import (
     RecordKind,
     SqliteJournal,
+    VerifyResult,
     chain_contains,
     export_jsonl,
 )
 from ismet.execution.manager import events_of
 from ismet.execution.state import replay
-from ismet.models import Symbol
+from ismet.models import Symbol, to_decimal
 from ismet.providers import ProviderRegistry
 from ismet.sync import as_datetime
 
@@ -579,6 +580,15 @@ def _require_named(args: argparse.Namespace, help_text: str) -> None:
             )
 
 
+def _require_intact(result: VerifyResult, refused: str) -> None:
+    """A running manager ignores this write on a broken chain, so do not pretend."""
+    if not result.ok:
+        raise JournalError(
+            f"{refused}: journal failed verification at record "
+            f"{result.first_bad_seq}: {result.detail}"
+        )
+
+
 def _kill(args: argparse.Namespace) -> int:
     if args.action is None:
         raise _UsageError("kill needs an action", "ismet kill --help")
@@ -597,6 +607,9 @@ def _kill(args: argparse.Namespace) -> int:
     else:
         journal = _existing_journal(args.journal)
     try:
+        chain = None if args.action == "engage" else journal.verify()
+        if args.action == "release" and chain is not None:
+            _require_intact(chain, "kill switch not released")
         state = journal.kill_state()
         if args.action == "engage":
             wants_cancel = not args.keep_orders
@@ -629,9 +642,21 @@ def _kill(args: argparse.Namespace) -> int:
                 "reason": state.reason or "none",
                 "operator": state.operator or "none",
                 "cancel_open": state.cancel_open,
+                **(
+                    {}
+                    if chain is None
+                    else {
+                        "chain": (
+                            "intact"
+                            if chain.ok
+                            else f"broken at record {chain.first_bad_seq}: "
+                            f"{chain.detail}; a release here would be ignored"
+                        )
+                    }
+                ),
             }
         )
-        return EXIT_OK
+        return EXIT_OK if chain is None or chain.ok else EXIT_FAILED
     finally:
         journal.close()
 
@@ -642,17 +667,17 @@ def _position(args: argparse.Namespace) -> int:
     _require_named(args, "ismet position --help")
     symbol = Symbol.parse(args.symbol)
     try:
-        delta = Decimal(args.delta)
-    except ArithmeticError:
-        raise _UsageError(
-            f"--delta {args.delta!r} is not a number", "ismet position --help"
-        ) from None
-    if not delta.is_finite():
-        raise _UsageError(
-            f"--delta {args.delta!r} is not a number", "ismet position --help"
-        )
+        delta = to_decimal(args.delta)
+    except ValueError as exc:
+        raise _UsageError(f"--delta: {exc}", "ismet position --help") from None
     journal = _existing_journal(args.journal)
     try:
+        _require_intact(journal.verify(), "position not adjusted")
+        if not any(r.kind is RecordKind.POSITION_BASELINE for r in journal.records()):
+            raise ConfigError(
+                "this journal has no position baseline, so a running manager would "
+                "ignore the adjustment"
+            )
         record = journal.append(
             RecordKind.POSITION_ADJUSTED,
             json.dumps(
@@ -710,9 +735,6 @@ def _error_hint(exc: Exception) -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     """Entry point. Returns the process exit code."""
     arguments = list(sys.argv[1:] if argv is None else argv)
-    if arguments in (["-v"], ["-V"], ["--version"]):
-        print(_version())
-        return EXIT_OK
     if not arguments:
         return _home()
     try:

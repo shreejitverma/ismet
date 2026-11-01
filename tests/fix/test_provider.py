@@ -26,7 +26,7 @@ from ismet.errors import (
 )
 from ismet.fix.message import encode_fields, format_utc_timestamp
 from ismet.fix.provider import FixDialect, FixProvider, ReportQuarantinedError
-from ismet.fix.session import SequenceTooLowError, SessionState
+from ismet.fix.session import SequenceTooLowError, SessionFailedError, SessionState
 from ismet.fix.store import FixStore, FixStoreError, MemoryFixStore, SqliteFixStore
 from ismet.models import Symbol
 from ismet.models.orders import (
@@ -1588,8 +1588,10 @@ class TestOrderStatus:
     ) -> None:
         provider = await make_provider()
         await provider.place_order(order())
+        assert [s.client_order_id for s in await provider.open_orders()] == ["C1"]
         acceptor.faults.status_unknown_via_business_reject = True
         assert await provider.order_status("C1", ACME) is None
+        assert await provider.open_orders() == []
 
     @pytest.mark.parametrize("reason", ["0", "3", "4", "6"])
     async def test_other_business_rejects_raise(
@@ -2412,6 +2414,152 @@ class TestBustsSurviveACrash:
         assert isinstance(stream.error, SequenceTooLowError)
 
 
+class TestALostFillSeenInCumQty:
+    """A venue may gap-fill a report it no longer holds, and FIX says no more.
+
+    The oracle is the venue's cumulative quantity: FIX defines CumQty(14) as the total
+    executed on the order, so a value above the fills received means one never arrived.
+    """
+
+    @staticmethod
+    async def _lose_a_fill(acceptor: FixAcceptor) -> None:
+        """The next number is never sent, so a resend answers it with a GapFill."""
+        venue_order = acceptor.orders["C1"]
+        venue_order.filled = Decimal(40)
+        acceptor.faults.skip_seq_next = 1
+
+    @pytest.mark.parametrize(
+        ("exec_type", "ord_status", "closing"),
+        [("4", "4", Canceled), ("C", "C", Expired)],
+    )
+    async def test_a_close_above_the_fills_received_halts(
+        self,
+        acceptor: FixAcceptor,
+        make_provider: ProviderFactory,
+        exec_type: str,
+        ord_status: str,
+        closing: type[Any],
+    ) -> None:
+        provider = await make_provider()
+        stream = Stream(provider)
+        await provider.place_order(order())
+        await self._lose_a_fill(acceptor)
+        await acceptor.exec_report("C1", exec_type, ord_status)
+        await eventually(lambda: isinstance(stream.error, ReportQuarantinedError))
+        assert acceptor.resend_requests_answered >= 1
+        assert stream.of(closing) == []
+        assert [e.status for e in stream.of(Restated)] == [OrderStatus.UNKNOWN]
+        rows = await provider.quarantined()
+        assert [(q.msg_type, q.halted) for q in rows] == [("8", True)]
+        with pytest.raises(ReportQuarantinedError):
+            await provider.place_order(order("C2"))
+        assert "C2" not in acceptor.orders
+
+    async def test_a_status_reply_does_not_hide_the_loss_from_a_later_report(
+        self, acceptor: FixAcceptor, make_provider: ProviderFactory
+    ) -> None:
+        provider = await make_provider()
+        stream = Stream(provider)
+        await provider.place_order(order())
+        await self._lose_a_fill(acceptor)
+        await acceptor.send("0", [])
+        snapshot = await provider.order_status("C1", ACME)
+        assert snapshot is not None
+        assert snapshot.filled_quantity == Decimal(40)
+        await acceptor.exec_report("C1", "4", "4")
+        await eventually(lambda: isinstance(stream.error, ReportQuarantinedError))
+        assert stream.of(Canceled) == []
+
+    async def test_a_fill_that_also_shows_a_loss_is_still_booked(
+        self, acceptor: FixAcceptor, make_provider: ProviderFactory
+    ) -> None:
+        provider = await make_provider()
+        stream = Stream(provider)
+        await provider.place_order(order())
+        await self._lose_a_fill(acceptor)
+        await acceptor.fill("C1", "10", "5")
+        await eventually(lambda: isinstance(stream.error, ReportQuarantinedError))
+        assert [e.fill.quantity for e in stream.of(Filled)] == [Decimal(10)]
+
+    async def test_every_fill_received_is_no_loss(
+        self, acceptor: FixAcceptor, make_provider: ProviderFactory
+    ) -> None:
+        provider = await make_provider()
+        stream = Stream(provider)
+        await provider.place_order(order())
+        await acceptor.fill("C1", "40", "5")
+        await acceptor.exec_report("C1", "4", "4")
+        await eventually(lambda: bool(stream.of(Canceled)))
+        assert stream.error is None
+        assert await provider.quarantined() == []
+
+
+class TestRequestsThatCannotBeFramed:
+    async def test_an_order_that_cannot_be_encoded_leaves_no_row(
+        self, acceptor: FixAcceptor, make_provider: ProviderFactory
+    ) -> None:
+        provider = await make_provider()
+        with pytest.raises(VenueError) as info:
+            await provider.place_order(order(account="A\x01B"))
+        assert info.value.code == "INVALID_FIELD"
+        assert acceptor.orders == {}
+        ack = await provider.place_order(order(account="AB"))
+        assert ack.client_order_id == "C1"
+        assert acceptor.orders["C1"].quantity == Decimal(100)
+
+    async def test_an_amend_that_cannot_be_encoded_uses_no_client_order_id(
+        self, acceptor: FixAcceptor, make_provider: ProviderFactory
+    ) -> None:
+        provider = await make_provider()
+        await provider.place_order(order())
+        with pytest.raises(VenueError) as info:
+            await provider.amend_order("C1", ACME, quantity=Decimal("NaN"))
+        assert info.value.code == "INVALID_FIELD"
+        assert acceptor.of_type("G") == []
+        await provider.amend_order("C1", ACME, quantity=Decimal(50))
+        assert [m.get(11) for m in acceptor.of_type("G")] == ["C1~1"]
+
+
+class TestSessionRecovery:
+    async def test_an_empty_msg_type_is_consumed_and_what_follows_arrives(
+        self, acceptor: FixAcceptor, make_provider: ProviderFactory
+    ) -> None:
+        provider = await make_provider()
+        stream = Stream(provider)
+        await provider.place_order(order())
+        seq = acceptor.next_out
+        body = (
+            f"35=\x0149=VENUE\x0156=CLIENT\x0134={seq}\x0152={_now_text()}\x01"
+        ).encode()
+        head = f"8=FIX.4.4\x019={len(body)}\x01".encode() + body
+        acceptor.next_out += 1
+        connections = acceptor.connections
+        await acceptor.write(head + f"10={sum(head) % 256:03d}\x01".encode())
+        await acceptor.wait_until(lambda: bool(acceptor.of_type("3")))
+        reject = acceptor.of_type("3")[0]
+        assert reject.get(45) == str(seq)
+        assert reject.get(373) == "4"  # FIX SessionRejectReason: no value for the tag
+        assert reject.get(371) == "35"
+        await acceptor.fill("C1", "40", "5")
+        await eventually(lambda: bool(stream.of(Filled)))
+        assert acceptor.connections == connections
+        assert [q.halted for q in await provider.quarantined()] == [False]
+
+    async def test_a_retried_open_keeps_a_terminal_failure_visible(
+        self, acceptor: FixAcceptor, make_provider: ProviderFactory
+    ) -> None:
+        provider = await make_provider()
+        await acceptor.send_raw_seq(1, "0", [])
+        await eventually(lambda: provider.session.failure is not None)
+        with pytest.raises(SequenceTooLowError):
+            await provider.open()
+        stream = Stream(provider)
+        await eventually(lambda: stream.error is not None)
+        assert isinstance(stream.error, SequenceTooLowError)
+        with pytest.raises(SessionFailedError):
+            await provider.place_order(order())
+
+
 class TestHaltsAreDurable:
     async def _quarantine_one(
         self, store: FixStore, make_provider: ProviderFactory, acceptor: FixAcceptor
@@ -2487,6 +2635,8 @@ class TestHaltsAreDurable:
         provider = await self._quarantine_one(store, make_provider, acceptor)
         with pytest.raises(ValidationError, match="operator"):
             await provider.release_quarantine(operator="", reason="no one", expected=1)
+        with pytest.raises(ValidationError, match="reason"):
+            await provider.release_quarantine(operator="op", reason=" ", expected=1)
         stopped = Stream(provider)
         await eventually(lambda: stopped.error is not None)
 

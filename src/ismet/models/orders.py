@@ -264,7 +264,6 @@ class EventOrigin(str, Enum):
     OMS = "oms"
     VENUE = "venue"
     RECONCILE = "reconcile"
-    OPERATOR = "operator"
 
 
 class _Event(BaseModel):

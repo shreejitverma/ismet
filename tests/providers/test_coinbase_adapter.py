@@ -23,8 +23,6 @@ from ismet.errors import (
 from ismet.models import Interval, QualityFlag, Symbol
 from ismet.providers.coinbase import (
     RATE_LIMITS,
-    REST_URL,
-    WS_URL,
     CoinbaseProvider,
 )
 from ismet.refdata import validate_currency
@@ -34,10 +32,20 @@ from ismet.transport.clock import ManualClock
 from ismet.transport.ratelimit import TokenBucket
 from ismet.transport.ws import ConnectionState
 
-from ._support import FAST_BACKOFF, FIXTURES, frames, manifest, replay, session, take
+from ._support import (
+    FAST_BACKOFF,
+    FIXTURES,
+    body,
+    frames,
+    manifest,
+    replay,
+    session,
+    take,
+)
 
 BTC = Symbol(venue="ZCBS", ticker="BTC-USD")
 UTC = timezone.utc
+_HTTP_DATE = "%a, %d %b %Y %H:%M:%S GMT"
 ISO = "%Y-%m-%dT%H:%M:%SZ"
 
 
@@ -65,8 +73,6 @@ def test_declares_exactly_the_market_data_capabilities() -> None:
 
 
 def test_default_hosts_and_settings() -> None:
-    assert REST_URL == "https://api.exchange.coinbase.com"
-    assert WS_URL == "wss://ws-feed.exchange.coinbase.com"
     settings = ProviderSettings(
         name="coinbase", options={"rest_url": "https://a.example", "ws_url": "wss://b"}
     )
@@ -641,6 +647,100 @@ async def test_a_copy_that_predates_the_window_is_not_an_empty_answer() -> None:
         with pytest.raises(TransportError, match="predates") as caught:
             await provider.bars(BTC, Interval.M1, opened, opened + timedelta(minutes=2))
     assert caught.value.retryable
+
+
+@pytest.mark.parametrize(
+    "now_offset",
+    [
+        pytest.param(timedelta(seconds=10), id="only-the-open-bucket"),
+        pytest.param(timedelta(minutes=-5), id="wholly-in-the-future"),
+    ],
+)
+async def test_a_window_with_no_closed_bucket_is_empty_however_old_the_copy(
+    now_offset: timedelta,
+) -> None:
+    opened = datetime(2026, 11, 1, 12, 30, tzinfo=UTC)
+    now = opened + now_offset
+    provider = CoinbaseProvider(
+        http_transport=httpx.MockTransport(
+            lambda _: httpx.Response(
+                200,
+                json=[],
+                headers={"date": now.strftime(_HTTP_DATE), "age": "20"},
+            )
+        ),
+        retry_policy=NO_RETRY,
+        clock=ManualClock(now),
+    )
+    async with provider:
+        bars = await provider.bars(
+            BTC, Interval.M1, opened, opened + timedelta(minutes=1)
+        )
+    assert bars == []
+
+
+async def test_a_rate_limit_longer_than_the_retry_cap_is_not_retried_early() -> None:
+    seen = 0
+
+    def respond(_: httpx.Request) -> httpx.Response:
+        nonlocal seen
+        seen += 1
+        return httpx.Response(429, headers={"Retry-After": "300"})
+
+    provider = CoinbaseProvider(http_transport=httpx.MockTransport(respond))
+    async with provider:
+        with pytest.raises(RateLimited) as caught:
+            await provider.quote(BTC)
+    assert caught.value.retry_after == 300
+    assert seen == 1
+
+
+async def test_search_leaves_out_a_listing_with_an_unreadable_increment() -> None:
+    good = body("coinbase", "instruments", "/products")
+    good = good[0] if isinstance(good, list) else good
+    bad_increment = dict(good, id=good["id"] + "X", base_increment="0")
+    bad_flag = dict(good, id=good["id"] + "Y", trading_disabled="false")
+    bad_symbol = dict(good, id="")
+    payload = [bad_increment, bad_flag, bad_symbol, good]
+    provider = CoinbaseProvider(
+        http_transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, content=json.dumps(payload, default=str))
+        )
+    )
+    async with provider:
+        hits = await provider.search(good["base_currency"])
+    assert [hit.symbol.ticker for hit in hits] == [good["id"]]
+
+
+@pytest.mark.parametrize(
+    ("interval", "documented_seconds"),
+    [
+        (Interval.M1, 60),
+        (Interval.M5, 300),
+        (Interval.M15, 900),
+        (Interval.H1, 3600),
+        (Interval.D1, 86400),
+    ],
+)
+async def test_a_bars_request_carries_the_documented_granularity(
+    interval: Interval, documented_seconds: int
+) -> None:
+    sent: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        sent.append(parse_qs(urlsplit(str(request.url)).query)["granularity"][0])
+        return httpx.Response(200, json=[])
+
+    start = datetime(2026, 11, 1, tzinfo=UTC)
+    provider = CoinbaseProvider(
+        http_transport=httpx.MockTransport(respond),
+        clock=ManualClock(start + timedelta(days=30)),
+    )
+    async with provider:
+        await provider.bars(
+            BTC, interval, start, start + timedelta(seconds=documented_seconds)
+        )
+    assert sent == [str(documented_seconds)]
 
 
 async def test_an_empty_window_in_a_fresh_copy_is_still_no_trades() -> None:

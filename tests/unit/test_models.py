@@ -146,3 +146,15 @@ def test_instrument_alignment_helpers(sym: Symbol) -> None:
     assert not inst.is_lot_aligned(D(150))
     assert inst.round_price(D("10.13"), Rounding.FLOOR) == D("10.10")
     assert inst.multiplier == D(1)
+
+
+def test_an_instrument_minimum_quantity_cannot_exceed_its_maximum() -> None:
+    with pytest.raises(ValidationError):
+        Instrument(
+            symbol=Symbol(venue="ZSIM", ticker="ACME"),
+            name="Acme",
+            currency="USD",
+            tick_size="0.01",
+            min_quantity="10",
+            max_quantity="1",
+        )

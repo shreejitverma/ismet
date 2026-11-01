@@ -6,7 +6,7 @@ import subprocess
 import sys
 import textwrap
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from pathlib import Path
 
 import pytest
@@ -46,6 +46,7 @@ UTC = timezone.utc
 D = Decimal
 SYM = Symbol(venue="XNYS", ticker="ACME")
 DAY = datetime(2026, 3, 9, 14, 30, tzinfo=UTC)
+XNYS = get_calendar("XNYS")
 
 
 def bar(ts: datetime = DAY, close: str = "10.10", **kw: object) -> Bar:
@@ -595,11 +596,6 @@ def test_descriptive_symbol_fields_are_not_a_revision(store: BarStore) -> None:
     assert store.checksum(*span) == before
 
 
-def test_formatting_of_a_price_is_not_a_revision(store: BarStore) -> None:
-    store.write([bar(close="10.10")])
-    assert store.write([bar(close="10.1")]).unchanged == 1
-
-
 def _at(ts: datetime, symbol: Symbol) -> Bar:
     return bar(ts=ts, symbol=symbol, interval=Interval.H1, session_date=None)
 
@@ -726,6 +722,156 @@ async def test_an_empty_window_cutting_through_a_session_is_not_proven_empty(
         calendar=get_calendar("XNYS"),
     )
     assert report.windows_empty_unproven == 1 and not report.complete
+
+
+def flat_bar(ts: datetime, price: str, **kw: object) -> Bar:
+    return bar(ts, close=price, open=price, high=price, low=price, **kw)
+
+
+def test_a_read_refuses_a_range_on_two_price_scales(store: BarStore) -> None:
+    next_day = DAY + timedelta(days=1)
+    store.write([flat_bar(DAY, "100")])
+    store.write([flat_bar(next_day, "50", adjustment=Adjustment.SPLIT)])
+    whole = (SYM, Interval.D1, DAY, next_day + timedelta(minutes=1))
+    with pytest.raises(ValidationError, match="split"):
+        store.read(*whole)
+    with pytest.raises(ValidationError, match="split"):
+        store.checksum(*whole)
+    assert [b.close for b in store.read(SYM, Interval.D1, DAY, next_day)] == [D("100")]
+
+
+def test_the_digest_ignores_a_low_ambient_precision(store: BarStore) -> None:
+    span_of_day = (SYM, Interval.D1, DAY, DAY + timedelta(minutes=1))
+    with localcontext() as ctx:
+        ctx.prec = 3
+        store.write([bar(close="10.01")])
+        assert store.write([bar(close="10.01")]).unchanged == 1
+        assert store.write([bar(close="10.02")]).revised == 1
+    assert store.read(*span_of_day)[0].close == D("10.02")
+
+
+def test_a_restatement_past_the_default_precision_is_kept(store: BarStore) -> None:
+    span_of_day = (SYM, Interval.D1, DAY, DAY + timedelta(minutes=1))
+    store.write([bar(volume="1234567890123.123456789012345678")])
+    restated = "1234567890123.123456789012345999"
+    assert store.write([bar(volume=restated)]).revised == 1
+    assert store.read(*span_of_day)[0].volume == D(restated)
+
+
+async def test_a_skipped_window_cannot_hide_a_missing_session(store: BarStore) -> None:
+    monday = datetime(2026, 3, 9, tzinfo=UTC)
+    saturday = monday + timedelta(days=5)
+    only_monday = bar(DAY, session_date=date(2026, 3, 9))
+
+    async def fetch(symbol, interval, start, end):  # type: ignore[no-untyped-def]
+        return [only_monday]
+
+    args = (fetch, store, SYM, Interval.D1, monday, saturday)
+    first = await backfill(*args, window=timedelta(days=5))
+    assert first.complete and first.windows_fetched == 1
+    report = await backfill(*args, window=timedelta(days=5), calendar=XNYS)
+    assert not report.complete
+    assert report.windows_skipped == 0 and report.windows_incomplete == 1
+    assert report.sessions_missing == [
+        date(2026, 3, 10),
+        date(2026, 3, 11),
+        date(2026, 3, 12),
+        date(2026, 3, 13),
+    ]
+
+
+async def test_a_window_finished_from_a_later_start_reopens_for_an_earlier_one(
+    store: BarStore,
+) -> None:
+    # NYSE opens at 13:30 UTC on 2026-03-09, so a run from 14:00 does not require it.
+    late = datetime(2026, 3, 9, 14, tzinfo=UTC)
+    day = timedelta(days=1)
+    tuesday_bar = bar(late + timedelta(hours=23), session_date=date(2026, 3, 10))
+
+    async def fetch(symbol, interval, start, end):  # type: ignore[no-untyped-def]
+        return [b for b in [tuesday_bar] if start <= b.exchange_ts < end]
+
+    end = late + day
+    first = await backfill(
+        fetch, store, SYM, Interval.D1, late, end, window=day, calendar=XNYS
+    )
+    assert first.complete
+    again = await backfill(
+        fetch, store, SYM, Interval.D1, late - day, end, window=day, calendar=XNYS
+    )
+    assert again.windows_skipped == 0
+    assert again.sessions_missing == [date(2026, 3, 9)]
+    assert not again.complete
+
+
+async def test_a_clean_rerun_with_a_calendar_still_skips_without_fetching(
+    store: BarStore,
+) -> None:
+    monday = datetime(2026, 3, 9, tzinfo=UTC)
+    calls = 0
+
+    async def fetch(symbol, interval, start, end):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        return [bar(DAY, session_date=date(2026, 3, 9))]
+
+    args = (fetch, store, SYM, Interval.D1, monday, monday + timedelta(days=1))
+    assert (await backfill(*args, calendar=XNYS)).complete
+    rerun = await backfill(*args, calendar=XNYS)
+    assert rerun.complete and rerun.windows_skipped == 1
+    assert calls == 1
+
+
+def test_an_undated_daily_bar_outside_a_session_cannot_count_as_present(
+    store: BarStore,
+) -> None:
+    midnight = datetime(2026, 3, 10, tzinfo=UTC)
+    store.write([bar(midnight, session_date=None)])
+    with pytest.raises(ValidationError, match="session_date"):
+        store.missing_sessions(SYM, XNYS, date(2026, 3, 9), date(2026, 3, 10))
+
+
+def test_an_undated_daily_bar_inside_a_session_takes_that_session(
+    store: BarStore,
+) -> None:
+    store.write([bar(DAY, session_date=None)])
+    assert store.missing_sessions(SYM, XNYS, date(2026, 3, 9), date(2026, 3, 10)) == [
+        date(2026, 3, 10)
+    ]
+
+
+def test_records_carry_flags_derived_from_the_data() -> None:
+    ts = DAY
+    # A bid above the ask is crossed by definition.
+    crossed = Quote(symbol=SYM, exchange_ts=ts, received_ts=ts, bid="11", ask="10")
+    assert to_records([crossed])[0]["quality"] == "crossed"
+    skewed = bar(ts, received_ts=ts - timedelta(seconds=5))
+    assert to_records([skewed])[0]["quality"] == "clock_skew"
+    assert to_records([bar(ts)])[0]["quality"] == ""
+
+
+def test_polars_refuses_a_column_whose_shared_scale_overflows() -> None:
+    pytest.importorskip("polars")
+    # Each close fits alone. Together: 23 integer digits and 19 fractional digits.
+    wide = flat_bar(DAY, "12345678901234567890123.5")
+    fine = flat_bar(DAY + timedelta(days=1), "0.1234567890123456789")
+    assert to_polars([wide])["close"].to_list() == [wide.close]
+    assert to_polars([fine])["close"].to_list() == [fine.close]
+    series = BarSeries([wide, fine])
+    with pytest.raises(ValidationError, match="lossy_float"):
+        series.to_polars()
+    assert series.to_polars(lossy_float=True)["close"].null_count() == 0
+
+
+def test_polars_keeps_exactly_38_digits_without_loss() -> None:
+    pytest.importorskip("polars")
+    # The polars Decimal type holds a precision of 38 at most.
+    top = "1" * 19 + "." + "2" * 19
+    frame = to_polars([flat_bar(DAY, top)])
+    assert frame["close"].dtype.is_decimal()
+    assert frame["close"].to_list() == [D(top)]
+    with pytest.raises(ValidationError, match="lossy_float"):
+        to_polars([flat_bar(DAY, "1" + top)])
 
 
 def test_polars_names_the_way_out_when_decimals_are_too_wide() -> None:

@@ -97,7 +97,6 @@ class TestGolden:
         ]
         message = decode(encode("FIX.4.4", fields))
         assert list(message.fields) == fields
-        assert message.get_all(600) == ["AAA", "BBB"]
         assert message.get(600) == "AAA"
 
     def test_data_field_may_hold_delimiters(self) -> None:
@@ -367,13 +366,6 @@ class TestStreamParser:
         assert out[0].defect is not None
         assert out[0].defect.reason == 4
         assert out[0].defect.tag == 55
-
-    def test_reset_forgets_a_partial_frame(self) -> None:
-        parser = FixStreamParser()
-        parser.feed(GOLDEN[:10])
-        parser.reset()
-        assert parser.buffered == 0
-        assert parser.feed(GOLDEN) == [decode(GOLDEN)]
 
     def test_limit_must_be_positive(self) -> None:
         with pytest.raises(ValueError, match="positive"):

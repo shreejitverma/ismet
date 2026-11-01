@@ -7,7 +7,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from ismet.errors import SequenceGap
+from ismet.errors import SequenceGap, ValidationError
 from ismet.marketdata import BookBuilder, BookDelta
 from ismet.models import QualityFlag, Symbol
 from ismet.models.orders import OrderSide
@@ -38,6 +38,73 @@ def test_snapshot_orders_levels_and_limits_depth() -> None:
     shallow = snap(synced(), 1)
     assert len(shallow.bids) == len(shallow.asks) == 1
     assert synced().depth_counts() == (2, 2)
+
+
+def _raising_rows():  # type: ignore[no-untyped-def]
+    yield (D(8), D(1))
+    raise RuntimeError("feed broke mid-iteration")
+
+
+@pytest.mark.parametrize(
+    ("bids", "error"),
+    [
+        (_raising_rows, RuntimeError),
+        (lambda: [(D(8),)], ValidationError),
+        (lambda: [(D("NaN"), D(1))], ValidationError),
+        (lambda: [(D(8), D(-1))], ValidationError),
+        (lambda: [(D(8), D("NaN"))], ValidationError),
+    ],
+)
+def test_a_bad_snapshot_leaves_the_book_exactly_as_it_was(bids, error) -> None:  # type: ignore[no-untyped-def]
+    book = synced()
+    before = snap(book)
+    with pytest.raises(error):
+        book.apply_snapshot(200, bids(), [])
+    assert book.is_synced
+    assert book.last_sequence == 100
+    assert snap(book) == before
+
+
+def test_a_bad_snapshot_keeps_buffered_deltas_for_the_next_one() -> None:
+    book = BookBuilder(SYM)
+    book.apply_delta(BookDelta(BUY, D(10), D(5), 101))
+    with pytest.raises(ValidationError):
+        book.apply_snapshot(100, [(D("NaN"), D(1))], [])
+    assert not book.is_synced
+    assert book.apply_snapshot(100, [], [])
+    assert snap(book).bids[0].price == 10
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"price": D("NaN"), "size": D(1), "sequence": 1},
+        {"price": D(1), "size": D("NaN"), "sequence": 1},
+        {"price": D(1), "size": D(-1), "sequence": 1},
+        {"price": D(1), "size": D(1), "sequence": "1"},
+        {"price": D(1), "size": D(1), "sequence": 5, "first_sequence": 6},
+    ],
+)
+def test_an_impossible_delta_cannot_be_built(fields) -> None:  # type: ignore[no-untyped-def]
+    with pytest.raises(ValidationError):
+        BookDelta(BUY, **fields)
+
+
+def test_a_negative_price_is_a_real_level() -> None:
+    delta = BookDelta(BUY, D("-37.63"), D(1), 1)
+    assert delta.price == D("-37.63")
+
+
+def test_depth_below_one_is_refused_not_read_as_a_slice() -> None:
+    with pytest.raises(ValidationError):
+        snap(synced(), -1)
+    with pytest.raises(ValidationError):
+        snap(synced(), 0)
+
+
+def test_a_zero_buffer_is_refused_at_construction() -> None:
+    with pytest.raises(ValidationError):
+        BookBuilder(SYM, max_buffered=0)
 
 
 def test_deltas_insert_update_and_remove() -> None:

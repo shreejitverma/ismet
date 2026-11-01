@@ -17,7 +17,6 @@ from datetime import date, datetime, time, timezone
 from queue import Empty, Full, Queue
 from typing import Any, TypeVar
 
-from ismet.calendars import TradingCalendar, get_calendar
 from ismet.capabilities import Capability
 from ismet.client import IsmetClient
 from ismet.config import Settings
@@ -160,9 +159,6 @@ class IsmetSyncClient:
     def capabilities(self, provider: str) -> frozenset[Capability]:
         return self._client.capabilities(provider)
 
-    def calendar(self, venue: str) -> TradingCalendar:
-        return get_calendar(venue)
-
     # Calls
 
     def quote(
@@ -241,6 +237,8 @@ class IsmetSyncClient:
         under a running iterator raises in the consumer, rather than looking like the
         stream simply ended. Nothing here can block the event loop or hang the consumer.
         """
+        if maxsize < 1:
+            raise ValidationError(f"buffer must be at least 1, got {maxsize}")
         if self._loop is None:
             raise ConfigError("client is not open; use it in a 'with' block")
         loop = self._loop

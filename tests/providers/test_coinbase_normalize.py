@@ -23,7 +23,7 @@ from ismet.models import (
     datetime_from_ns,
 )
 from ismet.normalize import coinbase as nc
-from ismet.normalize._common import parse_iso8601_utc
+from ismet.normalize._common import copy_made_at, parse_iso8601_utc
 
 from ._support import RECEIVED, body, frames, manifest, session
 
@@ -74,14 +74,14 @@ def test_a_book_without_a_time_is_refused_rather_than_presented_as_fresh(
 def test_copy_made_at_is_date_minus_age_and_never_after_receipt() -> None:
     received = datetime(2026, 11, 1, 2, 10, 1, tzinfo=timezone.utc)
     headers = {"date": "Sun, 01 Nov 2026 02:10:01 GMT", "age": "82"}
-    assert nc.copy_made_at(headers, received) == datetime(
+    assert copy_made_at(headers, received) == datetime(
         2026, 11, 1, 2, 8, 39, tzinfo=timezone.utc
     )
     ahead = {"date": "Sun, 01 Nov 2026 02:10:05 GMT"}
-    assert nc.copy_made_at(ahead, received) == received
-    assert nc.copy_made_at({}, received) == received
-    assert nc.copy_made_at({"date": "not a date"}, received) == received
-    assert nc.copy_made_at({"date": headers["date"], "age": "x"}, received) == received
+    assert copy_made_at(ahead, received) == received
+    assert copy_made_at({}, received) == received
+    assert copy_made_at({"date": "not a date"}, received) == received
+    assert copy_made_at({"date": headers["date"], "age": "x"}, received) == received
 
 
 def test_order_book_maps_levels_with_counts_and_slices_to_depth() -> None:
@@ -305,5 +305,49 @@ def test_malformed_payloads_become_non_retryable_transport_errors(
     assert caught.value.retryable is False
 
 
-def test_granularity_map_is_documented_values_only() -> None:
-    assert set(nc.CANDLE_GRANULARITY.values()) <= {60, 300, 900, 3600, 21600, 86400}
+def test_granularity_map_gives_each_interval_its_own_length() -> None:
+    assert nc.CANDLE_GRANULARITY
+    for interval, seconds in nc.CANDLE_GRANULARITY.items():
+        assert seconds == interval.nominal_seconds
+
+
+def _candle(opened: object) -> list[object]:
+    return [opened, "1", "2", "1", "1.5", "3"]
+
+
+@pytest.mark.parametrize(
+    "opened",
+    [
+        pytest.param(1_762_000_030, id="off-the-grid"),
+        pytest.param(Decimal("1762000020.5"), id="fractional"),
+        pytest.param("1762000020", id="text"),
+        pytest.param(None, id="null"),
+    ],
+)
+def test_a_candle_time_off_the_bucket_grid_is_refused(opened: object) -> None:
+    with pytest.raises(TransportError) as caught:
+        nc.bars_from_candles(
+            [_candle(opened)], BTC, Interval.M1, RECEIVED, "USD", as_of=RECEIVED
+        )
+    assert caught.value.retryable is False
+
+
+@pytest.mark.parametrize("field", ["sequence", "trade_id"])
+@pytest.mark.parametrize("bad", ["7", None, True])
+def test_a_match_number_must_be_an_integer(field: str, bad: object) -> None:
+    frame = dict(frames("coinbase", "matches")[1])
+    frame[field] = bad
+    with pytest.raises(TransportError):
+        nc.trade_from_match(frame, BTC, RECEIVED, "USD")
+
+
+@pytest.mark.parametrize("field", ["trading_disabled", "cancel_only"])
+@pytest.mark.parametrize("bad", ["false", 0, None])
+def test_a_listing_flag_must_be_a_boolean(field: str, bad: object) -> None:
+    product = dict(body("coinbase", "instruments", "/products"))
+    product["status"] = "online"
+    product["trading_disabled"] = False
+    product["cancel_only"] = False
+    product[field] = bad
+    with pytest.raises(TransportError):
+        nc.instrument_from_product(product, BTC)

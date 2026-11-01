@@ -149,6 +149,12 @@ class Instrument(BaseModel):
                 raise ValueError(f"option is missing {', '.join(missing)}")
         elif self.option_right is not None or self.strike is not None:
             raise ValueError("option_right and strike apply only to options")
+        if (
+            self.min_quantity is not None
+            and self.max_quantity is not None
+            and self.min_quantity > self.max_quantity
+        ):
+            raise ValueError("min_quantity is above max_quantity")
         if self.asset_class is AssetClass.FUTURE and self.expiry is None:
             raise ValueError("future is missing expiry")
         if (

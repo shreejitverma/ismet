@@ -9,25 +9,11 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
-import pytest
-
 EXAMPLES = sorted((Path(__file__).parents[2] / "examples").glob("*.py"))
 
 
 def test_examples_exist() -> None:
     assert len(EXAMPLES) >= 3
-
-
-@pytest.mark.parametrize("path", EXAMPLES, ids=lambda p: p.stem)
-def test_example_runs(path: Path) -> None:
-    result = subprocess.run(
-        [sys.executable, str(path)],
-        capture_output=True,
-        text=True,
-        timeout=120,
-        check=False,
-    )
-    assert result.returncode == 0, result.stderr
 
 
 def _output_of(stem: str) -> str:

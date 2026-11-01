@@ -32,7 +32,14 @@ import asyncio
 import contextlib
 import json
 import logging
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Iterable,
+    Mapping,
+)
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -73,13 +80,15 @@ from ismet.execution.journal import (
 from ismet.execution.reconcile import BreakKind, ReconBreak, ReconReport
 from ismet.execution.risk import RiskConfig, RiskContext, RiskEngine
 from ismet.execution.state import (
+    PENDING_STATUSES,
+    WORKING_STATUSES,
     OrderState,
     apply_event,
     fill_adds_detail,
     fill_contradicts,
     new_order,
 )
-from ismet.models import Instrument, Quote, Symbol
+from ismet.models import Instrument, Quote, Symbol, to_decimal
 from ismet.models.decimals import absolute, add, mul, sub
 from ismet.models.orders import (
     Acknowledged,
@@ -118,8 +127,6 @@ EventHook = Callable[[OrderEvent, OrderState], None]
 BreakHook = Callable[[ReconBreak], None]
 AnomalyHook = Callable[[str, str], None]
 CheckpointHook = Callable[[str, str], None]
-_WORKING = (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED)
-_PENDING = (OrderStatus.PENDING_CANCEL, OrderStatus.PENDING_REPLACE)
 _RESOLVE = (OrderStatus.SUBMITTING, OrderStatus.UNKNOWN)
 # A fill after a cancel is an ordinary race, recorded but not a reason to stop. A fill
 # on an order believed never accepted or never sent means the books were wrong.
@@ -143,9 +150,19 @@ def _net_quantities(positions: Iterable[Position]) -> dict[Symbol, Decimal]:
     return net
 
 
-def _fill_terms(fill: Fill) -> tuple[str, str, str, str, str]:
+def _orphan_fill_subject(fill: Fill) -> str:
+    """A fill id is unique only per order, so an orphan is named by both."""
+    return f"{fill.client_order_id}:{fill.fill_id}"
+
+
+def _is_halting(anomaly: str) -> bool:
+    return any(tag in anomaly for tag in _HALTING_ANOMALIES)
+
+
+def _fill_terms(fill: Fill) -> tuple[str, str, str, str, str, str]:
     """A fill report's identity and what it says traded, as one hashable key."""
     return (
+        fill.client_order_id,
         fill.fill_id,
         str(fill.symbol),
         fill.side.value,
@@ -183,9 +200,11 @@ class OrderManager:
     on closed orders, because a position check misses offsetting losses and a venue with
     no account API has no position check at all. Positions must disagree for longer than
     ``unknown_grace`` to count, since brokers' position views lag their fills.
-    ``stream_settle`` is the delay before a follow-up reconciliation after the execution
-    stream connects, covering the time a subscription takes to go live. ``None`` skips
-    the follow-up.
+    ``stream_settle`` is how long a newly connected execution stream must survive, or
+    deliver an event, before it counts as up. New orders are refused until then, and
+    :meth:`start` waits out the first one. A follow-up reconciliation then covers the
+    time the subscription took to go live. ``None`` trusts the stream once subscribed
+    and skips the follow-up.
 
     A gross limit values positions at current market marks, never at cost basis. Each
     new order refreshes the marks of every held symbol older than the risk config's
@@ -262,7 +281,6 @@ class OrderManager:
         self._created_at: dict[str, datetime] = {}
         self._baseline: dict[Symbol, Decimal] | None = None
         self._unknown_since: dict[str, float] = {}
-        self._in_flight: set[str] = set()
         self._submitting: set[str] = set()
         self._placing: set[str] = set()
         self._cancel_before_send: set[str] = set()
@@ -275,7 +293,7 @@ class OrderManager:
         self._last_sweep: datetime | None = None
         self._durable_sweep: datetime | None = None
         self._reported_orphan_fills: set[str] = set()
-        self._reported_corrections: set[tuple[str, str, str, str, str]] = set()
+        self._reported_corrections: set[tuple[str, str, str, str, str, str]] = set()
         self._sweep_floor: datetime | None = None
         self._adjustments_seen = 0
         self._journalled_config: RiskConfig | None = None
@@ -283,6 +301,7 @@ class OrderManager:
         self._position_suspect_since: dict[Symbol, float] = {}
         self._journal_failed: str | None = None
         self.stream_healthy = False
+        self._stream_judged = asyncio.Event()
 
         self._executor: ThreadPoolExecutor | None = None
         self._state_lock = asyncio.Lock()
@@ -310,7 +329,8 @@ class OrderManager:
     ) -> ReconReport:
         """Verify and replay the journal, reconcile, and start background work.
 
-        Returns the first reconciliation. A journal that fails verification raises
+        Returns the first reconciliation, once the execution stream has held up for
+        ``stream_settle`` or failed. A journal that fails verification raises
         :class:`~ismet.errors.JournalError`, and nothing starts. Pass the head hash
         saved from an earlier run as ``expected_head_hash`` to also detect a truncated
         or replaced journal, which is otherwise self-consistent.
@@ -356,6 +376,8 @@ class OrderManager:
             )
         await self._establish_baseline()
         self._started = True
+        self.stream_healthy = False
+        self._stream_judged.clear()
         for symbol in self._symbols_with_exposure():
             await self._instrument(symbol)
         report = await self.reconcile()
@@ -364,7 +386,7 @@ class OrderManager:
             asyncio.create_task(self._reconcile_loop(), name="ismet-oms-reconcile"),
             asyncio.create_task(self._kill_loop(), name="ismet-oms-kill"),
         ]
-        await asyncio.sleep(0)  # let the stream loop subscribe before the first order
+        await self._stream_judged.wait()
         return report
 
     async def stop(self, *, cancel_open: bool = False) -> list[OrderState]:
@@ -460,6 +482,7 @@ class OrderManager:
         self._durable_sweep = None
         # With no clean sweep on record, every fill since the first record is unproven.
         self._last_sweep = records[0].ts if records else None
+        halting: tuple[int, str] | None = None
         for record in records:
             if record.kind is RecordKind.SWEEP_MARK:
                 self._durable_sweep = datetime.fromisoformat(
@@ -487,9 +510,13 @@ class OrderManager:
                     if isinstance(event, Filled) and fill_contradicts(
                         prior, event.fill
                     ):
-                        # Already raised once; a sweep finding it again must not halt.
+                        # Raised below if it never was; a sweep must not halt again.
                         self._reported_corrections.add(_fill_terms(event.fill))
-                    self._store(apply_event(prior, event))
+                    state = apply_event(prior, event)
+                    self._store(state)
+                    for message in state.anomalies[len(prior.anomalies) :]:
+                        if _is_halting(message):
+                            halting = (record.seq, f"order {cid}: {message}")
                 else:
                     raise JournalError(f"event {event.kind} for {cid} has no intent")
             elif record.kind is RecordKind.POSITION_BASELINE:
@@ -501,6 +528,9 @@ class OrderManager:
         self._adjustments_seen = records[-1].seq if records else 0
         self._marks.clear()  # replayed fills are history, not the market now
         self._kill = await self._call_journal(self._journal.kill_state)
+        if halting is not None and halting[0] > self._kill.seq:
+            # The process died between recording the anomaly and recording its halt.
+            await self._halt(halting[1])
         for state in list(self._open.values()):
             if state.status is OrderStatus.PENDING_SUBMIT:
                 await self._never_sent(state.client_order_id)
@@ -629,9 +659,14 @@ class OrderManager:
         atomically with other events. A conclusion drawn from a query is out of date
         once a newer event has landed.
         """
-        task = asyncio.create_task(
+        return await self._uncancellable(
             self._record_now(event, durable=durable, only_if=only_if)
         )
+
+    @staticmethod
+    async def _uncancellable(work: Coroutine[Any, Any, T]) -> T:
+        """Finish ``work`` before honouring a cancellation of the caller."""
+        task = asyncio.create_task(work)
         try:
             return await asyncio.shield(task)
         except asyncio.CancelledError:
@@ -727,7 +762,7 @@ class OrderManager:
                 self._on_anomaly(cid, message)
             except Exception:
                 logger.exception("on_anomaly hook failed")
-        if self._started and any(tag in message for tag in _HALTING_ANOMALIES):
+        if self._started and _is_halting(message):
             await self._halt(f"order {cid}: {message}")
 
     async def wait_for(
@@ -767,8 +802,10 @@ class OrderManager:
         down, and the record is retried until it lands. Cancels are retried by a
         background sweep until nothing is open. Engaging when already engaged keeps the
         original reason and can only widen the action: a later automatic halt cannot
-        stop a cancel sweep an operator asked for.
+        stop a cancel sweep an operator asked for. That judgment reads the journal
+        first, since memory may predate a release or an engage from another process.
         """
+        await self._refresh_kill()
         current = self._kill
         if current.engaged:
             if current.cancel_open or not cancel_open:
@@ -790,8 +827,16 @@ class OrderManager:
 
     async def _halt(self, reason: str) -> None:
         """Stop new orders without touching what is open, unless already engaged."""
+        await self._refresh_kill()
         if not self._kill.engaged:
             await self.engage_kill(reason, operator="oms", cancel_open=False)
+
+    async def _refresh_kill(self) -> None:
+        """Adopt the journal's kill state. With the journal down, memory stands."""
+        try:
+            await self._merge_kill(await self._call_journal(self._journal.kill_state))
+        except Exception:
+            logger.exception("could not read the kill switch from the journal")
 
     async def _record_kill(self) -> None:
         """Try to make an engaged kill durable. A restart must not lose it."""
@@ -804,6 +849,8 @@ class OrderManager:
             self._journal_failed = str(exc)
             logger.critical("kill switch could not be journalled: %s", exc)
             return
+        if self._kill_unrecorded is not payload:
+            return  # superseded during the write, by a wider engage or a release
         self._kill_unrecorded = None
         self._kill = KillState(
             True,
@@ -815,8 +862,10 @@ class OrderManager:
 
     async def release_kill(self, reason: str, *, operator: str) -> KillState:
         """Allow new orders again. Requires a named operator; journalled."""
-        if not operator.strip():
-            raise ValidationError("releasing the kill switch requires an operator")
+        if not operator.strip() or not reason.strip():
+            raise ValidationError(
+                "releasing the kill switch requires an operator and reason"
+            )
         record = await self._append(
             RecordKind.KILL_RELEASED, {"reason": reason, "operator": operator}
         )
@@ -1128,8 +1177,6 @@ class OrderManager:
 
     async def _send(self, request: OrderRequest) -> OrderState:
         cid = request.client_order_id
-        # In flight until the outcome is recorded, so reconcile cannot race the result.
-        self._in_flight.add(cid)
         try:
             if self._orders[cid].status is not OrderStatus.PENDING_SUBMIT:
                 return self._orders[cid]
@@ -1150,7 +1197,6 @@ class OrderManager:
             self._placing.add(cid)
             return await self._place(request)
         finally:
-            self._in_flight.discard(cid)
             self._placing.discard(cid)
 
     def _send_refusal(self, cid: str) -> str | None:
@@ -1369,7 +1415,7 @@ class OrderManager:
     ) -> OrderRequest:
         """What would be live after the amend: the unfilled part, on the new terms."""
         state = self.order(client_order_id)
-        if state.status not in _WORKING:
+        if state.status not in WORKING_STATUSES:
             raise OrderStateError(
                 f"cannot amend {client_order_id} in {state.status.value}"
             )
@@ -1406,6 +1452,10 @@ class OrderManager:
             raise ConfigError(
                 "this venue's position is unknown, so it cannot be adjusted"
             )
+        try:
+            delta = to_decimal(delta)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(f"invalid position delta: {exc}") from exc
         await self._append(
             RecordKind.POSITION_ADJUSTED,
             {
@@ -1458,6 +1508,7 @@ class OrderManager:
                     return
             for record in adjustments:
                 self._apply_adjustment(record)
+                self._adjustments_seen = record.seq
             if records:
                 self._adjustments_seen = records[-1].seq
 
@@ -1486,11 +1537,8 @@ class OrderManager:
                 )
             detail = f"{event.kind} from venue for an order ismet never sent: {payload}"
             if isinstance(event, Filled):
-                fill_id = event.fill.fill_id
-                if fill_id in self._reported_orphan_fills:
-                    return
-                self._reported_orphan_fills.add(fill_id)
-                item = ReconBreak(BreakKind.ORPHAN_FILL, fill_id, detail)
+                subject = _orphan_fill_subject(event.fill)
+                item = ReconBreak(BreakKind.ORPHAN_FILL, subject, detail)
             else:
                 item = ReconBreak(BreakKind.ORPHAN_ORDER, cid, detail)
             await self._report_break(item)
@@ -1508,11 +1556,9 @@ class OrderManager:
 
     async def _consume_stream(self, stream: AsyncIterator[OrderEvent]) -> None:
         async for event in stream:
+            self.stream_healthy = True  # it delivered, so it exists
+            self._stream_judged.set()
             await self._on_venue_event(event)
-
-    async def _settled_reconcile(self, delay: float) -> None:
-        await asyncio.sleep(delay)
-        await self._reconcile_quietly()
 
     async def _reconcile_quietly(self) -> None:
         try:
@@ -1536,19 +1582,21 @@ class OrderManager:
                 await asyncio.sleep(0)
                 if attempt:
                     await self._reconcile_quietly()
+                await asyncio.wait({consumer}, timeout=self._stream_settle or 0)
                 if not consumer.done():
                     self.stream_healthy = True
-                    attempt = 0
-                if self._stream_settle is not None:
-                    settled = asyncio.create_task(
-                        self._settled_reconcile(self._stream_settle)
-                    )
+                    self._stream_judged.set()
+                    if self._stream_settle is not None:
+                        settled = asyncio.create_task(self._reconcile_quietly())
                 await consumer
                 raise TransportError("execution stream ended")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                if self.stream_healthy:
+                    attempt = 0  # only a stream that held up restarts the backoff
                 self.stream_healthy = False
+                self._stream_judged.set()
                 logger.warning("execution stream lost: %s", exc)
             finally:
                 for task in (consumer, settled):
@@ -1568,7 +1616,7 @@ class OrderManager:
             await asyncio.sleep(interval)
             elapsed += interval
             has_unknown = any(
-                o.status in _RESOLVE and o.client_order_id not in self._in_flight
+                o.status in _RESOLVE and o.client_order_id not in self._submitting
                 for o in self._open.values()
             )
             due = elapsed >= self._reconcile_interval
@@ -1577,12 +1625,26 @@ class OrderManager:
                 await self._reconcile_quietly()
 
     async def _report_break(self, item: ReconBreak) -> None:
+        await self._uncancellable(self._report_break_now(item))
+
+    async def _report_break_now(self, item: ReconBreak) -> None:
+        """Report one break: the halt first, since a crash may stop what follows.
+
+        An orphan fill counts as reported only here. Until then every pass finds it
+        again, and once its record is durable a restart does not.
+        """
+        if item.kind is BreakKind.ORPHAN_FILL:
+            if item.subject in self._reported_orphan_fills:
+                return
+            self._reported_orphan_fills.add(item.subject)
         logger.error(
             "reconciliation break: %s %s: %s",
             item.kind.value,
             item.subject,
             item.detail,
         )
+        if item.is_critical and self._halt_on_break:
+            await self._halt(f"reconciliation break: {item.kind.value} {item.subject}")
         with contextlib.suppress(IsmetError, OSError):
             await self._append(
                 RecordKind.RECON_BREAK,
@@ -1597,8 +1659,6 @@ class OrderManager:
                 self._on_break(item)
             except Exception:
                 logger.exception("on_break hook failed")
-        if item.is_critical and self._halt_on_break:
-            await self._halt(f"reconciliation break: {item.kind.value} {item.subject}")
 
     async def reconcile(self) -> ReconReport:
         """Compare every open order, the venue's open orders, and positions.
@@ -1611,7 +1671,7 @@ class OrderManager:
             await self._merge_adjustments()
             for state in self.open_orders():
                 cid = state.client_order_id
-                if cid in self._in_flight or cid in self._submitting:
+                if cid in self._submitting:
                     # Its send has not returned, so "not found" would mean nothing.
                     continue
                 report.orders_checked += 1
@@ -1741,7 +1801,7 @@ class OrderManager:
     def _status_differs(self, state: OrderState, snapshot: VenueOrderSnapshot) -> bool:
         if state.status is snapshot.status:
             return False
-        if state.status in _PENDING and snapshot.status in _WORKING:
+        if state.status in PENDING_STATUSES and snapshot.status in WORKING_STATUSES:
             # A cancel or replace the venue has not processed yet is not a disagreement,
             # until it has gone unanswered for too long.
             sent = self._change_requested_at.get(state.client_order_id)
@@ -1827,7 +1887,8 @@ class OrderManager:
     async def _book_fills(self, fills: Iterable[Fill], report: ReconReport) -> None:
         """Record what a venue query knows and this manager does not.
 
-        A fill on an unknown order is reported once. It reaches the journal, so an
+        A fill on an unknown order is reported once, per order and fill id, since a fill
+        id is unique only per order. It reaches the journal, so an
         operator's release of the halt it causes is final, even across a restart. A
         known fill reported with other terms is recorded too, which raises the same
         halting anomaly the stream would, once per fill and set of terms, so the
@@ -1836,12 +1897,13 @@ class OrderManager:
         for fill in fills:
             state = self._orders.get(fill.client_order_id)
             if state is None:
-                if fill.fill_id not in self._reported_orphan_fills:
-                    self._reported_orphan_fills.add(fill.fill_id)
+                subject = _orphan_fill_subject(fill)
+                found = {b.subject for b in report.breaks}
+                if subject not in self._reported_orphan_fills | found:
                     report.breaks.append(
                         ReconBreak(
                             BreakKind.ORPHAN_FILL,
-                            fill.fill_id,
+                            subject,
                             f"{fill.side.value} {fill.quantity} {fill.symbol} at "
                             f"{fill.price} on {fill.client_order_id}, which ismet "
                             "never sent",

@@ -17,7 +17,7 @@ from enum import Enum
 
 from ismet.errors import SequenceGap
 from ismet.models import Bar, MarketEvent, OrderBook, Quote, Symbol, Trade
-from ismet.models.decimals import absolute, add, mul, ratio, sub
+from ismet.models.decimals import absolute, midpoint, mul, ratio, sub
 from ismet.models.types import QualityFlag
 from ismet.transport.ws import SequenceObservation, SequenceOutcome, SequenceTracker
 
@@ -199,7 +199,7 @@ class QualityMonitor:
         elif isinstance(event, OrderBook):
             bid = event.best_bid.price if event.best_bid else None
             ask = event.best_ask.price if event.best_ask else None
-            mid = ratio(add(bid, ask), Decimal(2)) if bid and ask else None
+            mid = midpoint(bid, ask) if bid is not None and ask is not None else None
             prices = (mid, bid, ask, None)
         else:
             return None
@@ -240,21 +240,23 @@ class QualityMonitor:
         if price is None:
             return issues
         previous = self._last_price.get(symbol)
-        if previous is not None and previous != 0:
-            move = _bps_between(price, previous)
-            if move > limits.outlier_bps:
-                issues.append(
-                    QualityIssue(
-                        symbol,
-                        Issue.OUTLIER,
-                        f"{price} moved {move:.1f} bps from {previous}",
-                    )
-                )
-                if not self._confirmed(symbol, price):
-                    return issues  # the good level stands until this is confirmed
+        outlier = None if previous is None else self._outlier(price, previous)
+        if outlier is not None:
+            issues.append(QualityIssue(symbol, Issue.OUTLIER, outlier))
+            if not self._confirmed(symbol, price):
+                return issues  # the good level stands until this is confirmed
         self._candidate.pop(symbol, None)
         self._last_price[symbol] = price
         return issues
+
+    def _outlier(self, price: Decimal, previous: Decimal) -> str | None:
+        """Why ``price`` is an outlier. A move off zero has no size in bps."""
+        if previous == 0:
+            return None if price == 0 else f"{price} moved off a price of 0"
+        move = _bps_between(price, previous)
+        if move <= self.thresholds.outlier_bps:
+            return None
+        return f"{price} moved {move:.1f} bps from {previous}"
 
     def _confirmed(self, symbol: Symbol, price: Decimal) -> bool:
         held, count = self._candidate.get(symbol, (price, 0))

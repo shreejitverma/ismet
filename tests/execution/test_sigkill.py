@@ -52,12 +52,11 @@ CHILD = textwrap.dedent(
 
     class DurableVenue(SimVenue):
         async def place_order(self, request):
-            ack = await super().place_order(request)
             with open(log_path, "a") as log:
                 log.write(request.model_dump_json() + "\\n")
                 log.flush()
                 os.fsync(log.fileno())
-            return ack
+            return await super().place_order(request)
 
     def die(step, cid):
         if step == kill_step:

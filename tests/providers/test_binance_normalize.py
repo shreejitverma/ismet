@@ -6,6 +6,7 @@ import json
 from datetime import date, timedelta
 from decimal import Decimal
 from itertools import pairwise
+from typing import Any
 
 import pytest
 
@@ -318,7 +319,64 @@ def test_float_is_impossible_because_prices_keep_their_text() -> None:
     assert str(price) == frame["p"]
 
 
-def test_interval_map_covers_only_documented_values() -> None:
-    documented = {"1s", "1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w", "1M"}
-    assert set(nb.KLINE_INTERVALS.values()) == documented
-    assert set(nb.KLINE_INTERVALS) == set(Interval)
+def test_interval_map_names_each_interval_by_its_own_vendor_code() -> None:
+    assert {interval: interval.value for interval in Interval} == nb.KLINE_INTERVALS
+
+
+def _kline(open_ms: object, close_ms: object) -> list[object]:
+    return [open_ms, "1", "2", "0", "1", "3", close_ms, "9", 4]
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        pytest.param(_kline(60_000, 60_000), id="closes-at-its-open"),
+        pytest.param(_kline(60_000, 1_000_000), id="wrong-width"),
+        pytest.param(_kline(60_000, 30_000), id="closes-before-open"),
+        pytest.param(_kline("60000", 119_999), id="open-is-text"),
+        pytest.param(_kline(60_000, "119999"), id="close-is-text"),
+        pytest.param(_kline(None, 119_999), id="open-is-null"),
+    ],
+)
+def test_a_kline_whose_close_does_not_end_its_interval_is_refused(row: object) -> None:
+    with pytest.raises(TransportError) as caught:
+        nb.bars_from_klines([row], BTC, Interval.M1, RECEIVED, "USDT", as_of=RECEIVED)  # type: ignore[list-item]
+    assert caught.value.retryable is False
+
+
+def test_a_month_kline_has_no_fixed_width_to_check() -> None:
+    bars = nb.bars_from_klines(
+        [_kline(0, 2_678_399_999)], BTC, Interval.MO1, RECEIVED, "USDT", as_of=RECEIVED
+    )
+    assert len(bars) == 1
+
+
+@pytest.mark.parametrize(
+    ("call", "payload"),
+    [
+        (nb.quote_from_depth, {"lastUpdateId": None, "bids": [], "asks": []}),
+        (nb.quote_from_depth, {"lastUpdateId": "7", "bids": [], "asks": []}),
+        (nb.order_book_from_depth, {"lastUpdateId": True, "bids": [], "asks": []}),
+    ],
+)
+def test_a_depth_sequence_must_be_an_integer(call: Any, payload: Any) -> None:
+    with pytest.raises(TransportError):
+        call(payload, BTC, RECEIVED, "USDT")
+
+
+@pytest.mark.parametrize(
+    ("field", "bad"), [("m", "false"), ("m", 0), ("t", "7"), ("t", None)]
+)
+def test_a_trade_frame_with_the_wrong_json_type_is_refused(
+    field: str, bad: object
+) -> None:
+    frame = dict(frames("binance", "trade")[0])
+    frame[field] = bad
+    with pytest.raises(TransportError):
+        nb.trade_from_frame(frame, BTC, RECEIVED, "USDT")
+
+
+def test_a_book_ticker_update_id_must_be_an_integer() -> None:
+    frame = dict(frames("binance", "book_ticker")[0], u="7")
+    with pytest.raises(TransportError):
+        nb.quote_from_book_ticker(frame, BTC, RECEIVED, "USDT")

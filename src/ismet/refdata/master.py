@@ -209,7 +209,8 @@ class CorporateAction:
     """An action taking effect at the open of ``ex_date``.
 
     For a split or stock dividend, ``ratio`` is new shares per old share (a 4-for-1
-    split is 4). For a cash dividend, ``amount`` is per share. Rights, spin-offs, and
+    split is 4). For a cash dividend, ``amount`` is per share, unless a ``price_factor``
+    is given instead. Rights, spin-offs, and
     mergers are recorded for lifecycle purposes, and they are not auto-adjusted here:
     their factors depend on values this module does not have. Supply them to
     :func:`adjust_bars` as an explicit ``price_factor``.
@@ -237,8 +238,21 @@ class CorporateAction:
             self.ratio is None or self.ratio <= 0
         ):
             raise ValidationError(f"{self.kind.value} requires a positive ratio")
-        if self.kind is ActionKind.CASH_DIVIDEND and self.amount is None:
-            raise ValidationError("cash dividend requires an amount")
+        if self.kind in (ActionKind.SPLIT, ActionKind.STOCK_DIVIDEND) and (
+            self.price_factor is not None
+        ):
+            raise ValidationError(
+                f"{self.kind.value} takes a ratio, which also scales volume, and not a "
+                "price_factor"
+            )
+        if self.price_factor is not None and self.price_factor <= 0:
+            raise ValidationError(f"price_factor {self.price_factor} must be positive")
+        if self.kind is ActionKind.CASH_DIVIDEND and (
+            self.amount is None and self.price_factor is None
+        ):
+            raise ValidationError("cash dividend requires an amount or a price_factor")
+        if self.amount is not None and self.amount < 0:
+            raise ValidationError(f"amount {self.amount} must not be negative")
 
 
 @dataclass(frozen=True)
@@ -331,12 +345,25 @@ def _actions_in_force(actions: Iterable[CorporateAction]) -> list[CorporateActio
     return current
 
 
-def _trading_date(bar: Bar, calendar: TradingCalendar | None) -> date:
-    """A bar's venue trading date, which can differ from its UTC date."""
+def trading_date(bar: Bar, calendar: TradingCalendar) -> date:
+    """A bar's venue trading date, which can differ from its UTC date.
+
+    An intraday bar's time falls on it. A daily, weekly, or monthly bar's stamp is a
+    vendor's convention, such as midnight UTC, so with no ``session_date`` its time must
+    be inside a session, and otherwise :class:`~ismet.errors.ValidationError` is raised.
+    """
     if bar.session_date is not None:
         return bar.session_date
-    resolved = calendar if calendar is not None else get_calendar(bar.symbol.venue)
-    return resolved.local_date(bar.exchange_ts)
+    if bar.interval.seconds is not None:
+        return calendar.local_date(bar.exchange_ts)
+    session = calendar.session_of(bar.exchange_ts)
+    if session is None:
+        raise ValidationError(
+            f"{bar.interval.value} bar of {bar.symbol} at "
+            f"{bar.exchange_ts.isoformat()} has no session_date and is outside every "
+            "session, so its trading date is unknown; supply session_date"
+        )
+    return session.date
 
 
 def _closes_before_dividends(
@@ -401,7 +428,7 @@ def adjust_bars(
         today = venue_calendar.local_date(known_at)
         known = [a for a in known if a.known_from <= known_at and a.ex_date <= today]
     usable = _actions_in_force(known)
-    dates = [_trading_date(bar, venue_calendar) for bar in ordered]
+    dates = [trading_date(bar, venue_calendar) for bar in ordered]
     closes_before = (
         _closes_before_dividends(ordered, dates, usable, venue_calendar)
         if include_dividends
@@ -429,4 +456,5 @@ __all__ = [
     "Listing",
     "SecurityMaster",
     "adjust_bars",
+    "trading_date",
 ]

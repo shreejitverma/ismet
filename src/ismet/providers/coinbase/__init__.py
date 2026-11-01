@@ -13,7 +13,9 @@ Vendor documentation, retrieved 2026-11-01:
 Rate limits. Public REST: 10 requests per second per IP, bursts to 15. Feed: 8
 requests per second per IP, bursts to 20, and 10 subscriptions per product per
 channel, so at most 10 concurrent stream calls per product here. Each is declared in
-``RATE_LIMITS``.
+``RATE_LIMITS``. The feed bucket is charged before every handshake, accepted or not. A
+rate limit that states a wait longer than the retry policy's cap is not retried,
+because a retry at the cap would come before the time the venue stated.
 
 Timestamps. ``time`` on ``/book`` and on feed frames has up to nanosecond digits,
 kept in ``exchange_ts_ns``. REST market data is served through a CDN: responses said
@@ -33,7 +35,8 @@ step was 1, ``matches`` jumps likewise, and the docs say ``matches`` can drop me
 found with ``trade_id``, consecutive per product in the same capture: a jump flags the
 next trade ``AFTER_GAP`` and logs the count. Quotes come from ``ticker``, which batches
 cascades, so nothing can show loss there, and the first quote per product after a
-reconnect is flagged. Repeats are dropped; a lower number is delivered flagged
+reconnect is flagged. A frame a dropping ``ws_backpressure`` policy discarded counts
+the same as a reconnect. Repeats are dropped; a lower number is delivered flagged
 ``OUT_OF_ORDER``. Nothing is backfilled, though the docs suggest REST for it: this
 adapter reports the gap and a consumer that needs every trade should act on it.
 ``IsmetClient`` takes its gap policy from those flags, because this adapter declares
@@ -91,9 +94,19 @@ from ismet.models import (
 )
 from ismet.models import Trade as TradeEvent
 from ismet.normalize import coinbase as normalize
-from ismet.normalize._common import StreamGate, check_range, merge_bars, search_rank
+from ismet.normalize._common import (
+    StreamGate,
+    check_range,
+    copy_made_at,
+    merge_bars,
+    search_rank,
+)
 from ismet.providers.base import Provider, max_reconnects_option
-from ismet.transport.backoff import DEFAULT_RETRY, ExponentialBackoff, RetryPolicy
+from ismet.transport.backoff import (
+    ExponentialBackoff,
+    RetryPolicy,
+    should_retry_after_stated_wait,
+)
 from ismet.transport.circuit import CircuitBreaker
 from ismet.transport.clock import SYSTEM_CLOCK, Clock
 from ismet.transport.http import Hook, HttpTransport, loads_decimal
@@ -125,6 +138,8 @@ RATE_LIMITS: Mapping[str, RateLimitSpec] = {
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _ONE_SECOND = timedelta(seconds=1)
 
+COINBASE_RETRY = RetryPolicy(should_retry=should_retry_after_stated_wait)
+
 E = TypeVar("E", bound=MarketEvent)
 
 
@@ -139,11 +154,18 @@ def _iso(seconds: int) -> str:
 
 
 def _outdated(
-    as_of: datetime, received: datetime, last_open: int, granularity: int
+    as_of: datetime,
+    received: datetime,
+    first_open: int,
+    last_open: int,
+    granularity: int,
 ) -> bool:
     """Whether a bucket in the window has closed since this copy was made."""
     closed_by_now = (received - _EPOCH) // timedelta(seconds=granularity) * granularity
-    return as_of < _EPOCH + min(last_open + granularity, closed_by_now) * _ONE_SECOND
+    closed_through = min(last_open + granularity, closed_by_now)
+    if closed_through < first_open + granularity:
+        return False
+    return as_of < _EPOCH + closed_through * _ONE_SECOND
 
 
 class CoinbaseProvider(Provider):
@@ -161,7 +183,7 @@ class CoinbaseProvider(Provider):
         timeout: float = DEFAULT_TIMEOUT,
         candles_per_request: int = MAX_CANDLES_PER_REQUEST,
         search_cache_seconds: float = 3600.0,
-        retry_policy: RetryPolicy = DEFAULT_RETRY,
+        retry_policy: RetryPolicy = COINBASE_RETRY,
         hooks: list[Hook] | None = None,
         ws_backoff: ExponentialBackoff = DEFAULT_WS_BACKOFF,
         ws_max_reconnects: int | None = None,
@@ -313,8 +335,8 @@ class CoinbaseProvider(Provider):
                 rate_key=_PUBLIC,
             )
             received = self.clock.now()
-            as_of = normalize.copy_made_at(response.headers, received)
-            outdated = _outdated(as_of, received, window_end, granularity)
+            as_of = copy_made_at(response.headers, received)
+            outdated = _outdated(as_of, received, cursor, window_end, granularity)
             page = normalize.bars_from_candles(
                 response.json(),
                 symbol,
@@ -380,34 +402,45 @@ class CoinbaseProvider(Provider):
         }
         generation = 0
 
-        def decode(raw: str | bytes) -> tuple[datetime, int, Any]:
-            return self.clock.now(), generation, loads_decimal(raw)
+        def decode(raw: str | bytes) -> tuple[datetime, int, int, Any]:
+            return self.clock.now(), generation, ws.stats.dropped, loads_decimal(raw)
+
+        async def before_connect() -> None:
+            await self._limiter.acquire(_WS_SUBSCRIBE)
 
         async def on_connect(ws: WebSocketTransport) -> None:
             nonlocal generation
             generation += 1
-            await self._limiter.acquire(_WS_SUBSCRIBE)
             await ws.send_json(request)
 
         ws = WebSocketTransport(
             self._ws_url,
             on_connect=on_connect,
+            before_connect=before_connect,
             on_state=self._ws_on_state,
             backoff=self._ws_backoff,
             max_reconnects=self._ws_max_reconnects,
             queue_size=self._ws_queue_size,
             backpressure=self._ws_backpressure,
             decode=decode,
-            is_data=lambda item: item[2].get("type") in data_types,
+            is_data=lambda item: item[3].get("type") in data_types,
         )
         gate = StreamGate(contiguous=contiguous)
         seen_generation = 1
+        seen_dropped = 0
+        newest_drop = self._ws_backpressure is BackpressurePolicy.DROP_NEWEST
         self._streams.add(ws)
         try:
             await ws.start()
-            async for received, frame_generation, frame in ws.messages():
-                if frame_generation != seen_generation:
-                    seen_generation = frame_generation
+            async for (
+                received,
+                frame_generation,
+                dropped_before,
+                frame,
+            ) in ws.messages():
+                dropped = dropped_before if newest_drop else ws.stats.dropped
+                if frame_generation != seen_generation or dropped != seen_dropped:
+                    seen_generation, seen_dropped = frame_generation, dropped
                     gate.mark_reconnected()
                 kind = frame.get("type")
                 if kind not in data_types:
@@ -420,12 +453,12 @@ class CoinbaseProvider(Provider):
                 if symbol is None:
                     logger.warning("frame for unsubscribed %s ignored", ticker)
                     continue
-                if kind == "last_match" and gate.is_fresh(ticker):
-                    gate.seed(ticker, frame[number_field])
-                    continue
                 if ticker not in currencies:
                     currencies[ticker] = normalize.quote_currency_of(ticker)
                 event = parse(frame, symbol, received, currencies[ticker])
+                if kind == "last_match" and gate.is_fresh(ticker):
+                    gate.seed(ticker, frame[number_field])
+                    continue
                 admitted = gate.admit(ticker, frame[number_field], event)
                 if admitted is not None:
                     yield admitted
@@ -473,10 +506,10 @@ class CoinbaseProvider(Provider):
             )
             if rank is None:
                 continue
-            target = Symbol(venue=COINBASE_VENUE, ticker=ticker)
             try:
+                target = Symbol(venue=COINBASE_VENUE, ticker=ticker)
                 instrument = normalize.instrument_from_product(product, target)
-            except ValidationError:
+            except (ValidationError, TransportError, ValueError):
                 skipped += 1
                 continue
             ranked.append((not instrument.active, rank, ticker, instrument))
@@ -489,6 +522,7 @@ class CoinbaseProvider(Provider):
 
 
 __all__ = [
+    "COINBASE_RETRY",
     "COINBASE_VENUE",
     "MAX_BARS",
     "MAX_CANDLES_PER_REQUEST",

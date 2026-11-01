@@ -461,8 +461,8 @@ async def test_close_is_idempotent_and_ends_messages(server_factory) -> None:  #
 
 def test_sequence_tracker() -> None:
     t = SequenceTracker()
-    assert t.observe(10) == 0
-    assert t.observe(11) == 0
-    assert t.observe(14) == 2
-    assert t.observe(13) == 0
+    assert t.classify(10).missing == 0
+    assert t.classify(11).missing == 0
+    assert t.classify(14).missing == 2
+    assert t.classify(13).missing == 0
     assert t.last == 14 and t.gaps == 1

@@ -358,7 +358,6 @@ def test_a_cash_dividend_is_retracted_with_a_neutral_price_factor() -> None:
     retraction = CorporateAction(
         ActionKind.CASH_DIVIDEND,
         ex_date,
-        amount=D(0),
         price_factor=D(1),
         known_from=datetime(2026, 3, 5, tzinfo=UTC),
     )
@@ -394,3 +393,41 @@ def test_history_follows_corrections_and_knowledge_time() -> None:
     before = datetime(2021, 1, 1, tzinfo=UTC)
     assert book.history("WRONG", known_at=before) == [wrong]
     assert book.history("RIGHT", known_at=before) == []
+
+
+@pytest.mark.parametrize(
+    ("kind", "fields"),
+    [
+        (ActionKind.SPIN_OFF, {"price_factor": D(0)}),
+        (ActionKind.SPIN_OFF, {"price_factor": D("-0.8")}),
+        (ActionKind.MERGER, {"price_factor": D(0)}),
+        (ActionKind.CASH_DIVIDEND, {"amount": D(-1)}),
+        (ActionKind.CASH_DIVIDEND, {}),
+        (ActionKind.SPLIT, {"ratio": D(4), "price_factor": D("0.25")}),
+        (ActionKind.STOCK_DIVIDEND, {"ratio": D(2), "price_factor": D("0.5")}),
+    ],
+)
+def test_impossible_action_terms_are_refused(
+    kind: ActionKind, fields: dict[str, Decimal]
+) -> None:
+    with pytest.raises(ValidationError):
+        CorporateAction(kind, date(2026, 3, 2), **fields)  # type: ignore[arg-type]
+
+
+def test_an_undated_post_split_daily_bar_at_midnight_utc_is_refused() -> None:
+    # 2026-03-09T00:00Z is 2026-03-08 in New York, outside any session, so the bar could
+    # belong to either side of a split ex 03-09, a 4x difference in price.
+    midnight = datetime(2026, 3, 9, tzinfo=UTC)
+    undated = bar(date(2026, 3, 9), "25", exchange_ts=midnight, session_date=None)
+    split = CorporateAction(ActionKind.SPLIT, date(2026, 3, 9), ratio=D(4))
+    with pytest.raises(ValidationError, match="session_date"):
+        adjust_bars([undated], [split])
+
+
+def test_an_undated_daily_bar_inside_a_session_adjusts_by_that_session() -> None:
+    # 14:30 UTC on 03-09 is in that NYSE session, on the ex-date, so it is post-split.
+    undated = bar(date(2026, 3, 9), "25", session_date=None)
+    split = CorporateAction(ActionKind.SPLIT, date(2026, 3, 9), ratio=D(4))
+    assert adjust_bars([undated], [split])[0].close == D("25")
+    before = bar(date(2026, 3, 6), "100", session_date=None)
+    assert adjust_bars([before], [split])[0].close == D("25")

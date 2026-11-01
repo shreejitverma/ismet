@@ -26,6 +26,12 @@ first connect fails or times out the task is cancelled before the error is
 raised, and a fresh ``start`` after ``close`` begins with clean failure state
 and stats and an emptied queue; the queue object itself never changes, so a
 consumer already waiting in ``messages`` keeps receiving across restarts.
+
+``before_connect`` runs before every handshake, whether or not the handshake then
+succeeds, so a provider can charge a connection budget there. A 429 rejection waits
+at least its ``Retry-After``. Under a dropping policy only data messages are dropped:
+a message ``is_data`` rejects, such as a venue's refusal, evicts the oldest instead,
+and the first drop is logged at WARNING. ``stats.dropped`` counts every message lost.
 """
 
 from __future__ import annotations
@@ -45,6 +51,7 @@ from websockets.asyncio.client import ClientConnection, connect
 
 from ismet.errors import AuthError, IsmetError, TransportError
 from ismet.transport.backoff import ExponentialBackoff
+from ismet.transport.http import retry_after_seconds
 
 logger = logging.getLogger("ismet.transport.ws")
 
@@ -93,6 +100,7 @@ _CLOSED = _Closed()
 
 OnConnect = Callable[["WebSocketTransport"], Awaitable[None]]
 OnState = Callable[[ConnectionState], None]
+BeforeConnect = Callable[[], Awaitable[None]]
 
 
 class SequenceOutcome(str, Enum):
@@ -123,10 +131,11 @@ class SequenceTracker:
     """Classify a stream of sequence numbers for one feed or symbol.
 
     A value at or below the high-water mark is a duplicate, unless a gap reported it
-    missing: then it is a late, out-of-order delivery of real data. The high-water mark
-    never moves down. Missing ranges are kept in a bounded list, so memory stays bounded
-    however many gaps a feed has; a very late delivery past that bound counts as a
-    duplicate.
+    missing: then it is a late, out-of-order delivery of real data. A value below the
+    first one seen counts the same way, once, and everything between it and that first
+    value is treated as a gap. The high-water mark never moves down. Missing ranges are
+    kept in a bounded list, so memory stays bounded however many gaps a feed has; a very
+    late delivery past that bound counts as a duplicate.
     """
 
     MAX_TRACKED_GAPS = 1024
@@ -138,7 +147,12 @@ class SequenceTracker:
         self.duplicates = 0
         self.out_of_order = 0
         self._missing: list[tuple[int, int]] = []
-        self._first: int | None = None
+        self._first = 0
+
+    def _remember_missing(self, low: int, high: int) -> None:
+        if low <= high:
+            self._missing.append((low, high))
+            del self._missing[: -self.MAX_TRACKED_GAPS]
 
     def _take_missing(self, sequence: int) -> bool:
         for index, (low, high) in enumerate(self._missing):
@@ -164,9 +178,13 @@ class SequenceTracker:
             self.last = sequence
             return SequenceObservation(SequenceOutcome.IN_ORDER, sequence, expected)
         if sequence <= last:
-            # Below the first number seen is data from before this stream's start.
-            before_start = self._first is not None and sequence < self._first
-            if before_start or self._take_missing(sequence):
+            if sequence < self._first:
+                self._remember_missing(sequence + 1, self._first - 1)
+                self._first = sequence
+                late = True
+            else:
+                late = self._take_missing(sequence)
+            if late:
                 self.out_of_order += 1
                 return SequenceObservation(
                     SequenceOutcome.OUT_OF_ORDER, sequence, expected
@@ -174,16 +192,11 @@ class SequenceTracker:
             self.duplicates += 1
             return SequenceObservation(SequenceOutcome.DUPLICATE, sequence, expected)
         missing = sequence - expected
-        self._missing.append((expected, sequence - 1))
-        del self._missing[: -self.MAX_TRACKED_GAPS]
+        self._remember_missing(expected, sequence - 1)
         self.last = sequence
         self.gaps += 1
         self.missing += missing
         return SequenceObservation(SequenceOutcome.GAP, sequence, expected, missing)
-
-    def observe(self, sequence: int) -> int:
-        """Record ``sequence``; return the number of skipped values (0 if none)."""
-        return self.classify(sequence).missing
 
     def reset(self) -> None:
         """Forget the position, for a venue that restarts sequences on reconnect."""
@@ -200,6 +213,7 @@ class WebSocketTransport:
         *,
         on_connect: OnConnect | None = None,
         on_state: OnState | None = None,
+        before_connect: BeforeConnect | None = None,
         backoff: ExponentialBackoff = DEFAULT_WS_BACKOFF,
         max_reconnects: int | None = None,
         heartbeat_interval: float | None = 20.0,
@@ -215,6 +229,7 @@ class WebSocketTransport:
         self.state = ConnectionState.IDLE
         self._on_connect = on_connect
         self._on_state = on_state
+        self._before_connect = before_connect
         self._backoff = backoff
         self._max_reconnects = max_reconnects
         self._heartbeat_interval = heartbeat_interval
@@ -340,6 +355,7 @@ class WebSocketTransport:
             if self._queue.full() and force:
                 with contextlib.suppress(asyncio.QueueEmpty):
                     self._queue.get_nowait()
+                    self._count_drop()
             try:
                 self._queue.put_nowait(item)
                 return True
@@ -347,19 +363,29 @@ class WebSocketTransport:
                 return False
         if self._queue.full():
             if self._policy is BackpressurePolicy.DROP_NEWEST:
-                self.stats.dropped += 1
+                self._count_drop()
                 return False
             with contextlib.suppress(asyncio.QueueEmpty):
                 self._queue.get_nowait()
-                self.stats.dropped += 1
+                self._count_drop()
         self._queue.put_nowait(item)
         return True
 
-    async def _put(self, item: Any) -> None:
+    def _count_drop(self) -> None:
+        self.stats.dropped += 1
+        if self.stats.dropped == 1:
+            logger.warning(
+                "websocket %s dropped a message: the consumer is behind a full queue "
+                "(%s)",
+                self.url,
+                self._policy.value,
+            )
+
+    async def _put(self, item: Any, *, is_data: bool) -> None:
         if self._policy is BackpressurePolicy.BLOCK:
             await self._queue.put(item)
         else:
-            self._enqueue(item)
+            self._enqueue(item, force=not is_data)
 
     def _fail(self, failure: IsmetError) -> None:
         self._failure = failure
@@ -381,6 +407,11 @@ class WebSocketTransport:
         failure.__cause__ = exc
         return failure
 
+    @staticmethod
+    def _stated_wait(exc: websockets.exceptions.InvalidStatus) -> float:
+        headers = {name.lower(): v for name, v in exc.response.headers.raw_items()}
+        return retry_after_seconds(headers) or 0.0
+
     async def _run(self) -> None:
         attempt = 0
         while not self._stop.is_set():
@@ -389,7 +420,10 @@ class WebSocketTransport:
             )
             reason: object = "server closed the connection"
             fatal: IsmetError | None = None
+            stated_wait = 0.0
             try:
+                if self._before_connect is not None:
+                    await self._before_connect()
                 async with connect(
                     self.url,
                     ping_interval=self._heartbeat_interval,
@@ -407,9 +441,10 @@ class WebSocketTransport:
                     async for raw in conn:
                         self.stats.received += 1
                         item = self._decode(raw)
-                        if self._is_data is None or self._is_data(item):
+                        is_data = self._is_data is None or self._is_data(item)
+                        if is_data:
                             attempt = 0
-                        await self._put(item)
+                        await self._put(item, is_data=is_data)
             except asyncio.CancelledError:
                 raise
             except websockets.exceptions.InvalidURI as exc:
@@ -423,6 +458,7 @@ class WebSocketTransport:
                 fatal = self._handshake_failure(exc)
                 if fatal is None:
                     reason = exc
+                    stated_wait = self._stated_wait(exc)
             except (
                 websockets.exceptions.WebSocketException,
                 OSError,
@@ -466,13 +502,14 @@ class WebSocketTransport:
                 reason,
                 attempt,
             )
-            await asyncio.sleep(self._backoff.delay(attempt - 1))
+            await asyncio.sleep(max(self._backoff.delay(attempt - 1), stated_wait))
         self._enqueue(_CLOSED, force=True)
 
 
 __all__ = [
     "DEFAULT_WS_BACKOFF",
     "BackpressurePolicy",
+    "BeforeConnect",
     "ConnectionState",
     "OnState",
     "SequenceObservation",

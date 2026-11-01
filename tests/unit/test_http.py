@@ -359,8 +359,11 @@ async def test_non_json_success_body_raises_transport_error() -> None:
 
 
 def test_map_response_error_variants() -> None:
-    e = map_response_error(429, b"", {"Retry-After": "bogus"})
+    e = map_response_error(429, b"", {"retry-after": "bogus"})
     assert isinstance(e, RateLimited) and e.retry_after is None
+    for not_a_wait in ("inf", "nan"):
+        limited = map_response_error(429, b"", {"retry-after": not_a_wait})
+        assert isinstance(limited, RateLimited) and limited.retry_after is None
     v = map_response_error(400, b"not json", {})
     assert isinstance(v, VenueError) and v.payload is None and v.code is None
     v2 = map_response_error(422, b'{"error_code": 7}', {})

@@ -26,7 +26,6 @@ def test_context_manager_serves_calls_and_leaves_no_thread() -> None:
             "ACME"
         ]
         assert client.capabilities("mock")
-        assert client.calendar("XNYS").venue == "XNYS"
     assert sync_threads() == []
 
 
@@ -217,3 +216,13 @@ def test_a_stream_failing_just_as_the_consumer_checks_still_raises(
         monkeypatch.undo()
         with pytest.raises(TransportError, match="the feed died"):
             next(stream)
+
+
+@pytest.mark.parametrize("buffer", [0, -1])
+def test_a_buffer_that_would_be_unbounded_is_refused(buffer: int) -> None:
+    # queue.Queue treats maxsize <= 0 as unbounded, which would drop the backpressure.
+    with IsmetSyncClient([MockProvider()]) as client:
+        with pytest.raises(ValidationError, match="buffer"):
+            client.stream_quotes(["ACME"], venue="XMOK", buffer=buffer)
+        with pytest.raises(ValidationError, match="buffer"):
+            client.stream_trades(["ACME"], venue="XMOK", buffer=buffer)

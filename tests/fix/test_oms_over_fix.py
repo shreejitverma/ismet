@@ -405,7 +405,33 @@ class TestUnreadableReports:
             await oms.submit(request("C2"))
         assert "C2" not in acceptor.orders
         assert rig.provider is not None
-        assert len(await rig.provider.quarantined()) == 1
+        rows = await rig.provider.quarantined()
+        assert [row.halted for row in rows] == [True, True]
+        assert "not a decimal" in rows[0].reason
+        assert "CumQty" in rows[1].reason
+
+    async def test_a_fill_the_venue_gap_filled_cannot_close_the_order_at_zero(
+        self, acceptor: FixAcceptor, rig: Rig
+    ) -> None:
+        """The venue traded 40, lost the report, and closed the order with CumQty 40."""
+        oms = await rig.build(unknown_grace=0.0)
+        await oms.submit(request())
+        venue_order = acceptor.orders["C1"]
+        venue_order.filled = Decimal(40)
+        acceptor.faults.skip_seq_next = 1
+        venue_order.status = "4"
+        await acceptor.exec_report("C1", "4", "4")
+        await eventually(
+            lambda: any(b.kind is BreakKind.FILL_MISMATCH for b in rig.breaks),
+            timeout=5.0,
+        )
+        assert acceptor.resend_requests_answered >= 1
+        assert oms.stream_healthy is False
+        with contextlib.suppress(RiskRejected):
+            await oms.submit(request("C2"))
+        assert "C2" not in acceptor.orders
+        assert rig.provider is not None
+        assert [q.halted for q in await rig.provider.quarantined()] == [True]
 
 
 class TestBusts:

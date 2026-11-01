@@ -72,7 +72,7 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-Blocking code, including inside a notebook, uses `IsmetSyncClient`, with the same methods.
+Blocking code, including inside a notebook, uses `IsmetSyncClient`, with the same market data and stream calls.
 
 ## Orders
 
@@ -136,8 +136,8 @@ It is not for colocated, sub-millisecond strategies.
 - **Money is exact.** `Decimal` everywhere, in a private exact context that ignores the ambient decimal settings. Floats are rejected.
 - **Real markets are representable.** Zero and negative prices, locked and crossed books, and clock skew are valid data, flagged rather than rejected.
 - **Identity is validated.** MICs and currencies against ISO snapshots, and ISIN, CUSIP, SEDOL, FIGI, and LEI by check digit.
-- **Calendars refuse to guess.** A date outside a venue's sourced data raises `CalendarOutOfRange`, which also refuses the order, unless it rests for later: OPG, CLS, or GTC or GTD on a limit or stop limit skip the session check.
-- **History is reproducible.** `BarStore` keeps restated bars and reads data as it stood at a past time, and with no `as_of` returns the latest. `SecurityMaster` answers "what did this ticker mean then, and what did we know then". A later record for the same symbol and start date replaces an earlier one from that time on, and a past query still sees what was believed then. A listing recorded with the wrong start date is taken back with `SecurityMaster.retract`, and a corporate action on the wrong ex-date with a neutral record on that date: `ratio=1` or `price_factor=1`.
+- **Calendars refuse to guess.** A date outside a venue's sourced data raises `CalendarOutOfRange`, which also refuses the order, unless it rests for later: OPG, CLS, or GTC or GTD on a limit or stop limit skip the session check. A daily bar with no `session_date` and a time outside every session raises rather than taking a guessed date.
+- **History is reproducible.** `BarStore` keeps restated bars and reads data as it stood at a past time, and with no `as_of` returns the latest, and a range mixing raw and adjusted bars raises. `SecurityMaster` answers "what did this ticker mean then, and what did we know then". A later record for the same symbol and start date replaces an earlier one from that time on, and a past query still sees what was believed then. A listing recorded with the wrong start date is taken back with `SecurityMaster.retract`, and a corporate action on the wrong ex-date with a neutral record on that date: `ratio=1` or `price_factor=1`.
 - **Backfills do not overclaim.** With a calendar, the window holding a session's close stays open until that session has a bar, in that window or an earlier one, and `BackfillReport` lists `sessions_missing`. A session with truly no trades therefore keeps the report incomplete.
 - **Flags travel with the data.** Exports carry `quality`, `source`, and `timeliness` columns. A Coinbase bar served from a CDN copy too old to show its bucket closed is flagged `STALE`, and a copy with no bars for such a window raises; repeat the request once the copy expires.
 - **Support is proven, not claimed.** A provider is listed only if it passes conformance on recorded responses.

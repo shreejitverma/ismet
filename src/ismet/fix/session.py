@@ -227,7 +227,6 @@ class FixSessionConfig:
     connect_timeout: float = 10.0
     logon_timeout: float = 10.0
     logout_timeout: float = 10.0
-    termination_wait: float = 2.0
     write_timeout: float = 10.0
     max_sending_time_skew: float | None = 120.0
     stale_resend_after: float = 60.0
@@ -702,7 +701,7 @@ class FixSession:
         """
         body = encode_fields(fields)
         async with self._send_lock:
-            self._require_ready()
+            self.require_ready()
             sending_time = format_utc_timestamp(self._clock.now())
             record = StoredMessage(0, msg_type, sending_time, body)
             seq = await self.run_store(lambda: self.store.allocate_outbound(record))
@@ -718,7 +717,7 @@ class FixSession:
                 ) from exc
             return seq
 
-    def _require_ready(self) -> None:
+    def require_ready(self) -> None:
         if self._failure is not None:
             raise SessionFailedError(f"FIX session failed: {self._failure}")
         if not self.is_ready:
@@ -783,7 +782,7 @@ class FixSession:
         await self._send_admin("2", [(7, self._next_in), (16, 0)])
 
     async def _terminate(self, text: str) -> NoReturn:
-        """Send a Logout, give the peer a moment to answer, and drop the connection."""
+        """Send a Logout and drop the connection."""
         with contextlib.suppress(_DisconnectError, FixStoreError):
             await self._send_admin("5", [(58, text)])
         raise _DisconnectError(text)

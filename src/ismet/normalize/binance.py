@@ -28,10 +28,11 @@ from ismet.models import (
 )
 from ismet.models.types import to_decimal
 from ismet.normalize._common import (
-    copy_made_at,
     datetime_from_ms,
     normalizer,
     register_asset,
+    strict_bool,
+    strict_int,
     venue_source,
 )
 
@@ -65,6 +66,8 @@ _STATUS: Mapping[str, ListingStatus] = {
 """``enums.md`` symbol statuses. No status means delisted; a delisted pair stays
 ``BREAK`` indefinitely, so ``SUSPENDED`` is the most this field can claim."""
 
+_MS_PER_SECOND = 1000
+
 _normalizes = normalizer(PROVIDER)
 
 
@@ -93,7 +96,7 @@ def quote_from_depth(
         symbol=symbol,
         exchange_ts=received,
         received_ts=received,
-        sequence=payload["lastUpdateId"],
+        sequence=strict_int(payload["lastUpdateId"]),
         source=venue_source(PROVIDER, FEED_DEPTH),
         bid=best_bid.price if best_bid else None,
         bid_size=best_bid.size if best_bid else None,
@@ -119,7 +122,7 @@ def order_book_from_depth(
         symbol=symbol,
         exchange_ts=received,
         received_ts=received,
-        sequence=payload["lastUpdateId"],
+        sequence=strict_int(payload["lastUpdateId"]),
         source=venue_source(PROVIDER, FEED_DEPTH),
         bids=tuple(_level(row) for row in payload["bids"]),
         asks=tuple(_level(row) for row in payload["asks"]),
@@ -144,14 +147,17 @@ def bars_from_klines(
     see it change.
     Binance publishes zero-volume klines (``trade_count`` 0) and they are kept.
     Volume is in the base asset. ``vwap`` stays ``None`` rather than being derived
-    from quote volume, which would need rounding.
+    from quote volume, which would need rounding. A close time that does not end the
+    interval means the row is not what it claims, so the payload is refused.
     """
     source = venue_source(PROVIDER, FEED_KLINES)
     bars: list[Bar] = []
     for row in rows:
-        if datetime_from_ms(row[6]) >= as_of:
+        open_ms, close_ms = strict_int(row[0]), strict_int(row[6])
+        _check_kline_span(open_ms, close_ms, interval)
+        if datetime_from_ms(close_ms) >= as_of:
             continue
-        opened = datetime_from_ms(row[0])
+        opened = datetime_from_ms(open_ms)
         bars.append(
             Bar(
                 symbol=symbol,
@@ -171,6 +177,16 @@ def bars_from_klines(
             )
         )
     return bars
+
+
+def _check_kline_span(open_ms: int, close_ms: int, interval: Interval) -> None:
+    seconds = interval.nominal_seconds
+    if close_ms <= open_ms or (
+        seconds is not None and close_ms != open_ms + seconds * _MS_PER_SECOND - 1
+    ):
+        raise ValueError(
+            f"{interval.value} kline opening at {open_ms} closes at {close_ms}"
+        )
 
 
 def _filter(payload: Mapping[str, Any], kind: str) -> Mapping[str, Any] | None:
@@ -204,7 +220,7 @@ def instrument_from_symbol_info(
     price_filter = _filter(payload, "PRICE_FILTER")
     lot_filter = _filter(payload, "LOT_SIZE")
     if price_filter is None or lot_filter is None:
-        raise ValueError(f"{symbol}: PRICE_FILTER or LOT_SIZE is absent")
+        raise ValidationError(f"{symbol}: PRICE_FILTER or LOT_SIZE is absent")
     tick = price_filter["tickSize"]
     if to_decimal(tick) == 0:
         raise ValidationError(f"{symbol}: Binance has disabled the tick size rule")
@@ -234,7 +250,7 @@ def quote_asset_of(payload: Mapping[str, Any]) -> str | None:
 @_normalizes
 def next_kline_start(rows: Sequence[Sequence[Any]]) -> int:
     """``startTime`` for the page after ``rows``: klines are keyed by open time."""
-    return int(rows[-1][0]) + 1
+    return strict_int(rows[-1][0]) + 1
 
 
 @_normalizes
@@ -255,7 +271,7 @@ def quote_from_book_ticker(
         symbol=symbol,
         exchange_ts=received,
         received_ts=received,
-        sequence=frame["u"],
+        sequence=strict_int(frame["u"]),
         source=venue_source(PROVIDER, FEED_BOOK_TICKER),
         bid=frame["b"],
         bid_size=frame["B"],
@@ -281,11 +297,11 @@ def trade_from_frame(
         symbol=symbol,
         exchange_ts=datetime_from_ms(frame["T"]),
         received_ts=received,
-        sequence=frame["t"],
+        sequence=strict_int(frame["t"]),
         source=venue_source(PROVIDER, FEED_TRADE),
         price=frame["p"],
         size=frame["q"],
-        side=Side.SELL if frame["m"] else Side.BUY,
+        side=Side.SELL if strict_bool(frame["m"]) else Side.BUY,
         trade_id=str(frame["t"]),
         currency=currency,
     )
@@ -318,7 +334,6 @@ __all__ = [
     "PROVIDER",
     "bars_from_klines",
     "control_error",
-    "copy_made_at",
     "instrument_from_symbol_info",
     "next_kline_start",
     "order_book_from_depth",

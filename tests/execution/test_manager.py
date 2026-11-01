@@ -44,6 +44,7 @@ from .conftest import (
     ACME,
     Factory,
     count_kill_polls,
+    lose_stream,
     order,
     permissive_config,
     until,
@@ -265,8 +266,7 @@ async def test_stream_disconnect_reconnects_and_recovers_missed_fills(
     await venue.drain()
     await oms.submit(order("S1", price="9.50"))
     await venue.drain()
-    venue.disconnect_stream()
-    await until(lambda: not oms.stream_healthy)
+    await lose_stream(oms, venue)
     venue.trade_through(ACME, "9.50", "100")
     state = await oms.wait_for("S1", lambda o: o.is_terminal, 5)
     assert state.status is S.FILLED

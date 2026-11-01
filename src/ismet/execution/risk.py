@@ -85,12 +85,19 @@ class RiskConfig(BaseModel):
     @field_validator("per_symbol")
     @classmethod
     def _full_symbol_keys(cls, value: dict[str, RiskLimits]) -> dict[str, RiskLimits]:
-        """A key that matches no symbol would silently apply no limit, so refuse it."""
+        """A key that matches no symbol would silently apply no limit, so refuse it.
+
+        Compared in upper case, like ``restricted_symbols``. Two keys differing only in
+        case would have one limit silently replace the other, so they are refused.
+        """
         normalized: dict[str, RiskLimits] = {}
         for key, limits in value.items():
             if "@" not in key:
                 raise ValueError(f"per_symbol key {key!r} must be TICKER@MIC")
-            normalized[str(Symbol.parse(key))] = limits
+            symbol = str(Symbol.parse(key)).upper()
+            if symbol in normalized:
+                raise ValueError(f"per_symbol has two keys for {symbol}")
+            normalized[symbol] = limits
         return normalized
 
     @field_validator("restricted_symbols")
@@ -118,7 +125,7 @@ class RiskConfig(BaseModel):
             scopes.append(
                 (f"strategy:{request.strategy}", self.per_strategy[request.strategy])
             )
-        key = str(request.symbol)
+        key = str(request.symbol).upper()
         if key in self.per_symbol:
             scopes.append((f"symbol:{key}", self.per_symbol[key]))
         return scopes
@@ -544,7 +551,7 @@ def _in_scope(request: OrderRequest, scope: str) -> bool:
     if kind == "strategy":
         return request.strategy == name
     if kind == "symbol":
-        return str(request.symbol) == name
+        return str(request.symbol).upper() == name
     return True
 
 

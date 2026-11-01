@@ -40,7 +40,9 @@ def test_to_decimal_rejects_non_decimal_types(bad: object) -> None:
         to_decimal(bad)
 
 
-@pytest.mark.parametrize("bad", ["abc", "NaN", "Infinity", "-inf", ""])
+@pytest.mark.parametrize(
+    "bad", ["abc", "NaN", "Infinity", "-inf", "", "1_000.5", "\u0661\u0662\u0663"]
+)
 def test_to_decimal_rejects_non_finite_or_garbage(bad: str) -> None:
     with pytest.raises(ValueError):
         to_decimal(bad)

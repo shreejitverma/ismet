@@ -10,6 +10,9 @@ from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
+from websockets.asyncio.server import ServerConnection, serve
+from websockets.http11 import Request
+from websockets.http11 import Response as WsResponse
 
 from ismet.capabilities import Capability
 from ismet.config import ProviderSettings, Settings
@@ -25,10 +28,6 @@ from ismet.models import Interval, QualityFlag, Symbol
 from ismet.providers.binance import (
     BINANCE_RETRY,
     RATE_LIMITS,
-    REQUEST_WEIGHT_PER_MINUTE,
-    REST_URL,
-    WS_CONNECTIONS_PER_5_MINUTES,
-    WS_URL,
     BinanceProvider,
 )
 from ismet.testing.replay import ReplayTransport, WsReplayServer, load_exchanges
@@ -76,11 +75,6 @@ def test_declares_exactly_the_market_data_capabilities() -> None:
     assert provider.serves("bncx")
 
 
-def test_defaults_are_the_market_data_only_hosts() -> None:
-    assert REST_URL == "https://data-api.binance.vision"
-    assert WS_URL == "wss://data-stream.binance.vision/ws"
-
-
 def test_from_settings_reads_urls() -> None:
     settings = ProviderSettings(
         name="binance", options={"rest_url": "https://a.example", "ws_url": "wss://b"}
@@ -90,11 +84,15 @@ def test_from_settings_reads_urls() -> None:
     assert provider._ws_url == "wss://b"
 
 
+DOCUMENTED_WEIGHT_PER_MINUTE = 6000
+DOCUMENTED_CONNECTIONS_PER_5_MINUTES = 300
+
+
 def test_rate_limit_declarations_match_the_venue() -> None:
     limits = body("binance", "conformance", "exchangeInfo?symbol=BTCUSDT")["rateLimits"]
     weight = next(x for x in limits if x["rateLimitType"] == "REQUEST_WEIGHT")
     assert (weight["interval"], weight["intervalNum"]) == ("MINUTE", 1)
-    assert weight["limit"] == REQUEST_WEIGHT_PER_MINUTE
+    assert weight["limit"] == DOCUMENTED_WEIGHT_PER_MINUTE
 
 
 @pytest.mark.parametrize(
@@ -121,9 +119,9 @@ async def test_each_endpoint_is_charged_its_documented_weight(
 
 def test_buckets_cannot_exceed_the_fixed_window_limits() -> None:
     weight = RATE_LIMITS["weight"]
-    assert weight.capacity + weight.rate * 60 <= REQUEST_WEIGHT_PER_MINUTE
+    assert weight.capacity + weight.rate * 60 <= DOCUMENTED_WEIGHT_PER_MINUTE
     connect = RATE_LIMITS["ws_connect"]
-    assert connect.capacity + connect.rate * 300 <= WS_CONNECTIONS_PER_5_MINUTES
+    assert connect.capacity + connect.rate * 300 <= DOCUMENTED_CONNECTIONS_PER_5_MINUTES
 
 
 async def test_requests_are_charged_their_documented_weight() -> None:
@@ -439,7 +437,7 @@ async def test_429_without_retry_after_is_not_retried() -> None:
 
 async def test_418_ban_is_rate_limited_never_retried_and_says_until_when() -> None:
     clock = ManualClock(datetime(2030, 1, 1, tzinfo=UTC))
-    banned_until = int(clock.now().timestamp() * 1000) + 90_000
+    banned_until = int(clock.now().timestamp() * 1000) + 300_000
     ban = httpx.Response(
         418,
         json={
@@ -453,13 +451,82 @@ async def test_418_ban_is_rate_limited_never_retried_and_says_until_when() -> No
     async with provider:
         with pytest.raises(RateLimited, match="banned") as caught:
             await provider._get("/api/v3/depth", {}, "klines")
-    assert caught.value.retry_after == pytest.approx(90)
+    assert caught.value.retry_after == pytest.approx(300)
+    assert len(seen) == 1
+
+
+async def test_a_ban_header_with_an_empty_body_holds_for_the_stated_time() -> None:
+    clock = ManualClock(datetime(2030, 1, 1, tzinfo=UTC))
+    ban = httpx.Response(418, headers={"Retry-After": "7200"}, content=b"")
+    transport, seen = _serving(ban)
+    provider = BinanceProvider(http_transport=transport, clock=clock)
+    async with provider:
+        with pytest.raises(RateLimited, match="banned") as caught:
+            await provider._get("/api/v3/depth", {}, "klines")
+        assert caught.value.retry_after == 7200
+        clock.advance(121)
+        with pytest.raises(RateLimited, match="not sending"):
+            await provider._get("/api/v3/depth", {}, "klines")
+    assert len(seen) == 1
+
+
+@pytest.mark.parametrize("ms_from_now", [90_000, -180_000])
+async def test_a_stated_ban_below_the_shortest_ban_holds_for_the_shortest(
+    ms_from_now: int,
+) -> None:
+    clock = ManualClock(datetime(2030, 1, 1, tzinfo=UTC))
+    until = int(clock.now().timestamp() * 1000) + ms_from_now
+    ban = httpx.Response(418, json={"code": -1003, "msg": f"IP banned until {until}."})
+    transport, seen = _serving(ban)
+    provider = BinanceProvider(http_transport=transport, clock=clock)
+    async with provider:
+        with pytest.raises(RateLimited, match="banned") as caught:
+            await provider._get("/api/v3/depth", {}, "klines")
+        assert caught.value.retry_after == 120
+        clock.advance(119)
+        with pytest.raises(RateLimited, match="not sending"):
+            await provider._get("/api/v3/depth", {}, "klines")
+    assert len(seen) == 1
+
+
+async def test_a_429_retry_after_beyond_the_cap_holds_later_calls() -> None:
+    clock = ManualClock(datetime(2030, 1, 1, tzinfo=UTC))
+    limited = httpx.Response(429, headers={"Retry-After": "300"}, json=TOO_MUCH_WEIGHT)
+    ok = httpx.Response(200, json={"symbols": []})
+    transport, seen = _serving(limited, ok)
+    provider = BinanceProvider(http_transport=transport, clock=clock)
+    async with provider:
+        with pytest.raises(RateLimited):
+            await provider._get("/api/v3/depth", {}, "klines")
+        for _ in range(2):
+            with pytest.raises(RateLimited, match="not sending"):
+                await provider._get("/api/v3/depth", {}, "klines")
+        assert len(seen) == 1
+        clock.advance(301)
+        assert await provider._get("/api/v3/depth", {}, "klines") == {"symbols": []}
+    assert len(seen) == 2
+
+
+async def test_a_short_429_wait_also_holds_other_callers_while_it_runs() -> None:
+    clock = ManualClock(datetime(2030, 1, 1, tzinfo=UTC))
+    limited = httpx.Response(429, headers={"Retry-After": "1"}, json=TOO_MUCH_WEIGHT)
+    transport, seen = _serving(limited)
+    provider = BinanceProvider(
+        http_transport=transport,
+        clock=clock,
+        retry_policy=replace(BINANCE_RETRY, max_attempts=1),
+    )
+    async with provider:
+        with pytest.raises(RateLimited):
+            await provider._get("/api/v3/depth", {}, "klines")
+        with pytest.raises(RateLimited, match="not sending"):
+            await provider._get("/api/v3/depth", {}, "klines")
     assert len(seen) == 1
 
 
 async def test_a_ban_is_honoured_locally_until_it_ends() -> None:
     clock = ManualClock(datetime(2030, 1, 1, tzinfo=UTC))
-    banned_until = int(clock.now().timestamp() * 1000) + 90_000
+    banned_until = int(clock.now().timestamp() * 1000) + 300_000
     ban = httpx.Response(
         418, json={"code": -1003, "msg": f"IP banned until {banned_until}."}
     )
@@ -468,7 +535,7 @@ async def test_a_ban_is_honoured_locally_until_it_ends() -> None:
     async with provider:
         with pytest.raises(RateLimited):
             await provider._get("/api/v3/depth", {}, "klines")
-        clock.advance(60)
+        clock.advance(270)
         with pytest.raises(RateLimited, match="not sending") as caught:
             await provider._get("/api/v3/depth", {}, "klines")
         assert caught.value.retry_after == pytest.approx(30)
@@ -781,6 +848,90 @@ async def test_a_ban_on_the_klines_path_is_still_remembered() -> None:
             with pytest.raises(RateLimited):
                 await provider.bars(BTC, Interval.M1, start, start + timedelta(hours=1))
     assert calls == 1
+
+
+async def test_every_handshake_is_charged_even_a_rejected_one() -> None:
+    handshakes = 0
+
+    def process_request(conn: ServerConnection, request: Request) -> WsResponse:
+        nonlocal handshakes
+        handshakes += 1
+        return conn.respond(429, "slow down")
+
+    async def never(conn: ServerConnection) -> None:
+        await conn.wait_closed()
+
+    async with serve(never, "127.0.0.1", 0, process_request=process_request) as server:
+        port = next(iter(server.sockets)).getsockname()[1]
+        provider = BinanceProvider(
+            http_transport=replay("binance", "conformance"),
+            ws_url=f"ws://127.0.0.1:{port}",
+            ws_backoff=FAST_BACKOFF,
+            ws_max_reconnects=2,
+            clock=ManualClock(),
+        )
+        bucket = provider._limiter.bucket("ws_connect")
+        assert bucket is not None
+        before = bucket.available
+        async with provider:
+            with pytest.raises(TransportError):
+                await take(provider.stream_quotes([BTC]), 1)
+        charged = before - bucket.available
+    assert handshakes == 3
+    assert charged == 3
+
+
+async def test_search_leaves_out_a_listing_with_a_zero_lot() -> None:
+    good = body("binance", "instruments", "exchangeInfo")["symbols"][0]
+    zero_lot = json.loads(json.dumps(good, default=str))
+    zero_lot["symbol"] = good["symbol"] + "X"
+    for rule in zero_lot["filters"]:
+        if rule["filterType"] == "LOT_SIZE":
+            rule["stepSize"] = "0"
+    no_filter = dict(zero_lot, symbol=good["symbol"] + "Y", filters=[])
+    bad_symbol = dict(good, symbol="")
+    payload = {"symbols": [zero_lot, no_filter, bad_symbol, good]}
+    transport = httpx.MockTransport(
+        lambda _: httpx.Response(200, content=json.dumps(payload, default=str))
+    )
+    provider = BinanceProvider(http_transport=transport)
+    async with provider:
+        hits = await provider.search(good["baseAsset"])
+    assert [hit.symbol.ticker for hit in hits] == [good["symbol"]]
+
+
+@pytest.mark.parametrize(
+    ("interval", "documented"),
+    [
+        (Interval.S1, "1s"),
+        (Interval.M1, "1m"),
+        (Interval.M5, "5m"),
+        (Interval.M15, "15m"),
+        (Interval.M30, "30m"),
+        (Interval.H1, "1h"),
+        (Interval.H4, "4h"),
+        (Interval.D1, "1d"),
+        (Interval.W1, "1w"),
+        (Interval.MO1, "1M"),
+    ],
+)
+async def test_a_bars_request_carries_the_documented_kline_interval(
+    interval: Interval, documented: str
+) -> None:
+    sent: list[str] = []
+    info = body("binance", "conformance", "exchangeInfo?symbol=BTCUSDT")
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if "exchangeInfo" in str(request.url):
+            return httpx.Response(200, content=json.dumps(info, default=str))
+        sent.append(parse_qs(urlsplit(str(request.url)).query)["interval"][0])
+        return httpx.Response(200, json=[])
+
+    start = datetime(2026, 11, 1, tzinfo=UTC)
+    provider = BinanceProvider(http_transport=httpx.MockTransport(respond))
+    async with provider:
+        await provider.bars(BTC, interval, start, start + timedelta(minutes=1))
+    assert sent == [documented]
 
 
 def _unreachable(**options: object) -> ProviderSettings:

@@ -79,6 +79,20 @@ def venue_source(provider: str, feed: str) -> DataSource:
     )
 
 
+def strict_int(value: object) -> int:
+    """``value`` if it is a JSON integer; anything else is an unreadable payload."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"expected an integer, got {value!r}")
+    return value
+
+
+def strict_bool(value: object) -> bool:
+    """``value`` if it is a JSON boolean; anything else is an unreadable payload."""
+    if not isinstance(value, bool):
+        raise TypeError(f"expected a boolean, got {value!r}")
+    return value
+
+
 def datetime_from_ms(ms: int) -> datetime:
     """UTC datetime for integer epoch milliseconds."""
     return datetime_from_ns(int(ms) * _NANOS_PER_MILLI)
@@ -183,8 +197,8 @@ class StreamGate:
       next event for each key is delivered with ``AFTER_GAP``, because updates were
       certainly unobserved while disconnected.
 
-    Either way a repeat of the latest number is dropped, and a number below the
-    high-water mark is delivered with ``OUT_OF_ORDER``. Nothing is backfilled.
+    Either way a repeat is dropped, and a number below the high-water mark seen for
+    the first time is delivered with ``OUT_OF_ORDER``. Nothing is backfilled.
     """
 
     def __init__(self, *, contiguous: bool) -> None:
@@ -242,5 +256,7 @@ __all__ = [
     "parse_iso8601_utc",
     "register_asset",
     "search_rank",
+    "strict_bool",
+    "strict_int",
     "venue_source",
 ]

@@ -26,13 +26,14 @@ from ismet.models import (
     Side,
     Symbol,
     Trade,
-    datetime_from_ns,
 )
 from ismet.normalize._common import (
-    copy_made_at,
+    datetime_from_ms,
     normalizer,
     parse_iso8601_utc,
     register_asset,
+    strict_bool,
+    strict_int,
     venue_source,
 )
 
@@ -52,7 +53,7 @@ CANDLE_GRANULARITY: Mapping[Interval, int] = {
 """Documented granularities that ismet has an interval for. Coinbase also has 6h,
 which :class:`Interval` lacks, and has no 1s, 30m, 4h, 1w or 1M."""
 
-_NANOS_PER_SECOND = 1_000_000_000
+_MS_PER_SECOND = 1000
 
 _normalizes = normalizer(PROVIDER)
 
@@ -84,7 +85,7 @@ def quote_from_book(
         exchange_ts=exchange_ts,
         exchange_ts_ns=exchange_ns,
         received_ts=received,
-        sequence=payload["sequence"],
+        sequence=strict_int(payload["sequence"]),
         source=venue_source(PROVIDER, FEED_BOOK),
         bid=best_bid.price if best_bid else None,
         bid_size=best_bid.size if best_bid else None,
@@ -113,7 +114,7 @@ def order_book_from_book(
         exchange_ts=exchange_ts,
         exchange_ts_ns=exchange_ns,
         received_ts=received,
-        sequence=payload["sequence"],
+        sequence=strict_int(payload["sequence"]),
         source=venue_source(PROVIDER, FEED_BOOK),
         bids=tuple(_level(row) for row in payload["bids"][:depth]),
         asks=tuple(_level(row) for row in payload["asks"][:depth]),
@@ -139,14 +140,19 @@ def bars_from_candles(
     ``as_of``, when the response was made, is dropped because its values are not
     final. Coinbase publishes nothing for a bucket with no trades, so a gap is an
     interval with no ticks unless ``outdated`` says this copy predates it; those bars
-    are flagged ``STALE``. ``trade_count`` is not available.
+    are flagged ``STALE``. ``trade_count`` is not available. A time off the bucket
+    grid means the row is not what it claims, so the payload is refused.
     """
-    granularity = timedelta(seconds=CANDLE_GRANULARITY[interval])
+    seconds = CANDLE_GRANULARITY[interval]
+    granularity = timedelta(seconds=seconds)
     quality = frozenset({QualityFlag.STALE}) if outdated else frozenset()
     source = venue_source(PROVIDER, FEED_CANDLES)
     bars: list[Bar] = []
     for row in rows:
-        opened = datetime_from_ns(int(row[0]) * _NANOS_PER_SECOND)
+        open_seconds = strict_int(row[0])
+        if open_seconds % seconds:
+            raise ValueError(f"candle time {open_seconds} is off the {seconds}s grid")
+        opened = datetime_from_ms(open_seconds * _MS_PER_SECOND)
         if opened + granularity > as_of:
             continue
         bars.append(
@@ -177,9 +183,10 @@ def _status(payload: Mapping[str, Any]) -> ListingStatus:
         return ListingStatus.SUSPENDED
     if payload["status"] != "online":
         return ListingStatus.UNKNOWN
-    if payload["trading_disabled"]:
+    if strict_bool(payload["trading_disabled"]):
         return ListingStatus.HALTED
-    return ListingStatus.SUSPENDED if payload["cancel_only"] else ListingStatus.ACTIVE
+    cancel_only = strict_bool(payload["cancel_only"])
+    return ListingStatus.SUSPENDED if cancel_only else ListingStatus.ACTIVE
 
 
 @_normalizes
@@ -242,7 +249,7 @@ def quote_from_ticker(
         exchange_ts=exchange_ts,
         exchange_ts_ns=exchange_ns,
         received_ts=received,
-        sequence=frame["sequence"],
+        sequence=strict_int(frame["sequence"]),
         source=venue_source(PROVIDER, FEED_TICKER),
         bid=frame["best_bid"],
         bid_size=frame["best_bid_size"],
@@ -275,12 +282,12 @@ def trade_from_match(
         exchange_ts=exchange_ts,
         exchange_ts_ns=exchange_ns,
         received_ts=received,
-        sequence=frame["sequence"],
+        sequence=strict_int(frame["sequence"]),
         source=venue_source(PROVIDER, FEED_MATCHES),
         price=frame["price"],
         size=frame["size"],
         side=_AGGRESSOR_FROM_MAKER[frame["side"]],
-        trade_id=str(frame["trade_id"]),
+        trade_id=str(strict_int(frame["trade_id"])),
         currency=currency,
     )
 
@@ -305,7 +312,6 @@ __all__ = [
     "PROVIDER",
     "bars_from_candles",
     "control_error",
-    "copy_made_at",
     "instrument_from_product",
     "order_book_from_book",
     "quote_currency_of",

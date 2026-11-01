@@ -257,6 +257,55 @@ def test_a_book_mid_far_from_the_last_price_is_an_outlier() -> None:
     assert "1000" in issues[0].detail
 
 
+def _book(bid: str, ask: str) -> OrderBook:
+    return OrderBook(
+        symbol=SYM,
+        exchange_ts=TS,
+        received_ts=TS,
+        bids=(Level(price=bid, size="1"),),
+        asks=(Level(price=ask, size="1"),),
+    )
+
+
+def test_a_zero_bid_prices_a_book_at_the_same_mid_as_the_equal_quote() -> None:
+    monitor = QualityMonitor()
+    quote = Quote(
+        symbol=SYM,
+        exchange_ts=TS,
+        received_ts=TS,
+        bid="0",
+        bid_size="1",
+        ask="0.05",
+        ask_size="1",
+    )
+    assert monitor.observe(quote) == []
+    assert monitor.observe(_book("0", "0.05")) == []
+
+
+def test_a_move_off_a_zero_price_is_reported_and_must_be_confirmed() -> None:
+    monitor = QualityMonitor()
+    assert monitor.observe(_book("0", "0")) == []
+    jumped = monitor.observe(trade(1, price="1000"))
+    assert [i.issue for i in jumped] == [Issue.OUTLIER]
+    assert "1000" in jumped[0].detail
+    assert [i.issue for i in monitor.observe(trade(1, price="1"))] == [Issue.OUTLIER]
+
+
+def test_a_steady_zero_price_is_not_an_outlier() -> None:
+    monitor = QualityMonitor()
+    assert monitor.observe(trade(1, price="0")) == []
+    assert monitor.observe(trade(1, price="0")) == []
+
+
+def test_a_guard_delivers_a_number_below_the_first_once() -> None:
+    guard = SequenceGuard()
+    guard.admit(trade(100))
+    assert QualityFlag.OUT_OF_ORDER in guard.admit(trade(50)).quality  # type: ignore[union-attr]
+    assert guard.admit(trade(50)) is None
+    assert guard.admit(trade(50)) is None
+    assert (guard.stats.out_of_order, guard.stats.duplicates_dropped) == (1, 2)
+
+
 def test_a_one_sided_book_and_an_empty_book_are_handled() -> None:
     monitor = QualityMonitor()
     monitor.observe(trade(1, price="100"))

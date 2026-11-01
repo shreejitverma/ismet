@@ -73,6 +73,7 @@ from .conftest import (
     ACME,
     Factory,
     count_kill_polls,
+    lose_stream,
     order,
     permissive_config,
     until,
@@ -266,11 +267,14 @@ async def test_restarting_one_instance_rebuilds_rather_than_replays_on_top(
     await venue.drain()
     await oms.submit(order("RS7", price="9.50"))
     await venue.drain()
+    venue.trade_through(ACME, "9.50", "40")
+    await oms.wait_for("RS7", lambda o: o.filled_quantity == 40, 2)
     await oms.stop()
     await oms.start()
     try:
         assert not oms.order("RS7").anomalies
-        assert oms.order("RS7").status is S.ACCEPTED
+        assert oms.order("RS7").status is S.PARTIALLY_FILLED
+        assert oms.net_position(ACME) == 40
     finally:
         await oms.abort()
 
@@ -657,9 +661,24 @@ async def test_stream_reconnects_even_if_its_reconcile_keeps_failing(
         raise KeyError("adapter bug")
 
     monkeypatch.setattr(venue, "open_orders", bug)
-    venue.disconnect_stream()
-    await until(lambda: not oms.stream_healthy)
+    await lose_stream(oms, venue)
     await until(lambda: bool(venue._subscribers))
+
+
+async def test_stream_reconnects_even_if_its_reconcile_raises_outright(
+    oms: OrderManager,
+    venue: SimVenue,
+    journal: Journal,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await venue.drain()
+
+    def bug(*_: object, **__: object) -> list[object]:
+        raise KeyError("journal bug")
+
+    monkeypatch.setattr(journal, "records", bug)
+    await lose_stream(oms, venue)
+    await until(lambda: oms.stream_healthy)
 
 
 async def test_failed_protective_cancel_keeps_the_order_unknown(
@@ -829,7 +848,12 @@ async def test_gross_exposure_keeps_the_multiplier_after_a_restart(
         journal = SqliteJournal(journal_path)
         return (
             OrderManager(
-                venue, journal, RiskEngine(tight), clock=clock, reconcile_interval=3600
+                venue,
+                journal,
+                RiskEngine(tight),
+                clock=clock,
+                reconcile_interval=3600,
+                stream_settle=None,
             ),
             journal,
         )
@@ -848,10 +872,13 @@ async def test_gross_exposure_keeps_the_multiplier_after_a_restart(
     try:
         # Marks are not trusted across a restart, so gross is unknown until a quote.
         assert second._gross_notional() is None
-        # With the multiplier of 50, the position and these 200 lots come to about
-        # 115000, over the limit. Without it they come to about 2300 and would pass.
-        with pytest.raises(RiskRejected):
-            await second.submit(order("GR2", price="9.50", quantity="200"))
+        # With the multiplier of 50, the position is 30 at the mid of 10.00, or 15000,
+        # and these 180 lots at the ask of 10.01 are 90090: 105090, over the limit. The
+        # order alone would pass, so this refusal needs the position kept on restart.
+        with pytest.raises(RiskRejected) as caught:
+            await second.submit(order("GR2", price="9.50", quantity="180"))
+        assert caught.value.check == "max_gross_notional"
+        assert "105090" in caught.value.reason
     finally:
         await second.abort()
         journal.close()
@@ -1425,6 +1452,7 @@ def test_adjustment_uses_the_venue_date_not_the_utc_date() -> None:
     after_hours = bar(
         date(2026, 3, 2),
         "100",
+        interval=Interval.M1,
         exchange_ts=datetime(2026, 3, 3, 1, 30, tzinfo=UTC),
         received_ts=datetime(2026, 3, 3, 1, 30, tzinfo=UTC),
         session_date=None,

@@ -48,7 +48,8 @@ Rules callers depend on that are easy to miss in the API reference.
 - A closed bar's age counts from its close, and the check is skipped for monthly bars.
 - `BookBuilder.apply_snapshot` returns `False` for a snapshot older than a dropped delta, and the book stays out of sync.
 - A Coinbase `/book` response with no `time` raises rather than looking fresh.
-- A Binance 418 ban is remembered, and requests are refused locally until it ends.
+- A Binance 418 ban or a 429 with `Retry-After` is remembered, and requests are refused locally until the wait ends.
+  A ban lasts at least 2 minutes, whatever the response or the host clock says.
 
 ## Reference data
 

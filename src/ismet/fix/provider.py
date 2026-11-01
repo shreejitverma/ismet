@@ -62,7 +62,11 @@ What FIX does and does not offer, and how this provider handles each:
   venue. This fails closed: one malformed report stops new orders on this provider.
   A report with only a field defect such as an empty Text is applied and then rejected.
   A SequenceReset-Reset that skips numbers, or a peer's unrequested sequence reset, can
-  hide fills the same way and stops the stream the same way.
+  hide fills the same way and stops the stream the same way. A GapFill over a report the
+  venue no longer holds is seen only later: the next report on that order whose CumQty
+  exceeds the fills received is committed and quarantined the same way, its closing
+  status is withheld, and the order is restated as ``UNKNOWN``. With no later report,
+  only reconciliation can find it.
 - Fill identity: ``fill_id`` is ExecID(17). ExecID is unique within a day or the life
   of a multi-day order (FIX 4.2 field definition), so duplicates are detected per order.
   A repeat with the same content is dropped. A repeated fill with different content is
@@ -104,8 +108,10 @@ from ismet.errors import (
     VenueError,
 )
 from ismet.fix.message import (
+    REASON_TAG_WITHOUT_VALUE,
     FieldFormatError,
     FixMessage,
+    encode_fields,
     format_utc_timestamp,
     parse_decimal,
     parse_seq_num,
@@ -214,6 +220,7 @@ _TAG_SESSION_REJECT_REASON = 373
 _TAG_CXL_REJ_RESPONSE_TO = 434
 _TAG_LAST_LIQUIDITY_IND = 851
 _TAG_MSG_SEQ_NUM = 34
+_TAG_MSG_TYPE = 35
 
 
 _ORD_STATUS: Mapping[str, OrderStatus] = {
@@ -453,7 +460,6 @@ class FixProvider(Provider):
         self._subscribers: list[asyncio.Queue[OrderEvent | Exception]] = []
         self._backlog: deque[OrderEvent] = deque()
         self._records_lock = asyncio.Lock()
-        self._failure: Exception | None = None
         self._request_counter = 0
         self._begin_string = config.begin_string
         self._store_in_use = False
@@ -542,7 +548,6 @@ class FixProvider(Provider):
 
     async def open(self) -> None:
         """Connect and log on. Raises if the session cannot become ready in time."""
-        self._failure = None
         self._store_in_use = await self._store_call(self._store_has_history)
         await self._session.start()
         await self._session.wait_ready(self._logon_timeout)
@@ -589,7 +594,6 @@ class FixProvider(Provider):
             pending.future.set_exception(error)
 
     def on_session_failed(self, error: Exception) -> None:
-        self._failure = error
         self.on_session_down(str(error))
         for queue in self._subscribers:
             queue.put_nowait(error)
@@ -721,8 +725,10 @@ class FixProvider(Provider):
         differs, because a row that arrived meanwhile was never checked. Durable, and
         the operator is recorded. Returns how many rows were released.
         """
-        if not operator.strip():
-            raise ValidationError("releasing the FIX quarantine requires an operator")
+        if not operator.strip() or not reason.strip():
+            raise ValidationError(
+                "releasing the FIX quarantine requires an operator and a reason"
+            )
         at = self.clock.now().isoformat()
         found = await self._store_call(
             lambda: self._store.release_quarantine(
@@ -738,6 +744,10 @@ class FixProvider(Provider):
 
     async def _on_other_message(self, message: FixMessage) -> None:
         msg_type = message.msg_type
+        if not msg_type:
+            raise ApplicationRejectError(
+                REASON_TAG_WITHOUT_VALUE, "MsgType has no value", _TAG_MSG_TYPE
+            )
         if msg_type in _IGNORED_MSG_TYPES:
             logger.info("FIX ignored application message type %s", msg_type)
         else:
@@ -912,6 +922,9 @@ class FixProvider(Provider):
             return
         fill = next((e.fill for e in events if isinstance(e, Filled)), None)
         bust = next((e.fill_id for e in events if isinstance(e, FillBusted)), None)
+        unreported = self._unreported_quantity(record, message, fill, bust)
+        if unreported is not None:
+            events = [e for e in events if isinstance(e, Filled)]
         updated = self._updated_record(record, message, wire_id, fill, bust)
         received = self.clock.now()
         execution = StoredExecution(
@@ -949,8 +962,34 @@ class FixProvider(Provider):
         for event in events:
             self._publish(event)
         self._answer_waiters(message, wire_id)
+        if unreported is not None:
+            await self._quarantine(
+                message,
+                f"CumQty is {unreported} above the fills received, so a report on "
+                f"{client_order_id} was lost",
+            )
         if cancelled is not None:
             raise cancelled
+
+    def _unreported_quantity(
+        self,
+        record: _Record | None,
+        message: FixMessage,
+        fill: Fill | None,
+        bust: str | None,
+    ) -> Decimal | None:
+        """How far CumQty exceeds the fills this session was told of, if it does."""
+        if (
+            record is None
+            or bust is not None
+            or self.dialect.is_duplicate_reject(message)
+        ):
+            return None
+        cum_qty = self._decimal(message, _TAG_CUM_QTY)
+        if cum_qty is None:
+            return None
+        received = record.filled + (fill.quantity if fill is not None else Decimal(0))
+        return cum_qty - received if cum_qty > received else None
 
     def _updated_record(
         self,
@@ -1276,7 +1315,6 @@ class FixProvider(Provider):
             updated = record.model_copy(
                 update={
                     "status": snapshot.status,
-                    "filled": snapshot.filled_quantity,
                     "venue_order_id": snapshot.venue_order_id or record.venue_order_id,
                     "acknowledged": record.acknowledged
                     or snapshot.status is not OrderStatus.SUBMITTING,
@@ -1356,11 +1394,13 @@ class FixProvider(Provider):
         pending = self._find_pending(ref_id, seq)
         code = f"BUSINESS_{reason_code}"
         if pending is not None and pending.kind is _Kind.STATUS:
-            if not pending.future.done():
-                if reason_code == _UNKNOWN_ID_BUSINESS_REASON:
+            if reason_code == _UNKNOWN_ID_BUSINESS_REASON:
+                async with self._records_lock:
+                    await self._forget_order(pending.client_order_id)
+                if not pending.future.done():
                     pending.future.set_result(None)
-                else:
-                    pending.future.set_exception(VenueError(text, code=code))
+            elif not pending.future.done():
+                pending.future.set_exception(VenueError(text, code=code))
             return
         sent = None if seq is None else self._sent.get(seq)
         if pending is not None:
@@ -1497,11 +1537,13 @@ class FixProvider(Provider):
                 f"not sent: {problem} is not supported", code="UNSUPPORTED"
             )
 
-    def _require_session(self) -> None:
-        if self._failure is not None:
-            raise SessionFailedError(f"FIX session failed: {self._failure}")
-        if not self._session.is_ready:
-            raise SessionDownError(f"FIX session is {self._session.state.value}")
+    @staticmethod
+    def _check_encodable(fields: Fields) -> None:
+        """Refuse what could never be framed, before anything durable says it left."""
+        try:
+            encode_fields(fields)
+        except FieldFormatError as exc:
+            raise VenueError(f"not sent: {exc}", code="INVALID_FIELD") from exc
 
     def _new_pending(
         self, kind: _Kind, client_order_id: str, wire_id: str, key: str
@@ -1549,7 +1591,7 @@ class FixProvider(Provider):
         """Send one NewOrderSingle and wait for acceptance. See the module docstring."""
         cid = request.client_order_id
         self._check_supported(request)
-        self._require_session()
+        self._session.require_ready()
         await self._refuse_while_halted()
         record = _Record(
             client_order_id=cid,
@@ -1571,6 +1613,7 @@ class FixProvider(Provider):
             (_TAG_CLIENT_ORDER_ID, cid),
             *self._order_terms(record, request.quantity, request.limit_price),
         ]
+        self._check_encodable(fields)
         payload = record.model_dump_json()
 
         def remember() -> None:
@@ -1610,8 +1653,13 @@ class FixProvider(Provider):
         assert isinstance(result, OrderAck)
         return result
 
-    async def _next_wire_id(self, client_order_id: str) -> tuple[_Record, str]:
-        """Take the order's next ClOrdID, atomically with respect to its reports."""
+    async def _next_wire_id(
+        self, client_order_id: str, build: Callable[[_Record, str], Fields]
+    ) -> tuple[str, Fields]:
+        """Take the order's next ClOrdID, atomically with respect to its reports.
+
+        ``build`` makes the request's fields, so one that cannot be framed uses no id.
+        """
         async with self._records_lock:
             record = await self._lookup(client_order_id)
             if record is None:
@@ -1621,6 +1669,8 @@ class FixProvider(Provider):
             sequence = record.chain_length + 1
             wire_id = self.dialect.wire_id(client_order_id, sequence)
             updated = record.model_copy(update={"chain_length": sequence})
+            fields = build(updated, wire_id)
+            self._check_encodable(fields)
             payload = updated.model_dump_json()
 
             def remember() -> None:
@@ -1630,7 +1680,7 @@ class FixProvider(Provider):
                 self._store.link_wire_id(wire_id, client_order_id)
 
             await self._store_call(remember)
-        return updated, wire_id
+        return wire_id, fields
 
     async def _request_change(
         self, kind: _Kind, msg_type: str, wire_id: str, root: str, fields: Fields
@@ -1653,20 +1703,24 @@ class FixProvider(Provider):
 
     async def cancel_order(self, client_order_id: str, symbol: Symbol) -> None:
         """Send OrderCancelRequest(F) and wait for the venue's first answer."""
-        self._require_session()
-        record, wire_id = await self._next_wire_id(client_order_id)
-        fields: Fields = [
-            (_TAG_ORIG_CLIENT_ORDER_ID, record.wire_id),
-            (_TAG_CLIENT_ORDER_ID, wire_id),
-        ]
-        if record.venue_order_id is not None:
-            fields.append((_TAG_ORDER_ID, record.venue_order_id))
-        if record.account is not None:
-            fields.append((_TAG_ACCOUNT, record.account))
-        fields.extend(self.dialect.instrument_fields(symbol))
-        fields.append((_TAG_SIDE, self._side_code(record)))
-        fields.append(self._transact_field())
-        fields.append((_TAG_ORDER_QTY, record.quantity))
+        self._session.require_ready()
+
+        def build(record: _Record, wire_id: str) -> Fields:
+            fields: Fields = [
+                (_TAG_ORIG_CLIENT_ORDER_ID, record.wire_id),
+                (_TAG_CLIENT_ORDER_ID, wire_id),
+            ]
+            if record.venue_order_id is not None:
+                fields.append((_TAG_ORDER_ID, record.venue_order_id))
+            if record.account is not None:
+                fields.append((_TAG_ACCOUNT, record.account))
+            fields.extend(self.dialect.instrument_fields(symbol))
+            fields.append((_TAG_SIDE, self._side_code(record)))
+            fields.append(self._transact_field())
+            fields.append((_TAG_ORDER_QTY, record.quantity))
+            return fields
+
+        wire_id, fields = await self._next_wire_id(client_order_id, build)
         await self._request_change(_Kind.CANCEL, "F", wire_id, client_order_id, fields)
 
     async def amend_order(
@@ -1678,22 +1732,26 @@ class FixProvider(Provider):
         limit_price: Decimal | None = None,
     ) -> None:
         """Send OrderCancelReplaceRequest(G) and wait for the first answer."""
-        self._require_session()
+        self._session.require_ready()
         await self._refuse_while_halted()  # a replacement can raise exposure
-        record, wire_id = await self._next_wire_id(client_order_id)
-        fields: Fields = [
-            (_TAG_ORIG_CLIENT_ORDER_ID, record.wire_id),
-            (_TAG_CLIENT_ORDER_ID, wire_id),
-        ]
-        if record.venue_order_id is not None:
-            fields.append((_TAG_ORDER_ID, record.venue_order_id))
-        fields.extend(
-            self._order_terms(
-                record,
-                quantity if quantity is not None else record.quantity,
-                limit_price if limit_price is not None else record.limit_price,
+
+        def build(record: _Record, wire_id: str) -> Fields:
+            fields: Fields = [
+                (_TAG_ORIG_CLIENT_ORDER_ID, record.wire_id),
+                (_TAG_CLIENT_ORDER_ID, wire_id),
+            ]
+            if record.venue_order_id is not None:
+                fields.append((_TAG_ORDER_ID, record.venue_order_id))
+            fields.extend(
+                self._order_terms(
+                    record,
+                    quantity if quantity is not None else record.quantity,
+                    limit_price if limit_price is not None else record.limit_price,
+                )
             )
-        )
+            return fields
+
+        wire_id, fields = await self._next_wire_id(client_order_id, build)
         await self._request_change(_Kind.REPLACE, "G", wire_id, client_order_id, fields)
 
     async def order_status(
@@ -1710,7 +1768,7 @@ class FixProvider(Provider):
                 )
                 return None
             raise TransportError(_no_record_text(client_order_id), retryable=False)
-        self._require_session()
+        self._session.require_ready()
         self._request_counter += 1
         key = f"S{self._request_counter}-{client_order_id}"
         fields: Fields = [(_TAG_CLIENT_ORDER_ID, record.wire_id)]
@@ -1810,8 +1868,9 @@ class FixProvider(Provider):
             await self._refuse_while_halted()
             for execution in await self._store_call(self._store.busted_executions):
                 queue.put_nowait(self._replayed_bust(execution))
-            if self._failure is not None:
-                queue.put_nowait(self._failure)
+            failure = self._session.failure
+            if failure is not None:
+                queue.put_nowait(failure)
             while True:
                 item = await queue.get()
                 if isinstance(item, Exception):

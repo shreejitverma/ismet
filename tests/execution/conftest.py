@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from ismet.errors import TransportError
 from ismet.execution import (
     Journal,
     KillState,
@@ -18,7 +19,7 @@ from ismet.execution import (
     SqliteJournal,
 )
 from ismet.models import Symbol
-from ismet.models.orders import OrderRequest, OrderSide, OrderType
+from ismet.models.orders import OrderEvent, OrderRequest, OrderSide, OrderType
 from ismet.testing.simvenue import SIM_VENUE, SimVenue, sim_instrument
 from ismet.transport.clock import ManualClock
 
@@ -34,6 +35,21 @@ async def until(condition: Callable[[], bool], timeout: float = 5.0) -> None:
             await asyncio.sleep(0.001)
 
     await asyncio.wait_for(poll(), timeout)
+
+
+async def lose_stream(oms: OrderManager, venue: SimVenue) -> None:
+    """Break the stream, and hold it down until the manager has seen that.
+
+    Reconnects are jittered from zero, so otherwise it could be back between two polls.
+    """
+
+    def refused() -> AsyncIterator[OrderEvent]:
+        raise TransportError("simulated: stream endpoint down")
+
+    venue.stream_executions = refused  # type: ignore[method-assign]
+    venue.disconnect_stream()
+    await until(lambda: not oms.stream_healthy)
+    del venue.stream_executions
 
 
 def count_kill_polls(journal: Journal) -> dict[str, int]:

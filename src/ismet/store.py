@@ -19,13 +19,15 @@ import sqlite3
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from pathlib import Path
 
 from ismet.calendars import Session, TradingCalendar
 from ismet.errors import CalendarOutOfRange, IsmetError, ValidationError
 from ismet.export import BarSeries
 from ismet.models import Bar, Interval, Symbol
+from ismet.models.decimals import _EXACT
+from ismet.refdata.master import trading_date
 from ismet.transport.clock import SYSTEM_CLOCK, Clock
 
 logger = logging.getLogger("ismet.store")
@@ -58,9 +60,10 @@ def _content_digest(bar: Bar) -> str:
     # the listing, whose identity is the row's key. None of them is the data.
     fields = bar.model_dump(mode="json", exclude={"received_ts", "source", "symbol"})
     fields["quality"] = sorted(fields["quality"])  # a set's order varies by process
-    for name, value in bar:
-        if isinstance(value, Decimal):
-            fields[name] = format(value.normalize(), "f")  # 10.10 and 10.1 are equal
+    with localcontext(_EXACT):
+        for name, value in bar:
+            if isinstance(value, Decimal):
+                fields[name] = format(value.normalize(), "f")  # 10.10 equals 10.1
     payload = json.dumps(fields, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -162,7 +165,9 @@ class BarStore:
     ) -> BarSeries:
         """Bars with ``start <= time < end``, as they were known at ``as_of``.
 
-        With no ``as_of``, the latest version of each bar.
+        With no ``as_of``, the latest version of each bar. A range holding more than
+        one ``adjustment`` raises :class:`~ismet.errors.ValidationError`, because its
+        prices are on different scales. :meth:`checksum` reads the same way.
         """
         begin = _utc_text(start, "start")
         finish = _utc_text(end, "end")
@@ -184,7 +189,14 @@ class BarStore:
                 cutoff,
             ),
         ).fetchall()
-        return BarSeries(Bar.model_validate_json(row[0]) for row in rows)
+        bars = BarSeries(Bar.model_validate_json(row[0]) for row in rows)
+        scales = sorted({bar.adjustment.value for bar in bars})
+        if len(scales) > 1:
+            raise ValidationError(
+                f"{symbol} {interval.value} from {begin} to {finish} mixes price "
+                f"scales {scales}; keep raw bars in the store and adjust on read"
+            )
+        return bars
 
     def revisions(self, symbol: Symbol, interval: Interval, bar_ts: datetime) -> int:
         """How many versions of one bar are stored."""
@@ -227,9 +239,7 @@ class BarStore:
         bars = self.read(
             symbol, Interval.D1, begin - timedelta(days=1), finish + timedelta(days=2)
         )
-        present = {
-            bar.session_date or calendar.local_date(bar.exchange_ts) for bar in bars
-        }
+        present = {trading_date(bar, calendar) for bar in bars}
         return [
             session.date
             for session in calendar.sessions(start, end)
@@ -345,9 +355,11 @@ async def backfill(
 ) -> BackfillReport:
     """Fetch ``[start, end)`` in windows into ``store``. Safe to rerun after a failure.
 
-    Finished windows are recorded and skipped next time. A window's failure is logged
-    and counted, and the rest continue. An empty window counts as finished only if
-    ``calendar`` shows no session touching it. With ``calendar``, every session must
+    Finished windows are recorded and skipped next time, unless ``calendar`` shows a
+    session in one with no bar, as a window finished without a calendar or from a later
+    start can: that window is fetched again and judged as new. A window's failure is
+    logged and counted, and the rest continue. An empty window counts as finished only
+    if ``calendar`` shows no session touching it. With ``calendar``, every session must
     have at least one bar, at any interval, for the window holding its close to finish.
     The bars can be in an earlier window, since a session can straddle several, and the
     store is what is asked. Sessions that began before ``start`` or close after ``end``
@@ -364,12 +376,9 @@ async def backfill(
     while cursor < end:
         upper = min(cursor + window, end)
         report.windows_total += 1
-        if store.window_done(symbol, interval, cursor, upper):
-            report.windows_skipped += 1
-        else:
-            await _backfill_window(
-                fetch, store, symbol, interval, cursor, upper, calendar, start, report
-            )
+        await _backfill_window(
+            fetch, store, symbol, interval, cursor, upper, calendar, start, report
+        )
         cursor = upper
     return report
 
@@ -386,6 +395,14 @@ async def _backfill_window(
     report: BackfillReport,
 ) -> None:
     try:
+        if store.window_done(symbol, interval, start, end) and (
+            calendar is None
+            or not _sessions_without_bars(
+                store, symbol, interval, calendar, start, end, requested_from
+            )
+        ):
+            report.windows_skipped += 1
+            return
         bars = await fetch(symbol, interval, start, end)
         _check_window(bars, symbol, interval, start, end)
         result = store.write(bars)
@@ -453,9 +470,7 @@ def _sessions_without_bars(
     # A daily bar can be stamped before its session opens, so read a day wider.
     earliest = min(start, due[0].open) - timedelta(days=1)
     stored = store.read(symbol, interval, earliest, end)
-    present = {
-        bar.session_date or calendar.local_date(bar.exchange_ts) for bar in stored
-    }
+    present = {trading_date(bar, calendar) for bar in stored}
     return [session.date for session in due if session.date not in present]
 
 
