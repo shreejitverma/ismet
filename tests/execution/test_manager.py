@@ -767,7 +767,7 @@ async def test_stop_order_elects_and_fills(oms: OrderManager, venue: SimVenue) -
     assert state.average_price == D("10.51")
 
 
-async def test_wait_for_times_out(oms: OrderManager) -> None:
+async def test_wait_for_times_out(oms: OrderManager, venue: SimVenue) -> None:
     await venue.drain()
     await oms.submit(order("W1", price="9.50"))
     with pytest.raises(asyncio.TimeoutError):
