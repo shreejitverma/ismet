@@ -21,11 +21,16 @@ class Provider:
     ``environment`` says where this instance's orders go. It defaults to ``LIVE``
     because a forgotten declaration must fail safe: the order manager refuses a live
     provider without an explicit acknowledgement.
+
+    ``gates_streams`` says the adapter's streams already drop repeats and set
+    ``AFTER_GAP`` and ``OUT_OF_ORDER`` by its venue's own numbering rule. Otherwise the
+    client treats ``sequence`` as rising by one per event on each symbol.
     """
 
     name: ClassVar[str]
     venues: ClassVar[frozenset[str]] = frozenset()
     environment: Environment = Environment.LIVE
+    gates_streams: ClassVar[bool] = False
 
     def __init__(self, *, clock: Clock = SYSTEM_CLOCK) -> None:
         self.clock = clock

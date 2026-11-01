@@ -9,7 +9,7 @@ import pytest
 from ismet import IsmetSyncClient, Symbol
 from ismet.errors import ConfigError, TransportError, ValidationError
 from ismet.providers.mock import MockProvider
-from ismet.sync import _as_datetime
+from ismet.sync import as_datetime
 
 
 def sync_threads() -> list[threading.Thread]:
@@ -47,7 +47,7 @@ def test_bars_accept_dates_strings_and_datetimes_and_export() -> None:
 
 def test_naive_datetimes_are_rejected() -> None:
     with pytest.raises(ValidationError, match="timezone-aware"):
-        _as_datetime("2026-03-09T10:00:00", datetime.now(timezone.utc))
+        as_datetime("2026-03-09T10:00:00", datetime.now(timezone.utc))
 
 
 def test_works_from_inside_a_running_event_loop() -> None:
@@ -133,3 +133,52 @@ def test_from_env(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:  # type: i
     monkeypatch.setenv("ISMET_CONFIG_FILE", str(tmp_path / "none.toml"))
     with IsmetSyncClient.from_env() as client:
         assert client.quote("ACME@XMOK").last is not None
+
+
+def test_a_stream_held_across_close_and_reopen_raises_rather_than_ending() -> None:
+    client = IsmetSyncClient([MockProvider()])
+    client.open()
+    stream = client.stream_quotes(["ACME"], venue="XMOK")
+    next(stream)
+    client.close()
+    client.open()
+    try:
+        with pytest.raises(ConfigError, match="closed during this stream"):
+            list(stream)
+    finally:
+        client.close()
+
+
+def test_a_stream_the_consumer_left_does_not_fail_a_later_close() -> None:
+    client = IsmetSyncClient([MockProvider()])
+    client.open()
+    stream = client.stream_quotes(["ACME"], venue="XMOK")
+    next(stream)
+    stream.close()
+    client.close()
+    assert client._streams == {}
+
+
+def test_a_stop_that_times_out_still_stops_the_loop(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr("ismet.sync._JOIN_TIMEOUT", 0.2)
+    client = IsmetSyncClient([MockProvider()])
+    client.open()
+    thread = client._thread
+    assert thread is not None
+
+    async def stubborn() -> None:
+        while True:
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                await asyncio.sleep(0.05)
+                continue
+
+    assert client._loop is not None
+    pending = asyncio.run_coroutine_threadsafe(stubborn(), client._loop)
+    with pytest.raises(TimeoutError):
+        client.close()
+    assert client._thread is None and client._loop is None
+    thread.join(3)
+    assert not thread.is_alive()
+    pending.cancel()

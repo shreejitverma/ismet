@@ -14,7 +14,7 @@ from ismet.models.orders import OrderSide
 
 D = Decimal
 TS = datetime(2026, 3, 9, 15, 0, tzinfo=timezone.utc)
-SYM = Symbol(venue="XSIM", ticker="ACME")
+SYM = Symbol(venue="ZSIM", ticker="ACME")
 BUY, SELL = OrderSide.BUY, OrderSide.SELL
 
 
@@ -96,8 +96,44 @@ def test_buffer_is_bounded_and_reports_overflow() -> None:
     for sequence in range(1, 5):
         book.apply_delta(BookDelta(BUY, D(10), D(1), sequence))
     assert book.overflowed
-    book.apply_snapshot(0, [], [])
+    assert book.apply_snapshot(4, [], [])
     assert not book.overflowed
+    assert book.is_synced
+
+
+def test_redelivered_batch_cannot_roll_a_new_snapshot_back() -> None:
+    book = BookBuilder(SYM)
+    book.apply_snapshot(10, [(D(100), D(9))], [])
+    delta = BookDelta(BUY, D(100), D(1), 15, first_sequence=11)
+    assert book.apply_delta(delta)
+    assert book.apply_snapshot(20, [(D(100), D(5))], [])
+    assert not book.apply_delta(delta)
+    assert book.last_sequence == 20
+    assert snap(book).bids[0].size == D(5)
+
+
+def test_levels_of_one_batch_still_apply_together() -> None:
+    book = BookBuilder(SYM)
+    book.apply_snapshot(10, [], [])
+    assert book.apply_delta(BookDelta(BUY, D(100), D(1), 13, first_sequence=11))
+    assert book.apply_delta(BookDelta(BUY, D(99), D(2), 13, first_sequence=11))
+    assert [(x.price, x.size) for x in snap(book).bids] == [
+        (D(100), D(1)),
+        (D(99), D(2)),
+    ]
+
+
+def test_a_batch_cut_by_overflow_cannot_sync_from_an_older_snapshot() -> None:
+    book = BookBuilder(SYM, max_buffered=2)
+    for price in (D(100), D(99), D(98)):
+        book.apply_delta(BookDelta(BUY, price, D(1), 13, first_sequence=11))
+    assert not book.apply_snapshot(10, [], [])
+    assert not book.is_synced
+    assert book.overflowed
+    with pytest.raises(SequenceGap):
+        snap(book)
+    assert book.apply_snapshot(13, [(D(100), D(1))], [])
+    assert book.is_synced and not book.overflowed
 
 
 def test_batched_deltas_use_the_covered_range() -> None:

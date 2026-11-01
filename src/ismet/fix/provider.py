@@ -13,8 +13,9 @@ What FIX does and does not offer, and how this provider handles each:
   or a disconnect before the ack. A new sequence number is never used for an order, and
   PossResend is never set. The session may retransmit a stored order under its original
   number and PossDupFlag=Y if the venue asks, which the spec requires, and the venue
-  deduplicates by ClOrdID. ``FixSessionConfig.stale_resend_after`` gap-fills aged
-  orders.
+  deduplicates by ClOrdID. That is the one case where an order's bytes can leave twice,
+  and only within ``FixSessionConfig.stale_resend_after`` of the first send. An older
+  order is gap-filled, never resent.
 - A reject with OrdRejReason=6 means the venue already holds the ClOrdID, which is what
   a resent order can get. It raises :class:`~ismet.errors.DuplicateOrderId` and does not
   reach the stream, because it says nothing against the original order.
@@ -27,29 +28,36 @@ What FIX does and does not offer, and how this provider handles each:
   session Reject, or any other reject raises and never returns ``None``. The one other
   case that cannot be asked is an order with no row in the store: FIX requires Side,
   which only that row holds. It raises rather than returning ``None``, because a wiped
-  or misconfigured store must not make a live order look dead. An order whose process
-  died between the order manager's ``send_started`` and this row stays ``UNKNOWN``
-  until an operator resolves it.
+  or misconfigured store must not make a live order look dead. This is a declared
+  exception to the trading conformance check ``status_none_when_not_found``. An order
+  whose process died between the order manager's ``send_started`` and this row stays
+  ``UNKNOWN`` until an operator resolves it.
 - ``cancel_order`` and ``amend_order`` send F and G under a fresh ClOrdID, as FIX
   requires, with OrigClOrdID naming the last accepted one. The chain is durable, so a
   report under any of its ClOrdIDs maps back to the caller's client order id. They wait
   for the first reply: OrderCancelReject(9) raises ``VenueError``, and any execution
-  report returns. A timeout or disconnect raises ``AmbiguousOutcome``.
+  report returns. A timeout or disconnect raises ``AmbiguousOutcome``. An order with no
+  row in the store raises ``VenueError`` with code ``NO_LOCAL_RECORD``, and nothing is
+  sent.
 - ``open_orders`` and ``fills_since``: FIX has no universal query for these, since
   OrderMassStatusRequest and TradeCaptureReportRequest are optional and venue-specific.
   Both answer from the durable local record of what this session sent and was told, so
   **an order placed outside this session is not listed** until a report arrives.
 - ``stream_executions``: execution reports are durable in the store before the inbound
-  sequence number advances. After a crash, ones the order manager never saw are found by
-  reconciliation through ``order_status`` and ``fills_since``.
+  sequence number advances. After a crash, fills the order manager never saw are found
+  by reconciliation through ``order_status`` and ``fills_since``. Reconciliation cannot
+  see a bust, so every call first replays :class:`FillBusted` for each busted execution
+  in the store. The order manager treats a repeat as a no-op.
 - An execution report that cannot be applied still consumes its sequence number, as
   the session test cases require, and could have been a fill. So it is quarantined
-  durably, its order is restated as ``UNKNOWN``, and the stream stops raising
-  :class:`ReportQuarantinedError` until an operator calls
-  :meth:`FixProvider.release_quarantine`. The order manager then refuses new orders and
-  its reconciliation compares CumQty with the venue. This fails closed: one malformed
-  report stops new orders on this provider. A report with only a field defect such as
-  an empty Text is applied and then rejected.
+  durably, its order is restated as ``UNKNOWN``, and the stream raises
+  :class:`ReportQuarantinedError`, on every subscribe and across restarts, until an
+  operator calls :meth:`FixProvider.release_quarantine`, which is recorded in the store.
+  The order manager then refuses new orders and its reconciliation compares CumQty with
+  the venue. This fails closed: one malformed report stops new orders on this provider.
+  A report with only a field defect such as an empty Text is applied and then rejected.
+  A SequenceReset-Reset that skips numbers, or a peer's unrequested sequence reset, can
+  hide fills the same way and stops the stream the same way.
 - Fill identity: ``fill_id`` is ExecID(17). ExecID is unique within a day or the life
   of a multi-day order (FIX 4.2 field definition), so duplicates are detected per order.
   A repeat with the same content is dropped. A repeated fill with different content is
@@ -67,10 +75,11 @@ import asyncio
 import contextlib
 import hashlib
 import logging
+import ssl as ssl_module
 from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 from functools import partial
@@ -87,6 +96,7 @@ from ismet.errors import (
     DuplicateOrderId,
     IsmetError,
     TransportError,
+    ValidationError,
     VenueError,
 )
 from ismet.fix.message import (
@@ -155,50 +165,52 @@ _HEADER_TAGS = frozenset({34, 43, 49, 50, 52, 56, 57, 97, 115, 116, 122, 128, 12
 _BACKLOG_LIMIT = 100_000
 _MULTI_DAY = frozenset({TimeInForce.GTC, TimeInForce.GTD})
 _SENT_INDEX_LIMIT = 10_000
+_PRICED_ORDER_TYPES = frozenset({OrderType.LIMIT, OrderType.STOP_LIMIT})
+_DUPLICATE_ORDER_REASON = "6"
+_UNKNOWN_ID_BUSINESS_REASON = "1"
+_IGNORED_MSG_TYPES = frozenset({"B", "C"})
+_MANY_MESSAGES = "*"
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
-@dataclass(frozen=True)
-class FixTags:
-    """Business tags, with the FIX standard numbers. A venue can replace any of them."""
-
-    account: int = 1
-    avg_px: int = 6
-    client_order_id: int = 11
-    commission: int = 12
-    commission_type: int = 13
-    cum_qty: int = 14
-    currency: int = 15
-    exec_id: int = 17
-    exec_inst: int = 18
-    exec_ref_id: int = 19
-    exec_trans_type: int = 20
-    handl_inst: int = 21
-    last_px: int = 31
-    last_qty: int = 32
-    ord_status_req_id: int = 790
-    order_id: int = 37
-    order_qty: int = 38
-    ord_status: int = 39
-    ord_type: int = 40
-    orig_client_order_id: int = 41
-    price: int = 44
-    ref_seq_num: int = 45
-    side: int = 54
-    symbol: int = 55
-    text: int = 58
-    time_in_force: int = 59
-    transact_time: int = 60
-    stop_px: int = 99
-    cxl_rej_reason: int = 102
-    ord_rej_reason: int = 103
-    expire_time: int = 126
-    exec_type: int = 150
-    ref_msg_type: int = 372
-    business_reject_ref_id: int = 379
-    business_reject_reason: int = 380
-    session_reject_reason: int = 373
-    cxl_rej_response_to: int = 434
-    last_liquidity_ind: int = 851
+_TAG_ACCOUNT = 1
+_TAG_CLIENT_ORDER_ID = 11
+_TAG_COMMISSION = 12
+_TAG_COMMISSION_TYPE = 13
+_TAG_CUM_QTY = 14
+_TAG_CURRENCY = 15
+_TAG_EXEC_ID = 17
+_TAG_EXEC_INST = 18
+_TAG_EXEC_REF_ID = 19
+_TAG_EXEC_TRANS_TYPE = 20
+_TAG_HANDL_INST = 21
+_TAG_LAST_PX = 31
+_TAG_LAST_QTY = 32
+_TAG_ORD_STATUS_REQ_ID = 790
+_TAG_ORDER_ID = 37
+_TAG_ORDER_QTY = 38
+_TAG_ORD_STATUS = 39
+_TAG_ORD_TYPE = 40
+_TAG_ORIG_CLIENT_ORDER_ID = 41
+_TAG_PRICE = 44
+_TAG_REF_SEQ_NUM = 45
+_TAG_SIDE = 54
+_TAG_SYMBOL = 55
+_TAG_TEXT = 58
+_TAG_TIME_IN_FORCE = 59
+_TAG_TRANSACT_TIME = 60
+_TAG_STOP_PX = 99
+_TAG_CXL_REJ_REASON = 102
+_TAG_ORD_REJ_REASON = 103
+_TAG_EXPIRE_TIME = 126
+_TAG_EXEC_TYPE = 150
+_TAG_REF_MSG_TYPE = 372
+_TAG_BUSINESS_REJECT_REF_ID = 379
+_TAG_BUSINESS_REJECT_REASON = 380
+_TAG_SESSION_REJECT_REASON = 373
+_TAG_CXL_REJ_RESPONSE_TO = 434
+_TAG_LAST_LIQUIDITY_IND = 851
+_TAG_MSG_SEQ_NUM = 34
 
 
 _ORD_STATUS: Mapping[str, OrderStatus] = {
@@ -225,13 +237,9 @@ class FixDialect:
     """How one venue's FIX differs from the standard. Override fields or subclass.
 
     ``handl_inst`` is required on D and G in FIX 4.2 and optional later. ``None`` omits
-    it. ``status_request_ids`` adds OrdStatusReqID(790), which arrived in FIX 4.3, and
-    ``None`` decides from the BeginString. ``ignored_msg_types`` are application
-    messages accepted without action. Anything else unrecognised gets a
-    BusinessMessageReject, as test case 2r requires.
+    it.
     """
 
-    tags: FixTags = field(default_factory=FixTags)
     side_codes: Mapping[OrderSide, str] = field(
         default_factory=lambda: {OrderSide.BUY: "1", OrderSide.SELL: "2"}
     )
@@ -263,19 +271,14 @@ class FixDialect:
     ord_status: Mapping[str, OrderStatus] = field(default_factory=lambda: _ORD_STATUS)
     post_only_exec_inst: str | None = "6"
     handl_inst: str | None = "1"
-    status_request_ids: bool | None = None
     unknown_order_reasons: frozenset[str] = frozenset({"5"})
-    duplicate_order_reasons: frozenset[str] = frozenset({"6"})
-    unknown_id_business_reasons: frozenset[str] = frozenset({"1"})
-    ignored_msg_types: frozenset[str] = frozenset({"B", "C"})
-    default_venue: str | None = None
     supports_amend: bool = True
     supports_short: bool = True
     client_order_id_max_length: int = 60
 
     def instrument_fields(self, symbol: Symbol) -> Fields:
         """How an instrument is named. Override to add SecurityID or an exchange."""
-        return [(self.tags.symbol, symbol.ticker)]
+        return [(_TAG_SYMBOL, symbol.ticker)]
 
     def side_of(self, code: str) -> OrderSide | None:
         """A Side value, reduced to its direction. ``None`` if it has none."""
@@ -296,10 +299,9 @@ class FixDialect:
 
     def is_unknown_order(self, report: FixMessage) -> bool:
         """Whether a status reply means the venue has no such order (scenario D24)."""
-        tags = self.tags
         return (
-            report.get(tags.ord_status) == "8"
-            and report.get(tags.ord_rej_reason) in self.unknown_order_reasons
+            report.get(_TAG_ORD_STATUS) == "8"
+            and report.get(_TAG_ORD_REJ_REASON) in self.unknown_order_reasons
         )
 
     def is_duplicate_reject(self, report: FixMessage) -> bool:
@@ -307,15 +309,14 @@ class FixDialect:
 
         It says nothing against the original order, which may be live.
         """
-        tags = self.tags
         return (
-            report.get(tags.exec_type) == "8"
-            and report.get(tags.ord_rej_reason) in self.duplicate_order_reasons
+            report.get(_TAG_EXEC_TYPE) == "8"
+            and report.get(_TAG_ORD_REJ_REASON) == _DUPLICATE_ORDER_REASON
         )
 
     def is_fill_report(self, report: FixMessage) -> bool:
         """4.4 and later report a trade as F, and 4.2 as a partial fill or fill."""
-        return report.get(self.tags.exec_type) in ("F", "1", "2")
+        return report.get(_TAG_EXEC_TYPE) in ("F", "1", "2")
 
     def trading_rules(self) -> TradingRules:
         return TradingRules(
@@ -443,7 +444,7 @@ class FixProvider(Provider):
         self._pending_by_seq: dict[int, _Pending] = {}
         self._sent: OrderedDict[int, _Sent] = OrderedDict()
         self._subscribers: list[asyncio.Queue[OrderEvent | Exception]] = []
-        self._backlog: deque[OrderEvent | ReportQuarantinedError] = deque()
+        self._backlog: deque[OrderEvent] = deque()
         self._records_lock = asyncio.Lock()
         self._failure: Exception | None = None
         self._request_counter = 0
@@ -457,9 +458,13 @@ class FixProvider(Provider):
 
         Options: ``host``, ``port``, ``begin_string``, ``sender_comp_id``,
         ``target_comp_id``, ``store_path``, and optionally ``heartbeat_interval``,
-        ``default_appl_ver_id``. Credentials: ``username`` and ``password``, if the
-        venue uses them. ``environment`` may be ``simulated`` or ``paper`` to opt out
-        of LIVE.
+        ``default_appl_ver_id``, ``tls``. Credentials: ``username`` and ``password``, if
+        the venue uses them. ``environment`` may be ``simulated`` or ``paper`` to opt
+        out of LIVE.
+
+        Credentials are refused without ``tls = true``, because Logon would carry them
+        in clear. Set ``allow_plaintext_credentials = true`` when a stunnel or VPN
+        protects the connection.
         """
         missing = [
             key
@@ -477,6 +482,19 @@ class FixProvider(Provider):
             raise ConfigError(
                 f"provider {settings.name!r} is missing options: {', '.join(missing)}"
             )
+        username = settings.credentials.get("username")
+        password = settings.credentials.get("password")
+        tls = settings.option("tls", False) is True
+        if (
+            (username is not None or password is not None)
+            and not tls
+            and settings.option("allow_plaintext_credentials", False) is not True
+        ):
+            raise ConfigError(
+                f"provider {settings.name!r} would send credentials in clear; set the "
+                "option tls = true, or allow_plaintext_credentials = true if a tunnel "
+                "protects the connection"
+            )
         config = FixSessionConfig(
             host=str(settings.option("host")),
             port=int(settings.option("port")),
@@ -485,8 +503,9 @@ class FixProvider(Provider):
             target_comp_id=str(settings.option("target_comp_id")),
             heartbeat_interval=int(settings.option("heartbeat_interval", 30)),
             default_appl_ver_id=settings.option("default_appl_ver_id"),
-            username=settings.credentials.get("username"),
-            password=settings.credentials.get("password"),
+            username=username,
+            password=password,
+            ssl=ssl_module.create_default_context() if tls else None,
         )
         store = SqliteFixStore(Path(settings.option("store_path")), config.session_id)
         provider = cls(
@@ -558,13 +577,12 @@ class FixProvider(Provider):
         await self._quarantine(message, reason)
 
     async def on_session_reject(self, message: FixMessage) -> None:
-        tags = self.dialect.tags
-        seq_text = message.get(tags.ref_seq_num)
-        code = f"SESSION_{message.get(tags.session_reject_reason, 'REJECT')}"
+        seq_text = message.get(_TAG_REF_SEQ_NUM)
+        code = f"SESSION_{message.get(_TAG_SESSION_REJECT_REASON, 'REJECT')}"
         text = self._peer_text(message) or "session-level reject"
         seq = _reference(seq_text)
         sent = None if seq is None else self._sent.get(seq)
-        ref_type = message.get(tags.ref_msg_type)
+        ref_type = message.get(_TAG_REF_MSG_TYPE)
         if (
             sent is not None
             and ref_type is not None
@@ -593,24 +611,42 @@ class FixProvider(Provider):
             await self._quarantine(message, exc.text)
             raise
 
+    async def on_possible_message_loss(
+        self, first_seq: int, last_seq: int | None, reason: str
+    ) -> None:
+        text = self._session.scrub(reason)
+        logger.critical("FIX messages may be lost: %s", text)
+        last = "unknown" if last_seq is None else str(last_seq)
+        record = QuarantinedMessage(
+            first_seq,
+            _MANY_MESSAGES,
+            f"unread inbound messages from {first_seq} to {last}",
+            text,
+            self.clock.now().isoformat(),
+            halted=True,
+        )
+        await self._session.run_store(lambda: self._store.quarantine(record))
+        self._halt(ReportQuarantinedError(f"messages may be lost: {text}"))
+
     async def _quarantine(self, message: FixMessage, reason: str) -> None:
         """Record a message that will never be redelivered, and stop if it mattered."""
         self.dropped_reports += 1
         text = self._session.scrub(reason)
         logger.critical("FIX message type %s quarantined: %s", message.msg_type, text)
+        halted = message.msg_type == "8" and not self._is_status(message)
         record = QuarantinedMessage(
-            parse_seq_num(message.get(34) or "0"),
+            parse_seq_num(message.get(_TAG_MSG_SEQ_NUM) or "0"),
             message.msg_type,
             self._session.scrub(repr(message)),
             text,
             self.clock.now().isoformat(),
+            halted=halted,
         )
         await self._session.run_store(lambda: self._store.quarantine(record))
-        if message.msg_type != "8" or self._is_status(message):
+        if not halted:
             return
-        tags = self.dialect.tags
-        wire_id = message.get(tags.client_order_id)
-        root = await self._resolve(wire_id, message.get(tags.orig_client_order_id))
+        wire_id = message.get(_TAG_CLIENT_ORDER_ID)
+        root = await self._resolve(wire_id, message.get(_TAG_ORIG_CLIENT_ORDER_ID))
         target = root or wire_id
         if target is not None:
             # A pending report that may hold a fill: only a query can settle it.
@@ -627,39 +663,43 @@ class FixProvider(Provider):
         self._halt(ReportQuarantinedError(f"unreadable execution report: {text}"))
 
     def _halt(self, error: ReportQuarantinedError) -> None:
-        if self._subscribers:
-            for queue in self._subscribers:
-                queue.put_nowait(error)
-        else:
-            self._backlog.append(error)
+        """Stop running streams. Later subscribers read the halt from the store."""
+        for queue in self._subscribers:
+            queue.put_nowait(error)
 
     async def quarantined(self) -> list[QuarantinedMessage]:
         """Every message that consumed a sequence number without being applied."""
-        return await self._store_read(self._store.quarantined)
+        return await self._read_durable(self._store.quarantined)
 
-    def release_quarantine(self) -> None:
-        """An operator has dealt with the quarantine, so the stream may run again."""
-        kept = [e for e in self._backlog if not isinstance(e, ReportQuarantinedError)]
-        self._backlog = deque(kept)
+    async def release_quarantine(self, *, operator: str, reason: str) -> int:
+        """An operator has dealt with the quarantine, so the stream may run again.
+
+        Durable, and the operator is recorded. Returns how many rows were released.
+        """
+        if not operator:
+            raise ValidationError("releasing the FIX quarantine requires an operator")
+        at = self.clock.now().isoformat()
+        return await self._read_durable(
+            lambda: self._store.release_quarantine(operator, reason, at)
+        )
 
     async def _on_other_message(self, message: FixMessage) -> None:
         msg_type = message.msg_type
-        if msg_type in self.dialect.ignored_msg_types:
+        if msg_type in _IGNORED_MSG_TYPES:
             logger.info("FIX ignored application message type %s", msg_type)
         else:
             await self._reject_unsupported(message)
 
     async def _reject_unsupported(self, message: FixMessage) -> None:
-        tags = self.dialect.tags
         logger.warning("FIX message type %s is not supported", message.msg_type)
         with contextlib.suppress(SessionDownError, AmbiguousOutcome, FixStoreError):
             await self._session.send_application(
                 "j",
                 [
-                    (tags.ref_seq_num, message.get(34) or "0"),
-                    (tags.ref_msg_type, message.msg_type),
-                    (tags.business_reject_reason, "3"),
-                    (tags.text, "Unsupported Message Type"),
+                    (_TAG_REF_SEQ_NUM, message.get(_TAG_MSG_SEQ_NUM) or "0"),
+                    (_TAG_REF_MSG_TYPE, message.msg_type),
+                    (_TAG_BUSINESS_REJECT_REASON, "3"),
+                    (_TAG_TEXT, "Unsupported Message Type"),
                 ],
             )
 
@@ -671,18 +711,13 @@ class FixProvider(Provider):
                 queue.put_nowait(event)
             return
         if len(self._backlog) >= _BACKLOG_LIMIT:
-            oldest = next(
-                (e for e in self._backlog if not isinstance(e, ReportQuarantinedError)),
-                None,
+            oldest = self._backlog.popleft()
+            logger.critical(
+                "FIX event backlog is full with no subscriber; dropped %s for %s. "
+                "Reconciliation recovers it from the store.",
+                oldest.kind,
+                oldest.client_order_id,
             )
-            if oldest is not None:
-                self._backlog.remove(oldest)
-                logger.critical(
-                    "FIX event backlog is full with no subscriber; dropped %s for %s. "
-                    "Reconciliation recovers it from the store.",
-                    oldest.kind,
-                    oldest.client_order_id,
-                )
         self._backlog.append(event)
 
     # Store helpers
@@ -695,8 +730,11 @@ class FixProvider(Provider):
 
     async def _save(self, record: _Record) -> None:
         payload = record.model_dump_json()
+        is_open = not record.status.is_terminal
         await self._session.run_store(
-            lambda: self._store.put_order(record.client_order_id, payload)
+            lambda: self._store.put_order(
+                record.client_order_id, payload, is_open=is_open
+            )
         )
 
     async def _resolve(self, *wire_ids: str | None) -> str | None:
@@ -724,21 +762,21 @@ class FixProvider(Provider):
             ) from exc
 
     def _transact_time(self, message: FixMessage) -> datetime:
-        raw = message.get(self.dialect.tags.transact_time)
+        raw = message.get(_TAG_TRANSACT_TIME)
         if raw is None:
             return self.clock.now()
         try:
-            return parse_utc_timestamp(raw, self.dialect.tags.transact_time)
+            return parse_utc_timestamp(raw, _TAG_TRANSACT_TIME)
         except FieldFormatError as exc:
             raise ApplicationRejectError(
                 _REJECT_BAD_FORMAT,
                 "TransactTime is not a timestamp",
-                self.dialect.tags.transact_time,
+                _TAG_TRANSACT_TIME,
             ) from exc
 
     def _peer_text(self, message: FixMessage) -> str:
         """Text(58), which can carry a credential if the venue echoes one."""
-        return self._session.scrub(message.get(self.dialect.tags.text) or "")
+        return self._session.scrub(message.get(_TAG_TEXT) or "")
 
     def _require(self, message: FixMessage, tag: int) -> str:
         value = message.get(tag)
@@ -749,10 +787,9 @@ class FixProvider(Provider):
         return value
 
     def _is_status(self, message: FixMessage) -> bool:
-        tags = self.dialect.tags
         return (
-            message.get(tags.exec_type) == "I"
-            or message.get(tags.exec_trans_type) == "3"
+            message.get(_TAG_EXEC_TYPE) == "I"
+            or message.get(_TAG_EXEC_TRANS_TYPE) == "3"
         )
 
     def _digest(self, message: FixMessage) -> str:
@@ -762,15 +799,14 @@ class FixProvider(Provider):
         return hashlib.sha256(material.encode("latin-1", "replace")).hexdigest()
 
     async def _on_execution_report(self, message: FixMessage) -> None:
-        tags = self.dialect.tags
-        wire_id = self._require(message, tags.client_order_id)
-        root = await self._resolve(wire_id, message.get(tags.orig_client_order_id))
+        wire_id = self._require(message, _TAG_CLIENT_ORDER_ID)
+        root = await self._resolve(wire_id, message.get(_TAG_ORIG_CLIENT_ORDER_ID))
         if self._is_status(message):
             await self._on_status_report(message, root or wire_id, wire_id)
             return
         client_order_id = root or wire_id
-        exec_id = self._require(message, tags.exec_id)
-        self._require(message, tags.exec_type)
+        exec_id = self._require(message, _TAG_EXEC_ID)
+        self._require(message, _TAG_EXEC_TYPE)
         async with self._records_lock:
             await self._apply_report(message, client_order_id, wire_id, exec_id)
 
@@ -802,20 +838,24 @@ class FixProvider(Provider):
         fill = next((e.fill for e in events if isinstance(e, Filled)), None)
         bust = next((e.fill_id for e in events if isinstance(e, FillBusted)), None)
         updated = self._updated_record(record, message, wire_id, fill, bust)
+        received = self.clock.now()
         execution = StoredExecution(
             client_order_id,
             exec_id,
             digest,
             fill.model_dump_json() if fill is not None else None,
             False,
-            self.clock.now().isoformat(),
+            received.isoformat(),
+            _epoch_us(max(fill.ts, received) if fill is not None else received),
         )
         payload = updated.model_dump_json() if updated is not None else None
+        order_open = updated is not None and not updated.status.is_terminal
         commit = asyncio.ensure_future(
             self._session.run_store(
                 lambda: self._store.record_report(
                     client_order_id,
                     order_payload=payload,
+                    order_open=order_open,
                     execution=execution,
                     bust_exec_id=bust,
                 )
@@ -847,31 +887,30 @@ class FixProvider(Provider):
     ) -> _Record | None:
         if record is None:
             return None
-        tags = self.dialect.tags
         update: dict[str, object] = {"updated_at": self.clock.now()}
         if self.dialect.is_duplicate_reject(message):
             return record.model_copy(update=update)
-        exec_type = message.get(tags.exec_type)
-        status_code = message.get(tags.ord_status)
+        exec_type = message.get(_TAG_EXEC_TYPE)
+        status_code = message.get(_TAG_ORD_STATUS)
         status = self._status_from(status_code or "", record)
         if status is not None:
             update["status"] = status
-        cum_qty = self._decimal(message, tags.cum_qty)
+        cum_qty = self._decimal(message, _TAG_CUM_QTY)
         if cum_qty is not None:
             update["filled"] = cum_qty
         elif fill is not None and bust is None:
             update["filled"] = record.filled + fill.quantity
-        venue_order_id = _venue_order_id(message.get(tags.order_id))
+        venue_order_id = _venue_order_id(message.get(_TAG_ORDER_ID))
         if venue_order_id is not None:
             update["venue_order_id"] = venue_order_id
         if exec_type != "A" and exec_type != "8":
             update["acknowledged"] = True
         if exec_type == "5":
             update["wire_id"] = wire_id
-            quantity = self._decimal(message, tags.order_qty)
+            quantity = self._decimal(message, _TAG_ORDER_QTY)
             if quantity is not None:
                 update["quantity"] = quantity
-            price = self._decimal(message, tags.price)
+            price = self._limit_price_of(message, record)
             if price is not None:
                 update["limit_price"] = price
         return record.model_copy(update=update)
@@ -883,9 +922,8 @@ class FixProvider(Provider):
         exec_id: str,
         record: _Record | None,
     ) -> list[OrderEvent]:
-        tags = self.dialect.tags
-        exec_type = message.get(tags.exec_type)
-        trans = message.get(tags.exec_trans_type, "0")
+        exec_type = message.get(_TAG_EXEC_TYPE)
+        trans = message.get(_TAG_EXEC_TRANS_TYPE, "0")
         text = self._peer_text(message)
         ts = self._transact_time(message)
         common: dict[str, Any] = {
@@ -909,12 +947,12 @@ class FixProvider(Provider):
                 if fill is None:
                     return []
                 return [Filled(**common, fill=fill)]
-            venue_order_id = _venue_order_id(message.get(tags.order_id))
+            venue_order_id = _venue_order_id(message.get(_TAG_ORDER_ID))
             if exec_type == "0":
                 return [
                     Acknowledged(
                         **common,
-                        venue_order_id=self._require(message, tags.order_id),
+                        venue_order_id=self._require(message, _TAG_ORDER_ID),
                     )
                 ]
             if exec_type == "4":
@@ -934,32 +972,32 @@ class FixProvider(Provider):
                     Rejected(
                         **common,
                         reason=text or "rejected by the venue",
-                        code=message.get(tags.ord_rej_reason),
+                        code=message.get(_TAG_ORD_REJ_REASON),
                     )
                 ]
             if exec_type == "5":
                 return [
                     Replaced(
                         **common,
-                        quantity=self._decimal(message, tags.order_qty),
-                        limit_price=self._decimal(message, tags.price),
+                        quantity=self._decimal(message, _TAG_ORDER_QTY),
+                        limit_price=self._limit_price_of(message, record),
                         venue_order_id=venue_order_id,
                     )
                 ]
             if exec_type == "D":
-                status = self.dialect.ord_status.get(
-                    self._require(message, tags.ord_status)
+                status = self._status_from(
+                    self._require(message, _TAG_ORD_STATUS), record
                 )
                 if status is None:
                     raise ApplicationRejectError(
-                        _REJECT_BAD_VALUE, "unknown OrdStatus", tags.ord_status
+                        _REJECT_BAD_VALUE, "unknown OrdStatus", _TAG_ORD_STATUS
                     )
                 return [
                     Restated(
                         **common,
                         status=status,
                         venue_order_id=venue_order_id,
-                        venue_filled_quantity=self._decimal(message, tags.cum_qty),
+                        venue_filled_quantity=self._decimal(message, _TAG_CUM_QTY),
                         reason=text,
                     )
                 ]
@@ -970,6 +1008,14 @@ class FixProvider(Provider):
         if exec_type not in ("A", "6", "E", "7", "9", "B"):
             logger.warning("FIX ExecType %s has no order event", exec_type)
         return []
+
+    def _limit_price_of(
+        self, message: FixMessage, record: _Record | None
+    ) -> Decimal | None:
+        """Price(44), only for an order that has one. Venues echo 44=0 on the rest."""
+        if record is None or record.order_type not in _PRICED_ORDER_TYPES:
+            return None
+        return self._decimal(message, _TAG_PRICE)
 
     @staticmethod
     def _done_for_day_ends(record: _Record | None) -> bool:
@@ -988,12 +1034,11 @@ class FixProvider(Provider):
     def _bust_event(
         self, message: FixMessage, client_order_id: str, ts: datetime
     ) -> FillBusted:
-        tags = self.dialect.tags
         return FillBusted(
             client_order_id=client_order_id,
             ts=ts,
             origin=EventOrigin.VENUE,
-            fill_id=self._require(message, tags.exec_ref_id),
+            fill_id=self._require(message, _TAG_EXEC_REF_ID),
             reason=self._peer_text(message) or "execution cancelled by the venue",
         )
 
@@ -1005,33 +1050,32 @@ class FixProvider(Provider):
         record: _Record | None,
         ts: datetime,
     ) -> Fill | None:
-        tags = self.dialect.tags
-        quantity = self._decimal(message, tags.last_qty)
+        quantity = self._decimal(message, _TAG_LAST_QTY)
         if quantity is None:
             raise ApplicationRejectError(
-                _REJECT_REQUIRED_TAG, "LastQty missing on a fill", tags.last_qty
+                _REJECT_REQUIRED_TAG, "LastQty missing on a fill", _TAG_LAST_QTY
             )
         if quantity == 0:
             return None
-        price = self._decimal(message, tags.last_px)
+        price = self._decimal(message, _TAG_LAST_PX)
         if price is None:
             raise ApplicationRejectError(
-                _REJECT_REQUIRED_TAG, "LastPx missing on a fill", tags.last_px
+                _REJECT_REQUIRED_TAG, "LastPx missing on a fill", _TAG_LAST_PX
             )
-        side = self.dialect.side_of(message.get(tags.side, "") or "")
+        side = self.dialect.side_of(message.get(_TAG_SIDE, "") or "")
         if side is None and record is not None:
             side = record.side
         if side is None:
             raise ApplicationRejectError(
-                _REJECT_BAD_VALUE, "Side has no direction", tags.side
+                _REJECT_BAD_VALUE, "Side has no direction", _TAG_SIDE
             )
-        symbol = self._symbol_of(message, record)
+        symbol = self._symbol_of(record)
         fee: Decimal | None = None
         fee_currency: str | None = None
-        if message.get(tags.commission_type) == "3":  # absolute, not per unit or bps
-            fee = self._decimal(message, tags.commission)
+        if message.get(_TAG_COMMISSION_TYPE) == "3":  # absolute, not per unit or bps
+            fee = self._decimal(message, _TAG_COMMISSION)
             if fee is not None:
-                fee_currency = message.get(tags.currency)
+                fee_currency = message.get(_TAG_CURRENCY)
         return Fill(
             fill_id=exec_id,
             client_order_id=client_order_id,
@@ -1040,36 +1084,31 @@ class FixProvider(Provider):
             price=price,
             quantity=quantity,
             ts=ts,
-            venue_order_id=_venue_order_id(message.get(tags.order_id)),
+            venue_order_id=_venue_order_id(message.get(_TAG_ORDER_ID)),
             fee=fee,
             fee_currency=fee_currency,
             liquidity={"1": Liquidity.MAKER, "2": Liquidity.TAKER}.get(
-                message.get(tags.last_liquidity_ind) or "", Liquidity.UNKNOWN
+                message.get(_TAG_LAST_LIQUIDITY_IND) or "", Liquidity.UNKNOWN
             ),
         )
 
-    def _symbol_of(self, message: FixMessage, record: _Record | None) -> Symbol:
-        if record is not None:
-            return record.symbol
-        tags = self.dialect.tags
-        venue = self.dialect.default_venue
-        if venue is None:
+    def _symbol_of(self, record: _Record | None) -> Symbol:
+        if record is None:
             raise ApplicationRejectError(
                 _REJECT_BAD_VALUE,
-                "fill for an unknown order and no default venue",
-                tags.client_order_id,
+                "report on an order this session never sent",
+                _TAG_CLIENT_ORDER_ID,
             )
-        return Symbol(venue=venue, ticker=self._require(message, tags.symbol))
+        return record.symbol
 
     def _answer_waiters(self, message: FixMessage, wire_id: str) -> None:
-        tags = self.dialect.tags
         pending = self._pending.get(wire_id)
         if pending is None or pending.future.done() or pending.kind is _Kind.STATUS:
             return
-        exec_type = message.get(tags.exec_type)
+        exec_type = message.get(_TAG_EXEC_TYPE)
         if exec_type == "8":
             reason = self._peer_text(message) or "rejected by the venue"
-            code = message.get(tags.ord_rej_reason)
+            code = message.get(_TAG_ORD_REJ_REASON)
             duplicate = pending.kind is _Kind.NEW and self.dialect.is_duplicate_reject(
                 message
             )
@@ -1085,7 +1124,7 @@ class FixProvider(Provider):
             pending.future.set_result(
                 OrderAck(
                     client_order_id=pending.client_order_id,
-                    venue_order_id=message.get(tags.order_id) or "NONE",
+                    venue_order_id=message.get(_TAG_ORDER_ID) or "NONE",
                     ts=self._transact_time(message),
                 )
             )
@@ -1095,8 +1134,7 @@ class FixProvider(Provider):
     async def _on_status_report(
         self, message: FixMessage, client_order_id: str, wire_id: str
     ) -> None:
-        tags = self.dialect.tags
-        request_id = message.get(tags.ord_status_req_id)
+        request_id = message.get(_TAG_ORD_STATUS_REQ_ID)
         pending = self._pending.get(request_id or "")
         if pending is None:
             pending = next(
@@ -1110,11 +1148,26 @@ class FixProvider(Provider):
                 None,
             )
         if self.dialect.is_unknown_order(message):
+            async with self._records_lock:
+                await self._forget_order(client_order_id)
             if pending is not None and not pending.future.done():
                 pending.future.set_result(None)
             return
         async with self._records_lock:
             await self._apply_status(message, client_order_id, pending)
+
+    async def _forget_order(self, client_order_id: str) -> None:
+        """The venue has no such order, so stop listing it. A report reopens it."""
+        record = await self._load(client_order_id)
+        if record is not None and not record.status.is_terminal:
+            await self._save(
+                record.model_copy(
+                    update={
+                        "status": OrderStatus.CANCELED,
+                        "updated_at": self.clock.now(),
+                    }
+                )
+            )
 
     async def _apply_status(
         self, message: FixMessage, client_order_id: str, pending: _Pending | None
@@ -1153,37 +1206,36 @@ class FixProvider(Provider):
     def _snapshot(
         self, message: FixMessage, client_order_id: str, record: _Record | None
     ) -> VenueOrderSnapshot:
-        tags = self.dialect.tags
-        code = self._require(message, tags.ord_status)
+        code = self._require(message, _TAG_ORD_STATUS)
         status = self._status_from(code, record)
         if status is None:
             raise ApplicationRejectError(
-                _REJECT_BAD_VALUE, "unknown OrdStatus", tags.ord_status
+                _REJECT_BAD_VALUE, "unknown OrdStatus", _TAG_ORD_STATUS
             )
-        quantity = self._decimal(message, tags.order_qty)
+        quantity = self._decimal(message, _TAG_ORDER_QTY)
         if quantity is None or quantity <= 0:
             if record is None:
                 raise ApplicationRejectError(
-                    _REJECT_REQUIRED_TAG, "OrderQty missing", tags.order_qty
+                    _REJECT_REQUIRED_TAG, "OrderQty missing", _TAG_ORDER_QTY
                 )
             quantity = record.quantity
-        filled = self._decimal(message, tags.cum_qty)
+        filled = self._decimal(message, _TAG_CUM_QTY)
         if filled is None:
             raise ApplicationRejectError(
-                _REJECT_REQUIRED_TAG, "CumQty missing", tags.cum_qty
+                _REJECT_REQUIRED_TAG, "CumQty missing", _TAG_CUM_QTY
             )
-        side = self.dialect.side_of(message.get(tags.side) or "")
+        side = self.dialect.side_of(message.get(_TAG_SIDE) or "")
         if side is None:
             if record is None:
                 raise ApplicationRejectError(
-                    _REJECT_BAD_VALUE, "Side has no direction", tags.side
+                    _REJECT_BAD_VALUE, "Side has no direction", _TAG_SIDE
                 )
             side = record.side
-        price = self._decimal(message, tags.price)
+        price = self._limit_price_of(message, record)
         return VenueOrderSnapshot(
             client_order_id=client_order_id,
-            venue_order_id=_venue_order_id(message.get(tags.order_id)),
-            symbol=self._symbol_of(message, record),
+            venue_order_id=_venue_order_id(message.get(_TAG_ORDER_ID)),
+            symbol=self._symbol_of(record),
             side=side,
             quantity=quantity,
             filled_quantity=filled,
@@ -1195,36 +1247,34 @@ class FixProvider(Provider):
         )
 
     async def _on_cancel_reject(self, message: FixMessage) -> None:
-        tags = self.dialect.tags
-        wire_id = self._require(message, tags.client_order_id)
+        wire_id = self._require(message, _TAG_CLIENT_ORDER_ID)
         reason = self._peer_text(message) or "cancel or replace rejected by the venue"
-        code = message.get(tags.cxl_rej_reason)
+        code = message.get(_TAG_CXL_REJ_REASON)
         pending = self._pending.get(wire_id)
         if pending is not None and not pending.future.done():
             pending.future.set_exception(VenueError(reason, code=code))
             return
-        root = await self._resolve(wire_id, message.get(tags.orig_client_order_id))
+        root = await self._resolve(wire_id, message.get(_TAG_ORIG_CLIENT_ORDER_ID))
         if root is None:
             logger.error("FIX OrderCancelReject for an unknown ClOrdID")
             self.dropped_reports += 1
             return
-        replace = message.get(tags.cxl_rej_response_to) == "2"
+        replace = message.get(_TAG_CXL_REJ_RESPONSE_TO) == "2"
         self._publish_reject(
             _Kind.REPLACE if replace else _Kind.CANCEL, root, reason, code
         )
 
     async def _on_business_reject(self, message: FixMessage) -> None:
-        tags = self.dialect.tags
-        ref_id = message.get(tags.business_reject_ref_id)
-        seq_text = message.get(tags.ref_seq_num)
-        reason_code = message.get(tags.business_reject_reason)
+        ref_id = message.get(_TAG_BUSINESS_REJECT_REF_ID)
+        seq_text = message.get(_TAG_REF_SEQ_NUM)
+        reason_code = message.get(_TAG_BUSINESS_REJECT_REASON)
         text = self._peer_text(message) or "business message reject"
         seq = _reference(seq_text)
         pending = self._find_pending(ref_id, seq)
         code = f"BUSINESS_{reason_code}"
         if pending is not None and pending.kind is _Kind.STATUS:
             if not pending.future.done():
-                if reason_code in self.dialect.unknown_id_business_reasons:
+                if reason_code == _UNKNOWN_ID_BUSINESS_REASON:
                     pending.future.set_result(None)
                 else:
                     pending.future.set_exception(VenueError(text, code=code))
@@ -1235,7 +1285,7 @@ class FixProvider(Provider):
         elif sent is None:
             root = await self._resolve(ref_id)
             kind = {"D": _Kind.NEW, "F": _Kind.CANCEL, "G": _Kind.REPLACE}.get(
-                message.get(tags.ref_msg_type) or ""
+                message.get(_TAG_REF_MSG_TYPE) or ""
             )
             if root is None or kind is None:
                 logger.error("FIX BusinessMessageReject matches no request: %s", text)
@@ -1303,13 +1353,9 @@ class FixProvider(Provider):
 
     # Outbound
 
-    def _wants_status_request_id(self) -> bool:
-        wanted = self.dialect.status_request_ids
-        return self._begin_string != "FIX.4.2" if wanted is None else wanted
-
     def _transact_field(self) -> tuple[int, FieldValue]:
         return (
-            self.dialect.tags.transact_time,
+            _TAG_TRANSACT_TIME,
             format_utc_timestamp(self.clock.now()),
         )
 
@@ -1321,34 +1367,35 @@ class FixProvider(Provider):
     def _order_terms(
         self, record: _Record, quantity: Decimal, limit_price: Decimal | None
     ) -> Fields:
-        tags = self.dialect.tags
         fields: Fields = []
         if record.account is not None:
-            fields.append((tags.account, record.account))
+            fields.append((_TAG_ACCOUNT, record.account))
         if self.dialect.handl_inst is not None:
-            fields.append((tags.handl_inst, self.dialect.handl_inst))
+            fields.append((_TAG_HANDL_INST, self.dialect.handl_inst))
         if record.post_only and self.dialect.post_only_exec_inst is not None:
-            fields.append((tags.exec_inst, self.dialect.post_only_exec_inst))
+            fields.append((_TAG_EXEC_INST, self.dialect.post_only_exec_inst))
         fields.extend(self.dialect.instrument_fields(record.symbol))
-        fields.append((tags.side, self._side_code(record)))
+        fields.append((_TAG_SIDE, self._side_code(record)))
         fields.append(self._transact_field())
-        fields.append((tags.order_qty, quantity))
-        fields.append((tags.ord_type, self.dialect.ord_type_codes[record.order_type]))
+        fields.append((_TAG_ORDER_QTY, quantity))
+        fields.append((_TAG_ORD_TYPE, self.dialect.ord_type_codes[record.order_type]))
         if limit_price is not None:
-            fields.append((tags.price, limit_price))
+            fields.append((_TAG_PRICE, limit_price))
         if record.stop_price is not None:
-            fields.append((tags.stop_px, record.stop_price))
+            fields.append((_TAG_STOP_PX, record.stop_price))
         fields.append(
-            (tags.time_in_force, self.dialect.tif_codes[record.time_in_force])
+            (_TAG_TIME_IN_FORCE, self.dialect.tif_codes[record.time_in_force])
         )
         if record.expire_at is not None:
-            fields.append((tags.expire_time, format_utc_timestamp(record.expire_at)))
+            fields.append((_TAG_EXPIRE_TIME, format_utc_timestamp(record.expire_at)))
         return fields
 
     def _check_supported(self, request: OrderRequest) -> None:
         dialect = self.dialect
         problem: str | None = None
-        if request.order_type not in dialect.ord_type_codes:
+        if self.venues and not self.serves(request.symbol.venue):
+            problem = f"venue {request.symbol.venue}, which FIX cannot route to"
+        elif request.order_type not in dialect.ord_type_codes:
             problem = f"order type {request.order_type.value}"
         elif request.time_in_force not in dialect.tif_codes:
             problem = f"time in force {request.time_in_force.value}"
@@ -1441,7 +1488,7 @@ class FixProvider(Provider):
             updated_at=self.clock.now(),
         )
         fields: Fields = [
-            (self.dialect.tags.client_order_id, cid),
+            (_TAG_CLIENT_ORDER_ID, cid),
             *self._order_terms(record, request.quantity, request.limit_price),
         ]
         payload = record.model_dump_json()
@@ -1490,14 +1537,18 @@ class FixProvider(Provider):
         async with self._records_lock:
             record = await self._load_or_transport_error(client_order_id)
             if record is None:
-                raise _no_record(client_order_id)
+                raise VenueError(
+                    _no_record_text(client_order_id), code="NO_LOCAL_RECORD"
+                )
             sequence = record.chain_length + 1
             wire_id = self.dialect.wire_id(client_order_id, sequence)
             updated = record.model_copy(update={"chain_length": sequence})
             payload = updated.model_dump_json()
 
             def remember() -> None:
-                self._store.put_order(client_order_id, payload)
+                self._store.put_order(
+                    client_order_id, payload, is_open=not updated.status.is_terminal
+                )
                 self._store.link_wire_id(wire_id, client_order_id)
 
             try:
@@ -1530,20 +1581,19 @@ class FixProvider(Provider):
     async def cancel_order(self, client_order_id: str, symbol: Symbol) -> None:
         """Send OrderCancelRequest(F) and wait for the venue's first answer."""
         self._require_session()
-        tags = self.dialect.tags
         record, wire_id = await self._next_wire_id(client_order_id)
         fields: Fields = [
-            (tags.orig_client_order_id, record.wire_id),
-            (tags.client_order_id, wire_id),
+            (_TAG_ORIG_CLIENT_ORDER_ID, record.wire_id),
+            (_TAG_CLIENT_ORDER_ID, wire_id),
         ]
         if record.venue_order_id is not None:
-            fields.append((tags.order_id, record.venue_order_id))
+            fields.append((_TAG_ORDER_ID, record.venue_order_id))
         if record.account is not None:
-            fields.append((tags.account, record.account))
+            fields.append((_TAG_ACCOUNT, record.account))
         fields.extend(self.dialect.instrument_fields(symbol))
-        fields.append((tags.side, self._side_code(record)))
+        fields.append((_TAG_SIDE, self._side_code(record)))
         fields.append(self._transact_field())
-        fields.append((tags.order_qty, record.quantity))
+        fields.append((_TAG_ORDER_QTY, record.quantity))
         await self._request_change(_Kind.CANCEL, "F", wire_id, client_order_id, fields)
 
     async def amend_order(
@@ -1556,14 +1606,13 @@ class FixProvider(Provider):
     ) -> None:
         """Send OrderCancelReplaceRequest(G) and wait for the first answer."""
         self._require_session()
-        tags = self.dialect.tags
         record, wire_id = await self._next_wire_id(client_order_id)
         fields: Fields = [
-            (tags.orig_client_order_id, record.wire_id),
-            (tags.client_order_id, wire_id),
+            (_TAG_ORIG_CLIENT_ORDER_ID, record.wire_id),
+            (_TAG_CLIENT_ORDER_ID, wire_id),
         ]
         if record.venue_order_id is not None:
-            fields.append((tags.order_id, record.venue_order_id))
+            fields.append((_TAG_ORDER_ID, record.venue_order_id))
         fields.extend(
             self._order_terms(
                 record,
@@ -1579,18 +1628,17 @@ class FixProvider(Provider):
         """Ask the venue about an order. See the module docstring for ``None``."""
         record = await self._load_or_transport_error(client_order_id)
         if record is None:
-            raise _no_record(client_order_id)
+            raise TransportError(_no_record_text(client_order_id), retryable=False)
         self._require_session()
-        tags = self.dialect.tags
         self._request_counter += 1
         key = f"S{self._request_counter}-{client_order_id}"
-        fields: Fields = [(tags.client_order_id, record.wire_id)]
+        fields: Fields = [(_TAG_CLIENT_ORDER_ID, record.wire_id)]
         if record.account is not None:
-            fields.append((tags.account, record.account))
+            fields.append((_TAG_ACCOUNT, record.account))
         fields.extend(self.dialect.instrument_fields(symbol))
-        fields.append((tags.side, self._side_code(record)))
-        if self._wants_status_request_id():
-            fields.append((tags.ord_status_req_id, key))
+        fields.append((_TAG_SIDE, self._side_code(record)))
+        if self._begin_string != "FIX.4.2":  # OrdStatusReqID arrived in FIX 4.3
+            fields.append((_TAG_ORD_STATUS_REQ_ID, key))
         pending = self._new_pending(_Kind.STATUS, client_order_id, record.wire_id, key)
         try:
             result = await asyncio.wait_for(
@@ -1612,14 +1660,12 @@ class FixProvider(Provider):
         self, symbol: Symbol | None = None
     ) -> list[VenueOrderSnapshot]:
         """Working orders from the local record. See the module docstring."""
-        payloads = await self._store_read(self._store.all_orders)
+        payloads = await self._store_read(self._store.open_orders)
         snapshots: list[VenueOrderSnapshot] = []
         for payload in payloads:
             record = _Record.model_validate_json(payload)
-            if (
-                not record.acknowledged
-                or record.status.is_terminal
-                or (symbol is not None and record.symbol != symbol)
+            if not record.acknowledged or (
+                symbol is not None and record.symbol != symbol
             ):
                 continue
             snapshots.append(
@@ -1645,16 +1691,15 @@ class FixProvider(Provider):
         A fill counts if either the venue's time or our receipt time is at or after
         ``since``, so a venue clock behind ours cannot hide a recovered fill.
         """
-        executions = await self._store_read(self._store.executions)
+        executions = await self._store_read(
+            partial(self._store.fills_since, _epoch_us(since))
+        )
         fills: list[Fill] = []
         for execution in executions:
-            if execution.fill is None or execution.busted:
+            if execution.fill is None:
                 continue
             fill = Fill.model_validate_json(execution.fill)
-            received = datetime.fromisoformat(execution.received_at)
-            if (fill.ts >= since or received >= since) and (
-                symbol is None or fill.symbol == symbol
-            ):
+            if symbol is None or fill.symbol == symbol:
                 fills.append(fill)
         fills.sort(key=lambda f: f.ts)
         return fills
@@ -1665,25 +1710,54 @@ class FixProvider(Provider):
         except IsmetError as exc:
             raise TransportError(f"FIX store read failed: {exc}") from exc
 
+    async def _read_durable(self, fn: Callable[[], T]) -> T:
+        """A store call that also works before the session starts or after it stops."""
+        try:
+            try:
+                return await self._session.run_store(fn)
+            except SessionDownError:
+                return fn()
+        except IsmetError as exc:
+            raise TransportError(f"FIX store read failed: {exc}") from exc
+
+    def _replayed_bust(self, execution: StoredExecution) -> FillBusted:
+        return FillBusted(
+            client_order_id=execution.client_order_id,
+            ts=self.clock.now(),
+            origin=EventOrigin.VENUE,
+            fill_id=execution.exec_id,
+            reason="execution cancelled by the venue, replayed from the FIX store",
+        )
+
     async def stream_executions(self) -> AsyncIterator[OrderEvent]:
         """Yield venue events. A disconnect the session can restore does not end it.
 
-        Raises once the session has failed for good. Events that arrive with no
-        subscriber wait in a backlog, which the first subscriber drains.
+        Raises :class:`ReportQuarantinedError` at once while a quarantine is unreleased.
+        Otherwise yields the backlog of events that arrived with no subscriber, then a
+        replay of every bust in the store, then live events. Raises after the backlog
+        once the session has failed for good.
         """
-        if self._failure is not None:
-            raise self._failure
         queue: asyncio.Queue[OrderEvent | Exception] = asyncio.Queue()
+        self._subscribers.append(queue)
         while self._backlog:
             queue.put_nowait(self._backlog.popleft())
-        self._subscribers.append(queue)
         try:
+            held = [
+                q
+                for q in await self._read_durable(self._store.quarantined)
+                if q.halted and q.released_by is None
+            ]
+            if held:
+                raise ReportQuarantinedError(
+                    f"{len(held)} quarantined FIX messages await release: "
+                    f"{held[0].reason}"
+                )
+            for execution in await self._read_durable(self._store.busted_executions):
+                queue.put_nowait(self._replayed_bust(execution))
+            if self._failure is not None:
+                queue.put_nowait(self._failure)
             while True:
                 item = await queue.get()
-                if isinstance(item, ReportQuarantinedError):
-                    # Stays queued, so every resubscribe stops here until released.
-                    self._backlog.append(item)
-                    raise item
                 if isinstance(item, Exception):
                     raise item
                 yield item
@@ -1691,12 +1765,7 @@ class FixProvider(Provider):
             self._subscribers.remove(queue)
             while not queue.empty():
                 leftover = queue.get_nowait()
-                if isinstance(leftover, ReportQuarantinedError):
-                    if not any(
-                        isinstance(e, ReportQuarantinedError) for e in self._backlog
-                    ):
-                        self._backlog.append(leftover)
-                elif not isinstance(leftover, Exception):
+                if not isinstance(leftover, Exception):
                     self._backlog.append(leftover)
 
 
@@ -1710,12 +1779,16 @@ def _reference(text: str | None) -> int | None:
         return None
 
 
-def _no_record(client_order_id: str) -> TransportError:
-    return TransportError(
+def _no_record_text(client_order_id: str) -> str:
+    return (
         f"no local record of {client_order_id}, so FIX cannot name its Side. The store "
-        "may be new or misconfigured; an operator must resolve this order.",
-        retryable=False,
+        "may be new or misconfigured; an operator must resolve this order."
     )
+
+
+def _epoch_us(moment: datetime) -> int:
+    """Whole microseconds since the epoch. Exact, unlike a float timestamp."""
+    return (moment - _EPOCH) // timedelta(microseconds=1)
 
 
 def _venue_order_id(value: str | None) -> str | None:
@@ -1723,4 +1796,4 @@ def _venue_order_id(value: str | None) -> str | None:
     return None if value in (None, "NONE") else value
 
 
-__all__ = ["FixDialect", "FixProvider", "FixTags", "ReportQuarantinedError"]
+__all__ = ["FixDialect", "FixProvider", "ReportQuarantinedError"]

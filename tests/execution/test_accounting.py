@@ -21,7 +21,7 @@ from ismet.models.orders import Fill, OrderSide
 
 D = Decimal
 TS = datetime(2026, 3, 9, 15, 0, tzinfo=timezone.utc)
-SYM = Symbol(venue="XSIM", ticker="ACME")
+SYM = Symbol(venue="ZSIM", ticker="ACME")
 _n = {"i": 0}
 
 

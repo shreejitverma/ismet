@@ -19,6 +19,7 @@ import sqlite3
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 
 from ismet.calendars import TradingCalendar
@@ -56,6 +57,9 @@ def _content_digest(bar: Bar) -> str:
     # received_ts and source describe the delivery, not the data.
     fields = bar.model_dump(mode="json", exclude={"received_ts", "source"})
     fields["quality"] = sorted(fields["quality"])  # a set's order varies by process
+    for name, value in bar:
+        if isinstance(value, Decimal):
+            fields[name] = format(value.normalize(), "f")  # 10.10 and 10.1 are equal
     payload = json.dumps(fields, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -139,15 +143,19 @@ class BarStore:
         *,
         as_of: datetime | None = None,
     ) -> BarSeries:
-        """Bars with ``start <= time < end``, as they were known at ``as_of``."""
+        """Bars with ``start <= time < end``, as they were known at ``as_of``.
+
+        With no ``as_of``, the latest version of each bar.
+        """
         begin = _utc_text(start, "start")
         finish = _utc_text(end, "end")
-        cutoff = _utc_text(as_of or self._clock.now(), "as_of")
+        cutoff = None if as_of is None else _utc_text(as_of, "as_of")
         rows = self._conn.execute(
             "SELECT payload FROM bars AS b WHERE venue=? AND ticker=? AND interval=? "
             "AND bar_ts>=? AND bar_ts<? AND known_at=("
             "  SELECT MAX(known_at) FROM bars WHERE venue=b.venue AND ticker=b.ticker "
-            "  AND interval=b.interval AND bar_ts=b.bar_ts AND known_at<=?"
+            "  AND interval=b.interval AND bar_ts=b.bar_ts "
+            "  AND (? IS NULL OR known_at<=?)"
             ") ORDER BY bar_ts",
             (
                 symbol.venue,
@@ -155,6 +163,7 @@ class BarStore:
                 interval.value,
                 begin,
                 finish,
+                cutoff,
                 cutoff,
             ),
         ).fetchall()
@@ -258,26 +267,31 @@ class BackfillReport:
     """Hard accounting for a backfill.
 
     Complete only if every window was fetched and none came back empty without proof
-    that empty was right. A vendor outage can look exactly like an empty window, so
-    such a window stays open and is fetched again next time.
+    that empty was right, or short of what the calendar expects. A vendor outage can
+    look exactly like an empty window, and a partial answer like a full one, so such a
+    window stays open and is fetched again next time. A session with truly no trades
+    keeps its window open too: the report stays honest about what it cannot prove.
     """
 
     windows_total: int = 0
     windows_skipped: int = 0
     windows_fetched: int = 0
     windows_empty_unproven: int = 0
+    windows_incomplete: int = 0
     windows_failed: int = 0
     bars_fetched: int = 0
     bars_inserted: int = 0
     bars_unchanged: int = 0
     bars_revised: int = 0
     failures: list[tuple[datetime, str]] = field(default_factory=list)
+    sessions_missing: list[date] = field(default_factory=list)
 
     @property
     def complete(self) -> bool:
         return (
             self.windows_failed == 0
             and self.windows_empty_unproven == 0
+            and self.windows_incomplete == 0
             and self.windows_skipped + self.windows_fetched == self.windows_total
         )
 
@@ -316,10 +330,15 @@ async def backfill(
 
     Finished windows are recorded and skipped next time. A window's failure is logged
     and counted, and the rest continue. An empty window counts as finished only if
-    ``calendar`` shows no session in it. Check :attr:`BackfillReport.complete`.
+    ``calendar`` shows no session in it. With ``calendar``, every session wholly inside
+    a window must have at least one bar, at any interval, for the window to finish; the
+    bars received are kept either way. Without one, a non-empty answer is taken as
+    final, since nothing can contradict it. Check :attr:`BackfillReport.complete`.
     """
     if window <= timedelta(0):
         raise ValidationError("window must be positive")
+    if start >= end:
+        raise ValidationError(f"backfill start {start} is not before end {end}")
     report = BackfillReport()
     cursor = start
     while cursor < end:
@@ -361,8 +380,38 @@ async def _backfill_window(
     if not bars and not _proven_empty(calendar, start, end):
         report.windows_empty_unproven += 1
         return
+    missing = _sessions_without_bars(bars, calendar, start, end)
+    if missing:
+        report.windows_incomplete += 1
+        report.sessions_missing.extend(missing)
+        return
     store.mark_window_done(symbol, interval, start, end, len(bars))
     report.windows_fetched += 1
+
+
+def _sessions_without_bars(
+    bars: list[Bar],
+    calendar: TradingCalendar | None,
+    start: datetime,
+    end: datetime,
+) -> list[date]:
+    """Sessions wholly inside the window with no bar. Unprovable ones count too."""
+    if calendar is None or not bars:
+        return []
+    first = calendar.local_date(start)
+    last = calendar.local_date(end - timedelta(microseconds=1))
+    try:
+        sessions = calendar.sessions(first, last)
+    except CalendarOutOfRange:
+        return [first]
+    present = {bar.session_date or calendar.local_date(bar.exchange_ts) for bar in bars}
+    return [
+        session.date
+        for session in sessions
+        if start <= session.open
+        and session.close <= end
+        and session.date not in present
+    ]
 
 
 def _proven_empty(

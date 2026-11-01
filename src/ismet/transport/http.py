@@ -28,6 +28,7 @@ touch a Python ``float``.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable, Generator, Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -48,6 +49,8 @@ from ismet.transport.backoff import DEFAULT_RETRY, NO_RETRY, RetryPolicy, retry
 from ismet.transport.circuit import CircuitBreaker
 from ismet.transport.clock import SYSTEM_CLOCK, Clock
 from ismet.transport.ratelimit import RateLimiter
+
+logger = logging.getLogger("ismet.transport")
 
 IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _NOT_SENT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
@@ -244,7 +247,10 @@ class HttpTransport:
 
     def _emit(self, info: RequestInfo) -> None:
         for hook in self.hooks:
-            hook(info)
+            try:
+                hook(info)
+            except Exception:
+                logger.exception("http hook failed")
 
     async def request(
         self,

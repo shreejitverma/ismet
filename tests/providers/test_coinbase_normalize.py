@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from decimal import Decimal
 from itertools import pairwise
 
@@ -56,12 +57,31 @@ def test_quote_from_book_maps_every_field() -> None:
     _assert_source(quote, "rest:book")
 
 
-def test_missing_book_time_falls_back_to_received_visibly() -> None:
-    payload = dict(body("coinbase", "conformance", "level=1"))
+@pytest.mark.parametrize("level", ["level=1", "level=2"])
+def test_a_book_without_a_time_is_refused_rather_than_presented_as_fresh(
+    level: str,
+) -> None:
+    payload = dict(body("coinbase", "conformance", level))
     del payload["time"]
-    quote = nc.quote_from_book(payload, BTC, RECEIVED, "USD")
-    assert quote.exchange_ts == RECEIVED
-    assert quote.exchange_ts_ns is None
+    with pytest.raises(TransportError) as caught:
+        if level == "level=1":
+            nc.quote_from_book(payload, BTC, RECEIVED, "USD")
+        else:
+            nc.order_book_from_book(payload, BTC, RECEIVED, 1, "USD")
+    assert caught.value.retryable is False
+
+
+def test_copy_made_at_is_date_minus_age_and_never_after_receipt() -> None:
+    received = datetime(2026, 11, 1, 2, 10, 1, tzinfo=timezone.utc)
+    headers = {"date": "Sun, 01 Nov 2026 02:10:01 GMT", "age": "82"}
+    assert nc.copy_made_at(headers, received) == datetime(
+        2026, 11, 1, 2, 8, 39, tzinfo=timezone.utc
+    )
+    ahead = {"date": "Sun, 01 Nov 2026 02:10:05 GMT"}
+    assert nc.copy_made_at(ahead, received) == received
+    assert nc.copy_made_at({}, received) == received
+    assert nc.copy_made_at({"date": "not a date"}, received) == received
+    assert nc.copy_made_at({"date": headers["date"], "age": "x"}, received) == received
 
 
 def test_order_book_maps_levels_with_counts_and_slices_to_depth() -> None:

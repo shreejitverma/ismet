@@ -21,11 +21,12 @@ from ismet.errors import (
     ConfigError,
     DuplicateOrderId,
     TransportError,
+    ValidationError,
     VenueError,
 )
 from ismet.fix.message import encode_fields, format_utc_timestamp
-from ismet.fix.provider import FixDialect, FixProvider, FixTags, ReportQuarantinedError
-from ismet.fix.session import SessionState
+from ismet.fix.provider import FixDialect, FixProvider, ReportQuarantinedError
+from ismet.fix.session import SequenceTooLowError, SessionState
 from ismet.fix.store import FixStore, FixStoreError, MemoryFixStore, SqliteFixStore
 from ismet.models import Symbol
 from ismet.models.orders import (
@@ -50,6 +51,8 @@ from ismet.models.orders import (
     ShortSaleMark,
     TimeInForce,
 )
+from ismet.testing.conformance import assert_conformant
+from ismet.testing.trading_conformance import run_trading_conformance
 
 from .acceptor import FixAcceptor
 from .conftest import eventually, session_config
@@ -90,15 +93,18 @@ async def make_provider(
         open_now: bool = True,
         ack_timeout: float = 2.0,
         query_timeout: float = 2.0,
+        provider_class: type[FixProvider] = FixProvider,
+        environment: Environment = Environment.LIVE,
         **session_options: Any,
     ) -> FixProvider:
-        provider = FixProvider(
+        provider = provider_class(
             session_config(target or acceptor, **session_options),
             store if store is not None else MemoryFixStore(),
             dialect=dialect,
             ack_timeout=ack_timeout,
             query_timeout=query_timeout,
             logon_timeout=5.0,
+            environment=environment,
         )
         providers.append(provider)
         if open_now:
@@ -212,12 +218,41 @@ class TestFromSettings:
                 "sender_comp_id": "A",
                 "target_comp_id": "B",
                 "store_path": str(tmp_path / "fix.db"),
+                "tls": True,
             },
         )
         provider = FixProvider.from_settings(settings)
         assert provider.environment is Environment.LIVE
         assert "hunter2" not in repr(provider)
         assert "hunter2" not in repr(provider.session.config)
+        assert provider.session.config.ssl is not None
+        await provider.close()
+
+    def _with_password(self, tmp_path: Path, **options: Any) -> ProviderSettings:
+        return ProviderSettings(
+            name="fix",
+            credentials={"password": SecretStr("hunter2")},
+            options={
+                "host": "127.0.0.1",
+                "port": 9,
+                "begin_string": "FIX.4.4",
+                "sender_comp_id": "A",
+                "target_comp_id": "B",
+                "store_path": str(tmp_path / "fix.db"),
+                **options,
+            },
+        )
+
+    def test_a_password_without_tls_is_refused(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError, match="in clear"):
+            FixProvider.from_settings(self._with_password(tmp_path))
+        assert not (tmp_path / "fix.db").exists()
+
+    async def test_a_tunnel_can_opt_out_of_tls(self, tmp_path: Path) -> None:
+        provider = FixProvider.from_settings(
+            self._with_password(tmp_path, allow_plaintext_credentials=True)
+        )
+        assert provider.session.config.ssl is None
         await provider.close()
 
     async def test_environment_can_opt_out(self, tmp_path: Path) -> None:
@@ -655,7 +690,6 @@ class TestExecutionMapping:
         self, acceptor: FixAcceptor, make_provider: ProviderFactory
     ) -> None:
         provider, stream = await self._placed(make_provider)
-        order_state = acceptor.orders["C1"]
         exec_id = await acceptor.fill("C1", "40", "10")
         await eventually(lambda: bool(stream.of(Filled)))
         # The same report under a new sequence number, as a venue might repeat it.
@@ -664,8 +698,8 @@ class TestExecutionMapping:
         await acceptor.send("8", list(fields))
         await eventually(lambda: provider.session.next_inbound == acceptor.next_out)
         assert len(stream.of(Filled)) == 1
-        assert exec_id
-        assert order_state.filled == Decimal(40)
+        fills = await provider.fills_since(datetime(2020, 1, 1, tzinfo=timezone.utc))
+        assert [(f.fill_id, f.quantity) for f in fills] == [(exec_id, Decimal(40))]
         await stream.close()
 
     async def test_possresend_with_a_seen_exec_id_is_dropped_and_new_is_kept(
@@ -832,18 +866,7 @@ class TestExecutionMapping:
         assert stream.of(Acknowledged)[0].client_order_id == "ALIEN"
         await stream.close()
 
-    async def test_fill_for_an_order_never_sent_uses_the_default_venue(
-        self, acceptor: FixAcceptor, make_provider: ProviderFactory
-    ) -> None:
-        provider = await make_provider(dialect=FixDialect(default_venue="XNAS"))
-        stream = Stream(provider)
-        acceptor.orders["ALIEN"] = _alien_order()
-        await acceptor.fill("ALIEN", "1", "2")
-        await eventually(lambda: bool(stream.of(Filled)))
-        assert stream.of(Filled)[0].fill.symbol == Symbol(venue="XNAS", ticker="ZZZ")
-        await stream.close()
-
-    async def test_fill_for_an_order_never_sent_without_a_venue_is_rejected(
+    async def test_fill_for_an_order_never_sent_is_quarantined(
         self, acceptor: FixAcceptor, make_provider: ProviderFactory
     ) -> None:
         provider = await make_provider()
@@ -992,7 +1015,7 @@ class TestUnreadableReports:
         assert isinstance(second.error, ReportQuarantinedError)
         assert second.of(Canceled) == [], "a later close must not hide the problem"
 
-        provider.release_quarantine()
+        await provider.release_quarantine(operator="alice", reason="checked the venue")
         third = Stream(provider)
         await eventually(lambda: bool(third.of(Canceled)))
         assert third.error is None
@@ -1128,10 +1151,9 @@ class TestSequenceResetForgetsWhatNumbersMeant:
 
 
 class TestConcurrency:
-    async def test_a_report_during_a_cancel_is_not_overwritten(
+    async def test_concurrent_amends_keep_the_clordid_chain_coherent(
         self, acceptor: FixAcceptor, make_provider: ProviderFactory
     ) -> None:
-        """Replace reports racing new requests keep the ClOrdID chain coherent."""
         provider = await make_provider()
         await provider.place_order(order())
         await asyncio.gather(
@@ -1141,10 +1163,9 @@ class TestConcurrency:
         )
         await eventually(lambda: provider.session.next_inbound == acceptor.next_out)
         ids = [m.get(11) for m in acceptor.of_type("G")]
-        assert len(set(ids)) == 3, "a ClOrdID was reused"
-        payload = provider.session.store.get_order("C1")
-        assert payload is not None
-        assert '"chain_length":3' in payload
+        assert sorted(ids) == ["C1~1", "C1~2", "C1~3"]
+        await provider.cancel_order("C1", ACME)
+        assert acceptor.of_type("F")[0].get(11) == "C1~4"
 
     async def test_events_go_out_when_a_commit_is_cancelled(
         self, acceptor: FixAcceptor, make_provider: ProviderFactory
@@ -1259,7 +1280,7 @@ class TestCancel:
         self, acceptor: FixAcceptor, make_provider: ProviderFactory
     ) -> None:
         provider = await make_provider()
-        with pytest.raises(TransportError, match="no local record"):
+        with pytest.raises(VenueError, match="no local record"):
             await provider.cancel_order("NOPE", ACME)
         assert acceptor.of_type("F") == []
 
@@ -1374,7 +1395,7 @@ class TestAmend:
         self, acceptor: FixAcceptor, make_provider: ProviderFactory
     ) -> None:
         provider = await make_provider()
-        with pytest.raises(TransportError, match="no local record"):
+        with pytest.raises(VenueError, match="no local record"):
             await provider.amend_order("NOPE", ACME, quantity=Decimal(1))
 
     async def test_no_answer_is_ambiguous(
@@ -1797,7 +1818,7 @@ class TestRestart:
 
 
 class TestDialect:
-    async def test_a_venue_can_override_tags_and_fields(
+    async def test_a_venue_can_override_fields(
         self, acceptor: FixAcceptor, make_provider: ProviderFactory
     ) -> None:
         class Venue(FixDialect):
@@ -1805,7 +1826,6 @@ class TestDialect:
                 return [(55, symbol.ticker), (207, symbol.venue)]
 
         dialect = Venue(
-            tags=FixTags(account=6666),
             handl_inst=None,
             post_only_exec_inst=None,
             supports_short=False,
@@ -1813,8 +1833,7 @@ class TestDialect:
         provider = await make_provider(dialect=dialect)
         await provider.place_order(order(account="ACC"))
         wire = acceptor.of_type("D")[0]
-        assert wire.get(6666) == "ACC"
-        assert wire.get(1) is None
+        assert wire.get(1) == "ACC"
         assert wire.get(21) is None
         assert wire.get(207) == "XNAS"
         rules = provider.trading_rules()
@@ -1828,23 +1847,6 @@ class TestDialect:
         with pytest.raises(VenueError) as info:
             await provider.place_order(order(post_only=True))
         assert info.value.code == "UNSUPPORTED"
-
-    async def test_custom_inbound_tags(
-        self, acceptor: FixAcceptor, make_provider: ProviderFactory
-    ) -> None:
-        provider = await make_provider(
-            dialect=FixDialect(tags=FixTags(exec_ref_id=7777))
-        )
-        stream = Stream(provider)
-        await provider.place_order(order())
-        first = await acceptor.fill("C1", "1", "10")
-        await eventually(lambda: bool(stream.of(Filled)))
-        await acceptor.exec_report(
-            "C1", "H", "0", extra=[(7777, first)], last_qty=Decimal(0)
-        )
-        await eventually(lambda: bool(stream.of(FillBusted)))
-        assert stream.of(FillBusted)[0].fill_id == first
-        await stream.close()
 
     async def test_a_venue_can_define_its_own_not_found(
         self, acceptor: FixAcceptor, make_provider: ProviderFactory
@@ -1997,3 +1999,502 @@ class TestEncoding:
         store._conn.close()
         with pytest.raises(FixStoreError):
             store.next_outbound()
+
+
+LONG_AGO = datetime(2020, 1, 1, tzinfo=timezone.utc)
+TERMS = [
+    (37, "O1"),
+    (11, "C1"),
+    (54, "1"),
+    (55, "ACME"),
+    (38, "100"),
+    (60, "20260309-14:30:15.123"),
+]
+"""The common part of a report, on an order placed by :func:`order`."""
+
+
+async def _settled(provider: FixProvider, acceptor: FixAcceptor) -> None:
+    await eventually(lambda: provider.session.next_inbound == acceptor.next_out)
+
+
+class TestFramesFromTheSpecification:
+    """Frames written out by hand from the FIX field definitions.
+
+    Neither the acceptor's report builder nor the provider produced these, so a shared
+    misreading of 4.2 ExecTransType or 4.4 ExecType cannot pass.
+    FIX 4.2: ExecTransType(20) 0=New 1=Cancel 2=Correct 3=Status, trades as 150=1/2.
+    FIX 4.4 and 5.0: ExecType(150) F=Trade G=Trade Correct H=Trade Cancel I=Status.
+    """
+
+    TRADE: ClassVar[dict[str, list[tuple[int, str]]]] = {
+        "FIX.4.2": [(20, "0"), (150, "1"), (39, "1")],
+        "FIX.4.4": [(150, "F"), (39, "1")],
+        "FIXT.1.1": [(150, "F"), (39, "1")],
+    }
+    CANCEL: ClassVar[dict[str, list[tuple[int, str]]]] = {
+        "FIX.4.2": [(20, "1"), (150, "0"), (39, "0")],
+        "FIX.4.4": [(150, "H"), (39, "0")],
+        "FIXT.1.1": [(150, "H"), (39, "0")],
+    }
+    CORRECT: ClassVar[dict[str, list[tuple[int, str]]]] = {
+        "FIX.4.2": [(20, "2"), (150, "1"), (39, "1")],
+        "FIX.4.4": [(150, "G"), (39, "1")],
+        "FIXT.1.1": [(150, "G"), (39, "1")],
+    }
+    FILLED_40: ClassVar[list[tuple[int, str]]] = [
+        (17, "X1"),
+        (32, "40"),
+        (31, "10.25"),
+        (14, "40"),
+        (151, "60"),
+        (6, "10.25"),
+    ]
+
+    @pytest.fixture
+    async def rig(
+        self, versioned_acceptor: FixAcceptor, make_provider: ProviderFactory
+    ) -> AsyncIterator[tuple[FixProvider, FixAcceptor, Stream]]:
+        provider = await make_provider(target=versioned_acceptor)
+        stream = Stream(provider)
+        await provider.place_order(order())
+        await eventually(lambda: bool(stream.of(Acknowledged)))
+        yield provider, versioned_acceptor, stream
+        await stream.close()
+
+    async def test_a_trade(
+        self, rig: tuple[FixProvider, FixAcceptor, Stream], begin_string: str
+    ) -> None:
+        _, acceptor, stream = rig
+        await acceptor.send("8", [*TERMS, *self.TRADE[begin_string], *self.FILLED_40])
+        await eventually(lambda: bool(stream.of(Filled)))
+        fill = stream.of(Filled)[0].fill
+        assert (fill.fill_id, fill.quantity, fill.price) == (
+            "X1",
+            Decimal(40),
+            Decimal("10.25"),
+        )
+        assert fill.side is OrderSide.BUY
+
+    async def test_a_trade_cancel(
+        self, rig: tuple[FixProvider, FixAcceptor, Stream], begin_string: str
+    ) -> None:
+        provider, acceptor, stream = rig
+        await acceptor.send("8", [*TERMS, *self.TRADE[begin_string], *self.FILLED_40])
+        await acceptor.send(
+            "8",
+            [
+                *TERMS,
+                *self.CANCEL[begin_string],
+                (17, "X2"),
+                (19, "X1"),
+                (32, "0"),
+                (31, "0"),
+                (14, "0"),
+                (151, "100"),
+                (6, "0"),
+            ],
+        )
+        await eventually(lambda: bool(stream.of(FillBusted)))
+        assert stream.of(FillBusted)[0].fill_id == "X1"
+        assert len(stream.of(Filled)) == 1
+        assert await provider.fills_since(LONG_AGO) == []
+
+    async def test_a_trade_correct(
+        self, rig: tuple[FixProvider, FixAcceptor, Stream], begin_string: str
+    ) -> None:
+        provider, acceptor, stream = rig
+        await acceptor.send("8", [*TERMS, *self.TRADE[begin_string], *self.FILLED_40])
+        await acceptor.send(
+            "8",
+            [
+                *TERMS,
+                *self.CORRECT[begin_string],
+                (17, "X3"),
+                (19, "X1"),
+                (32, "30"),
+                (31, "9"),
+                (14, "30"),
+                (151, "70"),
+                (6, "9"),
+            ],
+        )
+        await eventually(lambda: len(stream.of(Filled)) == 2)
+        assert stream.of(FillBusted)[0].fill_id == "X1"
+        kept = await provider.fills_since(LONG_AGO)
+        assert [(f.fill_id, f.quantity, f.price) for f in kept] == [
+            ("X3", Decimal(30), Decimal(9))
+        ]
+
+    async def test_appendix_d24_answers_an_unknown_order(
+        self, acceptor: FixAcceptor, make_provider: ProviderFactory
+    ) -> None:
+        provider = await make_provider()
+        await provider.place_order(order())
+        await _settled(provider, acceptor)
+        assert len(await provider.open_orders()) == 1
+        acceptor.faults.ignore_status_requests = True
+        asking = asyncio.create_task(provider.order_status("C1", ACME))
+        await acceptor.wait_until(lambda: bool(acceptor.of_type("H")))
+        await acceptor.send(
+            "8",
+            [
+                (37, "NONE"),
+                (11, "C1"),
+                (17, "0"),
+                (150, "I"),
+                (39, "8"),
+                (103, "5"),
+                (54, "1"),
+                (55, "ACME"),
+                (14, "0"),
+                (151, "0"),
+                (790, acceptor.of_type("H")[0].require(790)),
+            ],
+        )
+        assert await asking is None
+        assert await provider.open_orders() == []
+
+
+class TestRestatementRespectsDoneForDay:
+    @pytest.mark.parametrize(
+        ("tif", "filled", "expected"),
+        [
+            (TimeInForce.GTC, "0", OrderStatus.ACCEPTED),
+            (TimeInForce.GTC, "40", OrderStatus.PARTIALLY_FILLED),
+            (TimeInForce.DAY, "0", OrderStatus.EXPIRED),
+        ],
+    )
+    async def test_a_multi_day_order_stays_live(
+        self,
+        acceptor: FixAcceptor,
+        make_provider: ProviderFactory,
+        tif: TimeInForce,
+        filled: str,
+        expected: OrderStatus,
+    ) -> None:
+        provider = await make_provider()
+        stream = Stream(provider)
+        await provider.place_order(order(time_in_force=tif))
+        await eventually(lambda: bool(stream.of(Acknowledged)))
+        if filled != "0":
+            await acceptor.fill("C1", filled, "10")
+            await eventually(lambda: bool(stream.of(Filled)))
+        await acceptor.send(
+            "8", [*TERMS, (150, "D"), (39, "3"), (17, "R1"), (14, filled), (151, "60")]
+        )
+        await eventually(lambda: bool(stream.of(Restated)))
+        assert stream.of(Restated)[0].status is expected
+        await stream.close()
+
+
+class TestBustsSurviveACrash:
+    async def test_every_subscribe_replays_a_bust_after_the_backlog(
+        self, acceptor: FixAcceptor, make_provider: ProviderFactory
+    ) -> None:
+        provider = await make_provider()
+        await provider.place_order(order())
+        fill_id = await acceptor.fill("C1", "40", "10")
+        await acceptor.bust("C1", fill_id, "40")
+        await _settled(provider, acceptor)
+        stream = Stream(provider)
+        await eventually(lambda: len(stream.of(FillBusted)) == 2)
+        kinds = [e.kind for e in stream.events]
+        assert kinds.index("fill") < kinds.index("bust")
+        await stream.close()
+        again = Stream(provider)
+        await eventually(lambda: bool(again.of(FillBusted)))
+        assert [e.fill_id for e in again.of(FillBusted)] == [fill_id]
+        await again.close()
+
+    async def test_a_bust_the_order_manager_never_saw_returns_after_a_restart(
+        self, acceptor: FixAcceptor, make_provider: ProviderFactory, tmp_path: Path
+    ) -> None:
+        store = SqliteFixStore(tmp_path / "fix.db", "s")
+        first = await make_provider(store=store)
+        await first.place_order(order())
+        fill_id = await acceptor.fill("C1", "100", "10")
+        await acceptor.bust("C1", fill_id, "100")
+        await _settled(first, acceptor)
+        await first.close()
+
+        second = await make_provider(store=store)
+        stream = Stream(second)
+        await eventually(lambda: bool(stream.of(FillBusted)))
+        assert stream.of(FillBusted)[0].client_order_id == "C1"
+        assert stream.of(FillBusted)[0].fill_id == fill_id
+        assert await second.fills_since(LONG_AGO) == []
+        await stream.close()
+        await second.close()
+        store.close()
+
+    async def test_a_lost_trade_correct_replays_the_bust_of_the_old_fill(
+        self, acceptor: FixAcceptor, make_provider: ProviderFactory, tmp_path: Path
+    ) -> None:
+        store = SqliteFixStore(tmp_path / "fix.db", "s")
+        first = await make_provider(store=store)
+        await first.place_order(order())
+        old = await acceptor.fill("C1", "100", "10")
+        new = await acceptor.correct("C1", old, "100", "100", "9")
+        await _settled(first, acceptor)
+        await first.close()
+
+        second = await make_provider(store=store)
+        stream = Stream(second)
+        await eventually(lambda: bool(stream.of(FillBusted)))
+        assert [e.fill_id for e in stream.of(FillBusted)] == [old]
+        assert [f.fill_id for f in await second.fills_since(LONG_AGO)] == [new]
+        await stream.close()
+        await second.close()
+        store.close()
+
+    async def test_a_failed_session_still_delivers_the_backlog(
+        self, acceptor: FixAcceptor, make_provider: ProviderFactory
+    ) -> None:
+        provider = await make_provider()
+        await provider.place_order(order())
+        await acceptor.fill("C1", "40", "10")
+        await _settled(provider, acceptor)
+        await acceptor.send_raw_seq(1, "0", [])
+        await eventually(lambda: provider.session.failure is not None)
+        stream = Stream(provider)
+        await eventually(lambda: stream.error is not None)
+        assert len(stream.of(Filled)) == 1
+        assert isinstance(stream.error, SequenceTooLowError)
+
+
+class TestHaltsAreDurable:
+    async def _quarantine_one(
+        self, store: FixStore, make_provider: ProviderFactory, acceptor: FixAcceptor
+    ) -> FixProvider:
+        provider = await make_provider(store=store)
+        stream = Stream(provider)
+        await provider.place_order(order())
+        await acceptor.send("8", [(150, "F"), (17, "NOID"), (32, "10"), (31, "5")])
+        await eventually(lambda: stream.error is not None)
+        await stream.close()
+        return provider
+
+    async def test_a_restart_does_not_clear_the_halt(
+        self, acceptor: FixAcceptor, make_provider: ProviderFactory, tmp_path: Path
+    ) -> None:
+        store = SqliteFixStore(tmp_path / "fix.db", "s")
+        first = await self._quarantine_one(store, make_provider, acceptor)
+        await first.close()
+
+        second = await make_provider(store=store)
+        stopped = Stream(second)
+        await eventually(lambda: stopped.error is not None)
+        assert isinstance(stopped.error, ReportQuarantinedError)
+
+        await second.release_quarantine(operator="alice", reason="fill confirmed")
+        held = await second.quarantined()
+        assert (held[0].released_by, held[0].release_reason) == (
+            "alice",
+            "fill confirmed",
+        )
+        await second.close()
+
+        third = await make_provider(store=store)
+        running = Stream(third)
+        await acceptor.exec_report("C1", "0", "0")
+        await eventually(lambda: bool(running.of(Acknowledged)))
+        assert running.error is None
+        await running.close()
+        await third.close()
+        store.close()
+
+    async def test_a_release_needs_an_operator(
+        self, acceptor: FixAcceptor, make_provider: ProviderFactory
+    ) -> None:
+        store = MemoryFixStore()
+        provider = await self._quarantine_one(store, make_provider, acceptor)
+        with pytest.raises(ValidationError, match="operator"):
+            await provider.release_quarantine(operator="", reason="no one")
+        stopped = Stream(provider)
+        await eventually(lambda: stopped.error is not None)
+
+    async def test_a_malformed_status_reply_does_not_halt(
+        self, acceptor: FixAcceptor, make_provider: ProviderFactory
+    ) -> None:
+        provider = await make_provider()
+        await acceptor.send("8", [(11, "C1"), (150, "I"), (39, "x"), (17, "0")])
+        await _settled(provider, acceptor)
+        assert (await provider.quarantined())[0].halted is False
+        stream = Stream(provider)
+        await provider.place_order(order())
+        await eventually(lambda: bool(stream.of(Acknowledged)))
+        assert stream.error is None
+        await stream.close()
+
+    async def test_a_report_with_the_wrong_compid_is_quarantined(
+        self, acceptor: FixAcceptor, make_provider: ProviderFactory
+    ) -> None:
+        provider = await make_provider()
+        stream = Stream(provider)
+        await provider.place_order(order())
+        await eventually(lambda: bool(stream.of(Acknowledged)))
+        acceptor.faults.wrong_comp_id_next = 1
+        await acceptor.fill("C1", "40", "10")
+        await eventually(lambda: stream.error is not None)
+        assert isinstance(stream.error, ReportQuarantinedError)
+        held = await provider.quarantined()
+        assert held[0].reason == "CompID problem"
+        assert "32=40" in held[0].content
+        assert stream.of(Restated)[0].status is OrderStatus.UNKNOWN
+
+    async def test_a_sequence_reset_past_unread_numbers_halts(
+        self, acceptor: FixAcceptor, make_provider: ProviderFactory
+    ) -> None:
+        provider = await make_provider()
+        stream = Stream(provider)
+        expected = provider.session.next_inbound
+        await acceptor.send_raw_seq(expected, "4", [(36, "500")])
+        await eventually(lambda: stream.error is not None)
+        assert isinstance(stream.error, ReportQuarantinedError)
+        row = (await provider.quarantined())[0]
+        assert (row.msg_type, row.seq, row.halted) == ("*", expected, True)
+        assert "to 499" in row.content
+        assert provider.session.next_inbound == 500
+
+    async def test_an_unrequested_reset_at_logon_halts(
+        self, acceptor: FixAcceptor, make_provider: ProviderFactory
+    ) -> None:
+        provider = await make_provider()
+        stream = Stream(provider)
+        await acceptor.reset_sequences_at_logon()
+        await eventually(lambda: stream.error is not None)
+        assert isinstance(stream.error, ReportQuarantinedError)
+
+
+class TestTermsNotSetOnTheOrder:
+    async def test_a_zero_price_echo_on_a_stop_order_is_ignored(
+        self, acceptor: FixAcceptor, make_provider: ProviderFactory
+    ) -> None:
+        provider = await make_provider()
+        stream = Stream(provider)
+        stop = order(order_type=OrderType.STOP, limit_price=None, stop_price="11")
+        await provider.place_order(stop)
+        await eventually(lambda: bool(stream.of(Acknowledged)))
+        await acceptor.send(
+            "8",
+            [
+                *TERMS,
+                (150, "5"),
+                (39, "0"),
+                (17, "R1"),
+                (14, "0"),
+                (151, "100"),
+                (44, "0"),
+            ],
+        )
+        await eventually(lambda: bool(stream.of(Replaced)))
+        assert stream.of(Replaced)[0].limit_price is None
+        assert (await provider.open_orders())[0].limit_price is None
+
+        acceptor.faults.ignore_status_requests = True
+        asking = asyncio.create_task(provider.order_status("C1", ACME))
+        await acceptor.wait_until(lambda: bool(acceptor.of_type("H")))
+        await acceptor.send(
+            "8",
+            [
+                *TERMS,
+                (150, "I"),
+                (39, "0"),
+                (17, "0"),
+                (14, "0"),
+                (151, "100"),
+                (44, "0"),
+            ],
+        )
+        snapshot = await asking
+        assert snapshot is not None
+        assert snapshot.limit_price is None
+        await stream.close()
+
+    async def test_a_limit_order_still_reads_its_price(
+        self, acceptor: FixAcceptor, make_provider: ProviderFactory
+    ) -> None:
+        provider = await make_provider()
+        stream = Stream(provider)
+        await provider.place_order(order())
+        await eventually(lambda: bool(stream.of(Acknowledged)))
+        await acceptor.send(
+            "8",
+            [
+                *TERMS,
+                (150, "5"),
+                (39, "0"),
+                (17, "R1"),
+                (14, "0"),
+                (151, "100"),
+                (44, "9.75"),
+            ],
+        )
+        await eventually(lambda: bool(stream.of(Replaced)))
+        assert stream.of(Replaced)[0].limit_price == Decimal("9.75")
+        await stream.close()
+
+
+class TestDeclaredVenues:
+    class Nasdaq(FixProvider):
+        name = "fix-nasdaq"
+        venues = frozenset({"XNAS"})
+
+    async def test_an_undeclared_venue_is_refused_before_the_wire(
+        self, acceptor: FixAcceptor, make_provider: ProviderFactory
+    ) -> None:
+        provider = await make_provider(provider_class=self.Nasdaq)
+        other = order(symbol=Symbol(venue="XLON", ticker="BP"))
+        with pytest.raises(VenueError) as info:
+            await provider.place_order(other)
+        assert info.value.code == "UNSUPPORTED"
+        assert acceptor.of_type("D") == []
+
+    async def test_a_declared_venue_is_sent(
+        self, acceptor: FixAcceptor, make_provider: ProviderFactory
+    ) -> None:
+        provider = await make_provider(provider_class=self.Nasdaq)
+        await provider.place_order(order())
+        assert len(acceptor.of_type("D")) == 1
+
+
+class _FillingAcceptor(FixAcceptor):
+    """Fills any order whose id ends in -3 at once, for the conformance suite."""
+
+    async def _on_new_order(self, message: Any) -> None:
+        await super()._on_new_order(message)
+        cid = message.require(11)
+        if cid.endswith("-3"):
+            await self.fill(cid, "100", "10.25")
+
+
+class TestTradingConformance:
+    async def test_only_the_declared_exception_fails(
+        self, make_provider: ProviderFactory
+    ) -> None:
+        """``order_status`` of an id with no local row raises, see the module docstring.
+
+        Returning ``None`` would let the order manager close a live order on a wiped
+        store. Every other check in the suite must pass.
+        """
+        venue = _FillingAcceptor()
+        await venue.start()
+        provider = await make_provider(target=venue, environment=Environment.PAPER)
+
+        def resting(cid: str) -> OrderRequest:
+            return order(cid)
+
+        def marketable(cid: str) -> OrderRequest:
+            return order(cid)
+
+        report = await run_trading_conformance(
+            provider,
+            resting,
+            timeout=5.0,
+            make_marketable_order=marketable,
+            attempts=lambda cid: venue.orders[cid].arrivals,
+            unknown_status_error=TransportError,
+        )
+        assert_conformant(report)
+        await provider.close()
+        await venue.stop()

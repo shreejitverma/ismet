@@ -11,11 +11,13 @@ and a recycled ticker maps to different securities at different dates.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections import Counter
+from collections.abc import Callable, Hashable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from enum import Enum
+from typing import TypeVar
 
 from ismet.calendars import TradingCalendar, get_calendar
 from ismet.errors import ValidationError
@@ -24,6 +26,7 @@ from ismet.models.decimals import mul, ratio, sub
 
 _FOREVER = date.max
 _BEGINNING = datetime(1900, 1, 1, tzinfo=timezone.utc)
+_Answer = TypeVar("_Answer", bound=Hashable)
 
 
 @dataclass(frozen=True)
@@ -31,8 +34,10 @@ class Listing:
     """``symbol`` meant ``security_id`` for dates in ``[valid_from, valid_to)``.
 
     ``known_from`` is when this fact entered the records. A correction is a new
-    record with a later ``known_from``, leaving the old one in place, so a past query
-    still returns what was believed then.
+    record for the same ``symbol`` and ``valid_from`` with a later ``known_from``. It
+    replaces the old record from that time on, so it can change the security or end the
+    range, and the old one stays in place, so a past query still returns what was
+    believed then.
     """
 
     security_id: str
@@ -51,6 +56,23 @@ class Listing:
         return self.valid_from <= day < self.valid_to
 
 
+def _latest_known(
+    candidates: Iterable[Listing], answer: Callable[[Listing], _Answer], subject: str
+) -> _Answer | None:
+    """The answer from the latest known records. Records that tie must agree."""
+    listings = list(candidates)
+    if not listings:
+        return None
+    newest = max(listing.known_from for listing in listings)
+    answers = {answer(lst) for lst in listings if lst.known_from == newest}
+    if len(answers) > 1:
+        raise ValidationError(
+            f"records for {subject} known from {newest.isoformat()} conflict: "
+            f"{sorted(str(a) for a in answers)}; close one or correct it"
+        )
+    return answers.pop()
+
+
 @dataclass
 class SecurityMaster:
     """Listing history, queried as of a date and a knowledge time."""
@@ -60,39 +82,58 @@ class SecurityMaster:
     def add(self, listing: Listing) -> None:
         self.listings.append(listing)
 
+    def _in_force(self, known_at: datetime | None) -> list[Listing]:
+        """Records known at ``known_at`` that no later record has replaced."""
+        known = [
+            listing
+            for listing in self.listings
+            if known_at is None or listing.known_from <= known_at
+        ]
+        newest: dict[tuple[Symbol, date], datetime] = {}
+        for listing in known:
+            key = (listing.symbol, listing.valid_from)
+            newest[key] = max(newest.get(key, listing.known_from), listing.known_from)
+        return [
+            listing
+            for listing in known
+            if listing.known_from == newest[(listing.symbol, listing.valid_from)]
+        ]
+
     def resolve(
         self, symbol: Symbol, on: date, *, known_at: datetime | None = None
     ) -> str | None:
         """The security ``symbol`` meant on ``on``, as known at ``known_at``.
 
-        Where records conflict, the latest known wins. Returns ``None`` if there was
-        no such listing on that date.
+        Where records conflict, the latest known wins, and a tie between different
+        securities raises :class:`~ismet.errors.ValidationError`. Returns ``None`` if
+        there was no such listing on that date.
         """
-        candidates = [
-            listing
-            for listing in self.listings
-            if listing.symbol == symbol
-            and listing.valid_on(on)
-            and (known_at is None or listing.known_from <= known_at)
-        ]
-        if not candidates:
-            return None
-        return max(candidates, key=lambda listing: listing.known_from).security_id
+        return _latest_known(
+            (
+                listing
+                for listing in self._in_force(known_at)
+                if listing.symbol == symbol and listing.valid_on(on)
+            ),
+            lambda listing: listing.security_id,
+            f"{symbol} on {on}",
+        )
 
     def symbol_on(
         self, security_id: str, on: date, *, known_at: datetime | None = None
     ) -> Symbol | None:
-        """The symbol a security traded under on ``on``, or ``None``."""
-        candidates = [
-            listing
-            for listing in self.listings
-            if listing.security_id == security_id
-            and listing.valid_on(on)
-            and (known_at is None or listing.known_from <= known_at)
-        ]
-        if not candidates:
-            return None
-        return max(candidates, key=lambda listing: listing.known_from).symbol
+        """The symbol a security traded under on ``on``, or ``None``.
+
+        A tie between different symbols raises, as :meth:`resolve` does.
+        """
+        return _latest_known(
+            (
+                listing
+                for listing in self._in_force(known_at)
+                if listing.security_id == security_id and listing.valid_on(on)
+            ),
+            lambda listing: listing.symbol,
+            f"{security_id} on {on}",
+        )
 
     def history(self, security_id: str) -> list[Listing]:
         """Every listing of a security, in date order."""
@@ -101,15 +142,26 @@ class SecurityMaster:
             key=lambda lst: (lst.valid_from, lst.known_from),
         )
 
-    def universe(self, venue: str, on: date) -> list[str]:
-        """Securities listed on ``venue`` on ``on``, including since-delisted ones."""
-        return sorted(
-            {
-                listing.security_id
-                for listing in self.listings
-                if listing.symbol.venue == venue and listing.valid_on(on)
-            }
-        )
+    def universe(
+        self, venue: str, on: date, *, known_at: datetime | None = None
+    ) -> list[str]:
+        """Securities listed on ``venue`` on ``on``, including since-delisted ones.
+
+        Each symbol resolves by the rule :meth:`resolve` uses, as known at ``known_at``.
+        """
+        code = venue.strip().upper()
+        by_symbol: dict[Symbol, list[Listing]] = {}
+        for listing in self._in_force(known_at):
+            if listing.symbol.venue == code and listing.valid_on(on):
+                by_symbol.setdefault(listing.symbol, []).append(listing)
+        found: set[str] = set()
+        for symbol, listings in by_symbol.items():
+            security = _latest_known(
+                listings, lambda lst: lst.security_id, f"{symbol} on {on}"
+            )
+            assert security is not None
+            found.add(security)
+        return sorted(found)
 
 
 class ActionKind(str, Enum):
@@ -131,6 +183,11 @@ class CorporateAction:
     mergers are recorded for lifecycle purposes, and they are not auto-adjusted here:
     their factors depend on values this module does not have. Supply them to
     :func:`adjust_bars` as an explicit ``price_factor``.
+
+    A correction is a new record of the same ``kind`` and ``ex_date`` with a later
+    ``known_from``. Two cash dividends on one ex-date are both paid only if they share a
+    ``known_from``, so a special dividend announced later must be recorded with the
+    regular one, or combined with it.
     """
 
     kind: ActionKind
@@ -151,8 +208,14 @@ class CorporateAction:
 
 @dataclass(frozen=True)
 class _Factors:
-    price: Decimal
+    """Held as a fraction, so a 3-for-1 split of 300 is exactly 100."""
+
+    price_numerator: Decimal
+    price_denominator: Decimal
     volume: Decimal
+
+    def price(self, value: Decimal) -> Decimal:
+        return ratio(mul(value, self.price_numerator), self.price_denominator)
 
 
 def _rounded(value: Decimal) -> Decimal:
@@ -160,12 +223,8 @@ def _rounded(value: Decimal) -> Decimal:
     return ratio(value, Decimal(1))
 
 
-def _dividend_factor(action: CorporateAction, prior: Decimal | None) -> Decimal:
+def _dividend_factor(action: CorporateAction, prior: Decimal) -> Decimal:
     assert action.amount is not None
-    if prior is None:
-        raise ValidationError(
-            f"no close before ex-date {action.ex_date} to scale the dividend"
-        )
     if prior <= 0:
         raise ValidationError(
             f"the ratio method needs a positive close before ex-date {action.ex_date}"
@@ -186,7 +245,8 @@ def _factors_for(
     *,
     include_dividends: bool,
 ) -> _Factors:
-    price = Decimal(1)
+    numerator = Decimal(1)
+    denominator = Decimal(1)
     volume = Decimal(1)
     for action in actions:
         if action.ex_date <= bar_date:
@@ -195,15 +255,41 @@ def _factors_for(
         if is_dividend and not include_dividends:
             continue
         if action.price_factor is not None:
-            price = _rounded(mul(price, action.price_factor))
+            numerator = _rounded(mul(numerator, action.price_factor))
         elif action.kind in (ActionKind.SPLIT, ActionKind.STOCK_DIVIDEND):
             assert action.ratio is not None
-            price = ratio(price, action.ratio)
+            denominator = _rounded(mul(denominator, action.ratio))
             volume = _rounded(mul(volume, action.ratio))
         elif is_dividend:
-            factor = _dividend_factor(action, closes_before.get(action.ex_date))
-            price = _rounded(mul(price, factor))
-    return _Factors(price, volume)
+            factor = _dividend_factor(action, closes_before[action.ex_date])
+            numerator = _rounded(mul(numerator, factor))
+    return _Factors(numerator, denominator, volume)
+
+
+def _actions_in_force(actions: Iterable[CorporateAction]) -> list[CorporateAction]:
+    """The latest known record of each kind on each ex-date. Duplicates raise."""
+    usable = list(actions)
+    newest: dict[tuple[ActionKind, date], datetime] = {}
+    for action in usable:
+        key = (action.kind, action.ex_date)
+        newest[key] = max(newest.get(key, action.known_from), action.known_from)
+    current = [a for a in usable if a.known_from == newest[(a.kind, a.ex_date)]]
+    per_day = Counter(
+        (a.kind, a.ex_date) for a in current if a.kind is not ActionKind.CASH_DIVIDEND
+    )
+    repeats: list[tuple[ActionKind, date]] = [
+        key for key, count in per_day.items() if count > 1
+    ]
+    repeats += [
+        (a.kind, a.ex_date) for a, count in Counter(current).items() if count > 1
+    ]
+    if repeats:
+        kind, ex_date = repeats[0]
+        raise ValidationError(
+            f"more than one {kind.value} on {ex_date} with the same known_from; "
+            "correct one with a later known_from, or remove the duplicate"
+        )
+    return current
 
 
 def _trading_date(bar: Bar, calendar: TradingCalendar | None) -> date:
@@ -212,6 +298,32 @@ def _trading_date(bar: Bar, calendar: TradingCalendar | None) -> date:
         return bar.session_date
     resolved = calendar if calendar is not None else get_calendar(bar.symbol.venue)
     return resolved.local_date(bar.exchange_ts)
+
+
+def _closes_before_dividends(
+    ordered: Sequence[Bar],
+    dates: Sequence[date],
+    actions: Sequence[CorporateAction],
+    calendar: TradingCalendar,
+) -> dict[date, Decimal]:
+    closes: dict[date, Decimal] = {}
+    for action in actions:
+        needs_close = (
+            action.kind is ActionKind.CASH_DIVIDEND
+            and action.price_factor is None
+            and any(day < action.ex_date for day in dates)
+        )
+        if not needs_close:
+            continue
+        prior = calendar.previous_session_date(action.ex_date)
+        found = [b for b, day in zip(ordered, dates, strict=True) if day == prior]
+        if not found:
+            raise ValidationError(
+                f"no bar on {prior}, the session before ex-date {action.ex_date}, to "
+                "scale the dividend; supply an explicit price_factor"
+            )
+        closes[action.ex_date] = found[-1].close
+    return closes
 
 
 def adjust_bars(
@@ -225,38 +337,47 @@ def adjust_bars(
     """Back-adjust raw bars for actions, so a series is continuous at today's scale.
 
     Only raw bars are accepted: adjusting data already adjusted is the classic way to
-    apply a split twice. ``known_at`` limits the actions to those known at that time,
-    which gives the series a backtest would have seen on that date. Dividends use the
-    standard ratio method, ``(close_before - dividend) / close_before``, with the raw
-    close of the session before the ex-date. Results round to 50 significant digits;
-    the raw series remains the source of truth. A bar with no ``session_date`` gets its
-    trading date from ``calendar``, or the bundled calendar for its venue.
+    apply a split twice. ``known_at`` limits the actions to those known at that time and
+    with an ex-date on or before its venue-local date, which gives the series a backtest
+    would have seen then. Dividends use the standard ratio method, ``(close_before -
+    dividend) / close_before``, with the raw close of the session before the ex-date; a
+    series without that bar raises. Results round to 50 significant digits; the raw
+    series remains the source of truth. Dates come from ``calendar``, or the bundled
+    calendar for the bars' venue.
     """
     ordered = sorted(bars, key=lambda bar: bar.exchange_ts)
-    usable = [a for a in actions if known_at is None or a.known_from <= known_at]
-    dates = [_trading_date(bar, calendar) for bar in ordered]
-    closes_before: dict[date, Decimal] = {}
-    for action in usable:
-        before = [
-            bar for bar, day in zip(ordered, dates, strict=True) if day < action.ex_date
-        ]
-        if before:
-            closes_before[action.ex_date] = before[-1].close
-    result: list[Bar] = []
-    target = Adjustment.SPLIT_DIVIDEND if include_dividends else Adjustment.SPLIT
-    for bar, day in zip(ordered, dates, strict=True):
+    for bar in ordered:
         if bar.adjustment is not Adjustment.RAW:
             raise ValidationError(
                 f"adjust_bars needs raw bars; got {bar.adjustment.value} at "
                 f"{bar.exchange_ts.isoformat()}"
             )
+    if not ordered:
+        return []
+    venue_calendar = (
+        calendar if calendar is not None else get_calendar(ordered[0].symbol.venue)
+    )
+    known = list(actions)
+    if known_at is not None:
+        today = venue_calendar.local_date(known_at)
+        known = [a for a in known if a.known_from <= known_at and a.ex_date <= today]
+    usable = _actions_in_force(known)
+    dates = [_trading_date(bar, venue_calendar) for bar in ordered]
+    closes_before = (
+        _closes_before_dividends(ordered, dates, usable, venue_calendar)
+        if include_dividends
+        else {}
+    )
+    result: list[Bar] = []
+    target = Adjustment.SPLIT_DIVIDEND if include_dividends else Adjustment.SPLIT
+    for bar, day in zip(ordered, dates, strict=True):
         factors = _factors_for(
             day, usable, closes_before, include_dividends=include_dividends
         )
         fields = bar.model_dump()
         for name in ("open", "high", "low", "close", "vwap"):
             if fields[name] is not None:
-                fields[name] = _rounded(mul(fields[name], factors.price))
+                fields[name] = factors.price(fields[name])
         fields["volume"] = _rounded(mul(bar.volume, factors.volume))
         fields["adjustment"] = target
         result.append(Bar.model_validate(fields))

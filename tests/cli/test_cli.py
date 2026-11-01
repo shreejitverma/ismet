@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import json
+import re
+import shlex
 import sqlite3
 from datetime import datetime, timezone
+from decimal import Decimal
+from importlib.metadata import EntryPoint
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -38,6 +43,127 @@ def fixed_now(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "ismet.cli._now", lambda: datetime(2026, 3, 9, 15, 0, tzinfo=timezone.utc)
     )
+
+
+_HEADER = re.compile(
+    r'(?P<key>"(?:[^"\\\\]|\\\\.)*"|[A-Za-z_][A-Za-z0-9_.]*)?'
+    r"(?:\[(?P<count>\d+)\](?:\{(?P<fields>[^}]*)\})?)?:(?: (?P<value>.*))?"
+)
+_NUMBER = re.compile(r"-?\d+(\.\d+)?([eE][+-]?\d+)?")
+_ESCAPES = {"\\": "\\", '"': '"', "n": "\n", "r": "\r", "t": "\t"}
+
+
+def _toon_scalar(text: str) -> Any:
+    """A TOON primitive per the spec: quoted strings, or bare tokens that are safe."""
+    if text.startswith('"'):
+        if len(text) < 2 or not text.endswith('"'):
+            raise ValueError(f"unterminated string: {text}")
+        out, body, i = [], text[1:-1], 0
+        while i < len(body):
+            if body[i] == '"':
+                raise ValueError(f"unescaped quote: {text}")
+            if body[i] == "\\":
+                out.append(_ESCAPES[body[i + 1]])
+                i += 2
+            else:
+                out.append(body[i])
+                i += 1
+        return "".join(out)
+    if text in ("true", "false"):
+        return text == "true"
+    if text == "null":
+        return None
+    if _NUMBER.fullmatch(text):
+        return Decimal(text)
+    if not text or text != text.strip() or text.startswith("-"):
+        raise ValueError(f"string must be quoted: {text!r}")
+    if any(c in text for c in ':"\\[]{}'):
+        raise ValueError(f"string must be quoted: {text!r}")
+    return text
+
+
+def _toon_split(row: str) -> list[str]:
+    cells, cell, quoted, escape = [], "", False, False
+    for char in row:
+        if escape:
+            escape = False
+        elif char == "\\" and quoted:
+            escape = True
+        elif char == '"':
+            quoted = not quoted
+        elif char == "," and not quoted:
+            cells.append(cell)
+            cell = ""
+            continue
+        cell += char
+    cells.append(cell)
+    return cells
+
+
+def _toon_block(lines: list[tuple[int, str]], at: int, depth: int) -> tuple[dict, int]:  # type: ignore[type-arg]
+    result: dict[str, Any] = {}
+    while at < len(lines) and lines[at][0] == depth:
+        match = _HEADER.fullmatch(lines[at][1])
+        if match is None or match["key"] is None:
+            raise ValueError(f"not a field: {lines[at][1]!r}")
+        key = match["key"]
+        key = _toon_scalar(key) if key.startswith('"') else key
+        at += 1
+        if match["count"] is None:
+            if match["value"] is not None:
+                result[key] = _toon_scalar(match["value"])
+            else:
+                result[key], at = _toon_block(lines, at, depth + 1)
+            continue
+        count = int(match["count"])
+        rows: list[Any] = []
+        if match["value"] is not None:
+            rows = [_toon_scalar(v) for v in _toon_split(match["value"])]
+        elif match["fields"] is not None:
+            names = match["fields"].split(",")
+            while at < len(lines) and lines[at][0] == depth + 1:
+                cells = _toon_split(lines[at][1])
+                if len(cells) != len(names):
+                    raise ValueError(f"row width: {lines[at][1]!r}")
+                rows.append(dict(zip(names, map(_toon_scalar, cells), strict=True)))
+                at += 1
+        else:
+            while at < len(lines) and lines[at][0] == depth + 1:
+                text = lines[at][1]
+                if not text.startswith("- "):
+                    raise ValueError(f"list item needs a hyphen: {text!r}")
+                first = _HEADER.fullmatch(text[2:])
+                if first is not None and first["key"] is not None:
+                    nested = [(depth + 2, text[2:])]
+                    end = at + 1
+                    while end < len(lines) and lines[end][0] >= depth + 2:
+                        nested.append(lines[end])
+                        end += 1
+                    item, _ = _toon_block(nested, 0, depth + 2)
+                    rows.append(item)
+                    at = end
+                else:
+                    rows.append(_toon_scalar(text[2:]))
+                    at += 1
+        if len(rows) != count:
+            raise ValueError(f"{key} declares {count} items, has {len(rows)}")
+        result[key] = rows
+    return result, at
+
+
+def decode_toon(text: str) -> dict[str, Any]:
+    """A strict decoder written from the TOON spec, independent of the encoder."""
+    lines: list[tuple[int, str]] = []
+    for raw in text.splitlines():
+        stripped = raw.lstrip(" ")
+        indent = len(raw) - len(stripped)
+        if indent % 2:
+            raise ValueError(f"odd indent: {raw!r}")
+        lines.append((indent // 2, stripped))
+    result, at = _toon_block(lines, 0, 0)
+    if at != len(lines):
+        raise ValueError(f"unexpected line: {lines[at]}")
+    return result
 
 
 def run(capsys: pytest.CaptureFixture[str], *args: str) -> tuple[int, str]:
@@ -96,7 +222,12 @@ def test_quote_book_bars_through_the_mock_provider(capsys, monkeypatch) -> None:
         "2026-03-14",
     )
     assert code == 0
-    assert "count: 50 of 120 total" in out and "--full" in out
+    decoded = decode_toon(out)
+    assert decoded["count"] == "50 of 120 total"
+    hint = re.fullmatch(r"Run `ismet (.*)` for all rows", decoded["help"][0])
+    assert hint is not None
+    code, out = run(capsys, *shlex.split(hint[1]))
+    assert code == 0 and decode_toon(out)["count"] == "120 of 120 total"
     code, out = run(
         capsys,
         "bars",
@@ -161,9 +292,26 @@ def test_calendar_views(capsys) -> None:  # type: ignore[no-untyped-def]
     assert code == 1 and "error:" in out
 
 
-def test_providers_lists_capabilities(capsys) -> None:  # type: ignore[no-untyped-def]
+def test_providers_lists_names_and_names_one_for_capabilities(capsys) -> None:  # type: ignore[no-untyped-def]
     code, out = run(capsys, "providers")
-    assert code == 0 and "mock" in out and "market_data" in out
+    assert code == 0 and "mock" in decode_toon(out)["providers"]
+    code, out = run(capsys, "providers", "mock")
+    assert code == 0 and "market_data" in decode_toon(out)["capabilities"]
+    code, out = run(capsys, "providers", "nonesuch")
+    assert code == 1 and "unknown provider" in out
+
+
+def test_listing_providers_imports_nothing(capsys, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    broken = EntryPoint(
+        name="broken",
+        value="ismet_no_such_module:Provider",
+        group="ismet.providers",
+    )
+    monkeypatch.setattr("ismet.providers.registry.entry_points", lambda **_: [broken])
+    code, out = run(capsys, "providers")
+    assert code == 0 and decode_toon(out)["providers"] == ["broken"]
+    code, out = run(capsys, "providers", "broken")
+    assert code == 1 and "failed to import" in out
 
 
 def test_kill_switch_round_trip_is_idempotent_and_audited(
@@ -218,7 +366,7 @@ def _journal_with_order(path: Path) -> None:
     journal = SqliteJournal(path)
     request = OrderRequest(
         client_order_id="C1",
-        symbol=Symbol(venue="XSIM", ticker="ACME"),
+        symbol=Symbol(venue="ZSIM", ticker="ACME"),
         side=OrderSide.BUY,
         quantity="10",
         limit_price="1",
@@ -244,7 +392,7 @@ def test_journal_verify_orders_export(capsys, tmp_path: Path) -> None:  # type: 
     code, out = run(capsys, "journal", "verify", str(path), "--expect-head", "f" * 64)
     assert code == 1 and "truncated or replaced" in out
     code, out = run(capsys, "journal", "orders", str(path))
-    assert code == 0 and "C1,ACME@XSIM,buy,submitting,0/10" in out
+    assert code == 0 and "C1,ACME@ZSIM,buy,submitting,0/10" in out
     target = tmp_path / "audit.jsonl"
     code, out = run(capsys, "journal", "export", str(path), "--out", str(target))
     assert code == 0 and "exported: 2" in out
@@ -279,7 +427,7 @@ def test_journal_verify_fails_with_exit_code_on_tampering(
 def test_internal_errors_go_to_stderr_not_stdout(capsys, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     import ismet.cli as cli
 
-    def boom() -> int:
+    def boom(args: object) -> int:
         raise RuntimeError("bug")
 
     monkeypatch.setattr(cli, "_providers", boom)
@@ -329,11 +477,177 @@ def test_toon_structures() -> None:
     assert text.splitlines() == [
         "a:",
         "  b: 1",
-        "empty: {}",
+        "empty:",
         "rows[1]{x,y}:",
         "  1,z",
         "items[2]:",
-        "  p",
-        "  q",
+        "  - p",
+        "  - q",
         "none[0]:",
     ]
+
+
+def test_toon_round_trips_through_a_spec_decoder() -> None:
+    value = {
+        "text": 'a, b: [c] "d" \\ e',
+        "keyword": "true",
+        "numeric_text": "007",
+        "empty_text": "",
+        "number": Decimal("1E+2"),
+        "flag": False,
+        "nothing": None,
+        "nested": {"inner": {"x": 1}},
+        "empty": {},
+        "rows": [{"a": "x,y", "b": 2}, {"a": "z", "b": 3}],
+        "words": ["one two", "three: four", "-five"],
+        "mixed": [1, "two", {"three": 3, "four": [4]}],
+        "none": [],
+        "odd key": 1,
+    }
+    decoded = decode_toon(encode(value))
+    assert decoded["text"] == value["text"]
+    assert decoded["keyword"] == "true" and decoded["numeric_text"] == "007"
+    assert decoded["empty_text"] == "" and decoded["number"] == 100
+    assert decoded["flag"] is False and decoded["nothing"] is None
+    assert decoded["nested"] == {"inner": {"x": 1}} and decoded["empty"] == {}
+    assert decoded["rows"] == [{"a": "x,y", "b": 2}, {"a": "z", "b": 3}]
+    assert decoded["words"] == value["words"]
+    assert decoded["mixed"] == [1, "two", {"three": 3, "four": [4]}]
+    assert decoded["none"] == [] and decoded["odd key"] == 1
+
+
+def test_the_old_list_form_is_rejected_by_the_decoder() -> None:
+    with pytest.raises(ValueError, match="hyphen"):
+        decode_toon("items[2]:\n  p\n  q")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [(), ("calendar",), ("calendar", "XNYS"), ("doctor",), ("providers",)],
+    ids=lambda c: " ".join(c) or "home",
+)
+def test_real_command_output_is_valid_toon(capsys, command: tuple[str, ...]) -> None:  # type: ignore[no-untyped-def]
+    _, out = run(capsys, *command)
+    decoded = decode_toon(out)
+    assert decoded
+
+
+def test_doctor_hint_and_venue_list_decode_as_lists(capsys) -> None:  # type: ignore[no-untyped-def]
+    _, out = run(capsys, "doctor")
+    assert "ISMET_PROVIDERS=mock" in decode_toon(out)["help"][0]
+    _, out = run(capsys, "calendar")
+    assert "XNYS" in decode_toon(out)["calendars"]
+
+
+def _plain_sqlite(path: Path) -> None:
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE bars (x)")
+    conn.commit()
+    conn.close()
+
+
+def _tables(path: Path) -> list[str]:
+    conn = sqlite3.connect(path)
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+    ).fetchall()
+    conn.close()
+    return [row[0] for row in rows]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ("kill", "engage", "--journal", "{}", "--reason", "r", "--operator", "o"),
+        (
+            "kill",
+            "engage",
+            "--journal",
+            "{}",
+            "--create",
+            "--reason",
+            "r",
+            "--operator",
+            "o",
+        ),
+        ("kill", "status", "--journal", "{}"),
+        ("journal", "verify", "{}"),
+        ("journal", "orders", "{}"),
+    ],
+    ids=lambda c: " ".join(
+        w
+        for w in c
+        if w in ("kill", "journal", "engage", "status", "verify", "orders", "--create")
+    ),
+)
+def test_a_file_that_is_not_a_journal_is_refused_and_left_alone(
+    capsys, tmp_path: Path, command: tuple[str, ...]
+) -> None:  # type: ignore[no-untyped-def]
+    path = tmp_path / "bars.db"
+    _plain_sqlite(path)
+    code, out = run(capsys, *(w.replace("{}", str(path)) for w in command))
+    assert code == 1 and "not an ismet journal" in out
+    assert _tables(path) == ["bars"]
+
+
+def test_a_file_that_is_not_a_database_is_refused(capsys, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    path = tmp_path / "notes.txt"
+    path.write_text("this is not a database, just some words", encoding="utf-8")
+    code, out = run(capsys, "kill", "status", "--journal", str(path))
+    assert code == 1 and "not an ismet journal" in out
+    assert path.read_text(encoding="utf-8").startswith("this is not")
+
+
+def test_export_never_overwrites_and_cannot_destroy_the_journal(
+    capsys, tmp_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    path = tmp_path / "j.db"
+    _journal_with_order(path)
+    code, out = run(capsys, "journal", "export", str(path), "--out", str(path))
+    assert code == 1 and "already exists" in out
+    code, out = run(capsys, "journal", "verify", str(path))
+    assert code == 0 and "records: 2" in out
+    other = tmp_path / "keep.txt"
+    other.write_text("keep", encoding="utf-8")
+    code, _ = run(capsys, "journal", "export", str(path), "--out", str(other))
+    assert code == 1 and other.read_text(encoding="utf-8") == "keep"
+    target = tmp_path / "audit.jsonl"
+    code, out = run(capsys, "journal", "export", str(path), "--out", str(target))
+    assert code == 0 and "exported: 2" in out
+    assert sorted(p.name for p in tmp_path.iterdir() if p.name.startswith(".")) == []
+    assert len(target.read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_an_empty_expected_head_is_a_usage_error(capsys, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    path = tmp_path / "j.db"
+    _journal_with_order(path)
+    code, out = run(capsys, "journal", "verify", str(path), "--expect-head", "")
+    assert code == 2 and "--expect-head" in out and "chain intact" not in out
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ("kill", "engage", "--journal", "j.db", "--reason", "r", "--op", "o", "--k"),
+        ("journal", "export", "j.db", "--o", "out"),
+    ],
+)
+def test_safety_commands_refuse_abbreviated_flags(capsys, arguments) -> None:  # type: ignore[no-untyped-def]
+    code, _ = run(capsys, *arguments)
+    assert code == 2
+
+
+def test_a_naive_time_is_refused_as_the_sync_client_refuses_it(
+    capsys, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("ISMET_PROVIDERS", "mock")
+    code, out = run(
+        capsys,
+        "bars",
+        "ACME@XMOK",
+        "--start",
+        "2026-03-09T09:30:00",
+        "--end",
+        "2026-03-10",
+    )
+    assert code == 1 and "timezone-aware" in out

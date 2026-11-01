@@ -2,8 +2,10 @@
 
 A :class:`PositionLedger` is rebuilt from fills, so a bust or a late correction
 changes history by removing or replacing a fill, never by adjusting a running total
-that nobody can then check. All arithmetic is exact. Everything is in the
-instrument's quote currency; :func:`convert` moves a value between currencies at a
+that nobody can then check. All arithmetic is exact, except that an
+:attr:`LotMethod.AVERAGE` lot's price is a quotient rounded to the decimal context, so
+its realized P&L can differ in the last digits. Everything is in the instrument's quote
+currency; :func:`convert` moves a value between currencies at a
 rate the caller declares, because a hidden rate source is how P&L stops being
 reproducible.
 """
@@ -69,7 +71,7 @@ class PositionLedger:
     fees: dict[str, Decimal] = field(default_factory=dict)
     fills_with_unknown_fee: int = 0
     symbol: Symbol | None = None
-    _seen: set[str] = field(default_factory=set)
+    _seen: dict[tuple[str, str], Fill] = field(default_factory=dict)
 
     @property
     def quantity(self) -> Decimal:
@@ -108,9 +110,22 @@ class PositionLedger:
     def apply(self, fill: Fill) -> list[RealizedTrade]:
         """Book ``fill``; returns the closing matches it produced.
 
-        A repeated ``fill_id`` is ignored, so replaying reports cannot double count.
+        A repeated fill is ignored, so replaying reports cannot double count. Venues
+        promise ``fill_id`` unique only per order, so that is the identity. The same
+        identity with different terms raises: the books cannot tell which is true.
         """
-        if fill.fill_id in self._seen:
+        key = (fill.client_order_id, fill.fill_id)
+        seen = self._seen.get(key)
+        if seen is not None:
+            if (seen.side, seen.price, seen.quantity) != (
+                fill.side,
+                fill.price,
+                fill.quantity,
+            ):
+                raise ValidationError(
+                    f"fill {fill.fill_id} on {fill.client_order_id} was re-reported "
+                    "with different terms"
+                )
             return []
         if self.symbol is None:
             self.symbol = fill.symbol
@@ -120,7 +135,7 @@ class PositionLedger:
             )
         if fill.fee is not None and fill.fee != 0 and fill.fee_currency is None:
             raise ValidationError(f"fill {fill.fill_id} has a fee with no currency")
-        self._seen.add(fill.fill_id)
+        self._seen[key] = fill
         if fill.fee is None:
             self.fills_with_unknown_fee += 1
         elif fill.fee_currency is not None:
@@ -178,22 +193,31 @@ def build_ledger(
     method: LotMethod = LotMethod.FIFO,
     multiplier: Decimal = Decimal(1),
 ) -> PositionLedger:
-    """Build the books from fills, in execution-time order then ``fill_id``."""
+    """Build the books from fills, in execution-time order.
+
+    Fills with the same time keep their input order: a ``fill_id`` is an opaque string,
+    and sorting by it would invent an execution order.
+    """
     ledger = PositionLedger(method=method, multiplier=multiplier)
-    for fill in sorted(fills, key=lambda f: (f.ts, f.fill_id)):
+    for fill in sorted(fills, key=lambda f: f.ts):
         ledger.apply(fill)
     return ledger
 
 
 @dataclass(frozen=True)
 class Valuation:
-    """Total P&L in one currency, with the rates that produced it recorded."""
+    """Total P&L in one currency, with the rates that produced it recorded.
+
+    ``fills_with_unknown_fee`` counts fills with no reported fee: while it is above
+    zero, ``fees`` is a lower bound and ``net`` an upper bound.
+    """
 
     currency: str
     realized: Decimal
     unrealized: Decimal
     fees: Decimal
     rates_used: Mapping[str, Decimal]
+    fills_with_unknown_fee: int = 0
 
     @property
     def net(self) -> Decimal:
@@ -231,9 +255,11 @@ def value_books(
     mark raises: an unpriced position must not read as zero P&L.
     """
     realized = unrealized = fees = _ZERO
+    unknown_fees = 0
     for name, (ledger, quote_currency, mark) in books.items():
         if mark is None and ledger.quantity != 0:
             raise ValidationError(f"{name} has an open position and no mark")
+        unknown_fees += ledger.fills_with_unknown_fee
         realized = add(
             realized, convert(ledger.realized_pnl, quote_currency, currency, rates)
         )
@@ -244,7 +270,7 @@ def value_books(
                 unrealized,
                 convert(ledger.unrealized_pnl(mark), quote_currency, currency, rates),
             )
-    return Valuation(currency, realized, unrealized, fees, dict(rates))
+    return Valuation(currency, realized, unrealized, fees, dict(rates), unknown_fees)
 
 
 def slippage_bps(side: OrderSide, arrival: Decimal, average: Decimal) -> Decimal:

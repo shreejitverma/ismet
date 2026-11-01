@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -64,7 +65,14 @@ from ismet.transport.clock import ManualClock
 from ismet.transport.http import HttpTransport
 from ismet.transport.ws import SequenceOutcome, SequenceTracker
 
-from .conftest import ACME, Factory, order, permissive_config
+from .conftest import (
+    ACME,
+    Factory,
+    count_kill_polls,
+    order,
+    permissive_config,
+    until,
+)
 
 D = Decimal
 S = OrderStatus
@@ -184,21 +192,45 @@ async def test_a_venue_duplicate_id_is_resolved_by_query_not_treated_as_a_reject
     assert oms.order("RS4").status is S.ACCEPTED
 
 
+class IntentGate(MemoryJournal):
+    """Holds the write of an order's intent open, so a test can cancel during it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.writing = threading.Event()
+        self.release = threading.Event()
+
+    def append(self, *args: object, **kw: object):  # type: ignore[no-untyped-def]
+        if kw.get("unique_intent"):
+            self.writing.set()
+            assert self.release.wait(5)
+        return super().append(*args, **kw)  # type: ignore[arg-type]
+
+
 async def test_cancelled_caller_cannot_split_the_journal_from_memory(
-    make_manager: Factory, venue: SimVenue, journal: SqliteJournal
+    venue: SimVenue, clock: ManualClock
 ) -> None:
-    oms = make_manager()
+    journal = IntentGate()
+    oms = OrderManager(
+        venue, journal, RiskEngine(permissive_config()), clock=clock, stream_settle=None
+    )
     await oms.start()
     try:
         await venue.drain()
         task = asyncio.create_task(oms.submit(order("RS5", price="9.50")))
-        for _ in range(3):
-            await asyncio.sleep(0)
+        assert await asyncio.to_thread(journal.writing.wait, 5)
         task.cancel()
+        await asyncio.sleep(0.01)
+        journal.release.set()
         with pytest.raises(asyncio.CancelledError):
             await task
-        journalled = {r.client_order_id for r in journal.records()} - {None}
-        assert ("RS5" in journalled) == ("RS5" in oms.orders)
+        journalled = [r.client_order_id for r in journal.records()]
+        assert "RS5" in journalled
+        state = oms.order("RS5")
+        assert state.status is S.REJECTED
+        assert state.reject_code == "CANCELED_BEFORE_SEND"
+        assert (await oms.submit(order("RS5", price="9.50"))).status is S.REJECTED
+        assert venue.attempts["RS5"] == 0
     finally:
         await oms.abort()
 
@@ -600,8 +632,7 @@ async def test_a_dead_execution_stream_stops_new_orders(
 ) -> None:
     await venue.drain()
     venue.disconnect_stream()
-    while oms.stream_healthy:
-        await asyncio.sleep(0)
+    await until(lambda: not oms.stream_healthy)
     with pytest.raises(RiskRejected) as caught:
         await oms.submit(order("BL5", price="9.50"))
     assert caught.value.check == "execution_stream"
@@ -617,13 +648,8 @@ async def test_stream_reconnects_even_if_its_reconcile_keeps_failing(
 
     monkeypatch.setattr(venue, "open_orders", bug)
     venue.disconnect_stream()
-    while oms.stream_healthy:
-        await asyncio.sleep(0)
-    for _ in range(2000):
-        if venue._subscribers:
-            break
-        await asyncio.sleep(0.001)
-    assert venue._subscribers
+    await until(lambda: not oms.stream_healthy)
+    await until(lambda: bool(venue._subscribers))
 
 
 async def test_failed_protective_cancel_keeps_the_order_unknown(
@@ -837,10 +863,10 @@ async def test_cancelling_an_old_order_does_not_rewind_the_last_price(
     await oms.wait_for("GR4", lambda o: o.filled_quantity == 10, 2)
     await oms.submit(order("GR5", price="10.01", quantity="1"))
     await oms.wait_for("GR5", lambda o: o.is_terminal, 2)
-    assert oms._last_fill_price[ACME] == D("10.01")
+    assert oms._mark(ACME) == D("10.01")
     await oms.cancel("GR4")
     await oms.wait_for("GR4", lambda o: o.is_terminal, 2)
-    assert oms._last_fill_price[ACME] == D("10.01")
+    assert oms._mark(ACME) == D("10.01")
 
 
 async def test_price_only_amend_is_judged_on_leaves_not_total(
@@ -1186,7 +1212,7 @@ def test_unknown_fee_is_counted_not_treated_as_zero() -> None:
 
 
 def test_ledger_refuses_fills_from_another_symbol() -> None:
-    other = Symbol(venue="XSIM", ticker="OTHER")
+    other = Symbol(venue="ZSIM", ticker="OTHER")
     ledger = PositionLedger()
     ledger.apply(fill("A", BUY, "1", "10"))
     with pytest.raises(ValidationError, match="OTHER"):
@@ -1275,7 +1301,7 @@ def test_old_data_arriving_now_is_stale_and_absent_symbols_are_reported() -> Non
         size="1",
     )
     assert Issue.STALE in {i.issue for i in monitor.observe(old)}
-    other = Symbol(venue="XSIM", ticker="QUIET")
+    other = Symbol(venue="ZSIM", ticker="QUIET")
     stale = monitor.stale_symbols(NOW, expected=[ACME, other])
     assert [i.symbol for i in stale] == [other]
 
@@ -1347,14 +1373,14 @@ def bar(day: date, close: str, venue: str = "XNAS", **kw: object) -> Bar:
 
 
 def test_many_dividends_stay_exact_enough_and_reload() -> None:
-    bars = [bar(date(2020 + i // 4, 1 + (i % 4) * 3, 2), "97.13") for i in range(14)]
+    calendar = get_calendar("XNAS")
+    ex_dates = [date(2020 + i // 4, 2 + (i % 4) * 3, 3) for i in range(12)]
+    ex_dates = [calendar.next_session_date(day) for day in ex_dates]
+    bars = [bar(calendar.previous_session_date(day), "97.13") for day in ex_dates]
+    bars.append(bar(date(2023, 3, 1), "97.13"))
     actions = [
-        CorporateAction(
-            ActionKind.CASH_DIVIDEND,
-            date(2020 + i // 4, 2 + (i % 4) * 3, 2),
-            amount=D("0.37"),
-        )
-        for i in range(12)
+        CorporateAction(ActionKind.CASH_DIVIDEND, day, amount=D("0.37"))
+        for day in ex_dates
     ]
     adjusted = adjust_bars(bars, actions, include_dividends=True)
     assert adjusted[0].close < adjusted[-1].close
@@ -1362,11 +1388,12 @@ def test_many_dividends_stay_exact_enough_and_reload() -> None:
 
 
 def test_dividend_above_the_close_or_on_a_zero_close_is_refused() -> None:
-    bars = [bar(date(2026, 1, 2), "1"), bar(date(2026, 3, 2), "1")]
+    # 2026-01-30 is the session before Monday 2026-02-02.
+    bars = [bar(date(2026, 1, 30), "1"), bar(date(2026, 3, 2), "1")]
     big = CorporateAction(ActionKind.CASH_DIVIDEND, date(2026, 2, 2), amount=D(5))
     with pytest.raises(ValidationError, match="not below"):
         adjust_bars(bars, [big], include_dividends=True)
-    zero = [bar(date(2026, 1, 2), "0"), bar(date(2026, 3, 2), "1")]
+    zero = [bar(date(2026, 1, 30), "0"), bar(date(2026, 3, 2), "1")]
     with pytest.raises(ValidationError, match="positive close"):
         adjust_bars(zero, [big], include_dividends=True)
 
@@ -1550,7 +1577,7 @@ async def test_unknown_multiplier_fails_gross_closed_rather_than_assuming_one(
     )
     await oms.start()
     try:
-        oms._last_fill_price[ACME] = D(10)
+        oms._set_mark(ACME, D(10))
         assert oms._gross_notional() is None
     finally:
         await oms.abort()
@@ -1651,7 +1678,8 @@ async def test_keep_orders_kill_leaves_open_orders_working_across_polls(
     await oms.submit(order("TR11", price="9.50"))
     await venue.drain()
     await oms.engage_kill("halt", cancel_open=False)
-    await asyncio.sleep(0.05)  # many polls of the kill loop at 10 ms
+    polls = count_kill_polls(oms._journal)
+    await until(lambda: polls["reads"] >= 5)
     assert oms.order("TR11").status is S.ACCEPTED
     assert venue.attempts["TR11"] == 1
 
@@ -1731,20 +1759,9 @@ async def test_a_fee_arriving_later_enriches_the_fill_rather_than_halting(
     venue.trade_through(ACME, "9.50", "40")
     state = await oms.wait_for("TR15", lambda o: o.filled_quantity == 40, 2)
     assert state.fills[0].fee is None
-    fill_from_query = (await venue.fills_since(NOW - timedelta(days=1)))[0]
-    from ismet.models.orders import Filled
-
-    await oms._record(
-        Filled(
-            client_order_id="TR15",
-            ts=NOW,
-            fill=fill_from_query.model_copy(
-                update={"fee": D("0.10"), "fee_currency": "USD"}
-            ),
-        )
-    )
+    await oms.reconcile()
     state = oms.order("TR15")
-    assert state.fills[0].fee == D("0.10")
+    assert state.fills[0].fee == D(0)
     assert state.filled_quantity == 40 and not state.anomalies
     assert not oms.kill_state.engaged
 

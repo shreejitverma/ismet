@@ -23,7 +23,6 @@ from ismet.fix.message import (
     format_value,
     parse_decimal,
     parse_fields,
-    parse_int,
     parse_utc_timestamp,
 )
 
@@ -216,11 +215,6 @@ class TestValues:
     def test_bad_decimals_raise(self, text: str) -> None:
         with pytest.raises(FieldFormatError):
             parse_decimal(text, 44)
-
-    @pytest.mark.parametrize("text", ["", "1.5", "x", "9" * 30])
-    def test_bad_ints_raise(self, text: str) -> None:
-        with pytest.raises(FieldFormatError):
-            parse_int(text, 34)
 
     def test_timestamps_round_trip_at_millisecond_precision(self) -> None:
         moment = datetime(2026, 3, 9, 14, 30, 15, 123000, tzinfo=timezone.utc)

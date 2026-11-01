@@ -8,7 +8,8 @@ checked against recorded responses.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 from ismet.errors import ValidationError, VenueError
@@ -21,6 +22,7 @@ from ismet.models import (
     Level,
     ListingStatus,
     OrderBook,
+    QualityFlag,
     Quote,
     Side,
     Symbol,
@@ -55,13 +57,6 @@ _NANOS_PER_SECOND = 1_000_000_000
 _normalizes = normalizer(PROVIDER)
 
 
-def _exchange_time(
-    payload: Mapping[str, Any], received: datetime
-) -> tuple[datetime, int | None]:
-    text = payload.get("time")
-    return (received, None) if text is None else parse_iso8601_utc(text)
-
-
 def _level(row: Sequence[Any]) -> Level:
     return Level(price=row[0], size=row[1], count=row[2])
 
@@ -77,10 +72,10 @@ def quote_from_book(
 
     ``time`` and ``sequence`` describe the snapshot, unlike ``/ticker``, whose
     ``time`` is the last trade's and whose response has no sequence. ``last`` is
-    ``None`` because this endpoint does not carry it. If ``time`` is ever absent,
-    ``exchange_ts`` falls back to ``received``.
+    ``None`` because this endpoint does not carry it. Without ``time`` the book's age
+    is unknowable, so the payload is refused rather than presented as fresh.
     """
-    exchange_ts, exchange_ns = _exchange_time(payload, received)
+    exchange_ts, exchange_ns = parse_iso8601_utc(payload["time"])
     bids, asks = payload["bids"], payload["asks"]
     best_bid = _level(bids[0]) if bids else None
     best_ask = _level(asks[0]) if asks else None
@@ -112,7 +107,7 @@ def order_book_from_book(
     Levels carry the venue's order count. Coinbase documents that size is the
     level's combined size and must not be multiplied by the count.
     """
-    exchange_ts, exchange_ns = _exchange_time(payload, received)
+    exchange_ts, exchange_ns = parse_iso8601_utc(payload["time"])
     return OrderBook(
         symbol=symbol,
         exchange_ts=exchange_ts,
@@ -126,6 +121,22 @@ def order_book_from_book(
     )
 
 
+def copy_made_at(headers: Mapping[str, str], received: datetime) -> datetime:
+    """When a CDN's copy of a response was made: ``Date`` minus ``Age``.
+
+    Never later than ``received``. With no readable ``Date`` the response can only be
+    taken as fresh, so this is ``received``.
+    """
+    try:
+        served = parsedate_to_datetime(headers["date"])
+        age = timedelta(seconds=max(int(headers.get("age", 0)), 0))
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return received
+    if served.tzinfo is None:
+        served = served.replace(tzinfo=timezone.utc)
+    return min(received, served - age)
+
+
 @_normalizes
 def bars_from_candles(
     rows: Sequence[Sequence[Any]],
@@ -133,21 +144,27 @@ def bars_from_candles(
     interval: Interval,
     received: datetime,
     currency: str | None,
+    *,
+    as_of: datetime | None = None,
+    outdated: bool = False,
 ) -> list[Bar]:
     """Closed bars from ``GET /products/{id}/candles``, in the order received.
 
     Each row is ``[time, low, high, open, close, volume]``: low comes before high
     and open comes third, and rows arrive newest first. A bucket still open at
-    ``received`` is dropped because its values are not final. Coinbase publishes
-    nothing for a bucket with no trades, so a gap in the result is an interval with
-    no ticks, and ``trade_count`` is not available.
+    ``as_of``, when the response was made and by default ``received``, is dropped
+    because its values are not final. Coinbase publishes nothing for a bucket with no
+    trades, so a gap is an interval with no ticks unless ``outdated`` says this copy
+    predates it; those bars are flagged ``STALE``. ``trade_count`` is not available.
     """
     granularity = timedelta(seconds=CANDLE_GRANULARITY[interval])
+    closed_by = received if as_of is None else as_of
+    quality = frozenset({QualityFlag.STALE}) if outdated else frozenset()
     source = venue_source(PROVIDER, FEED_CANDLES)
     bars: list[Bar] = []
     for row in rows:
         opened = datetime_from_ns(int(row[0]) * _NANOS_PER_SECOND)
-        if opened + granularity > received:
+        if opened + granularity > closed_by:
             continue
         bars.append(
             Bar(
@@ -155,6 +172,7 @@ def bars_from_candles(
                 exchange_ts=opened,
                 received_ts=received,
                 source=source,
+                quality=quality,
                 interval=interval,
                 low=row[1],
                 high=row[2],
@@ -304,6 +322,7 @@ __all__ = [
     "PROVIDER",
     "bars_from_candles",
     "control_error",
+    "copy_made_at",
     "instrument_from_product",
     "order_book_from_book",
     "quote_currency_of",

@@ -48,7 +48,7 @@ CHILD = textwrap.dedent(
     from ismet.testing.simvenue import SimVenue, sim_instrument
 
     journal_path, log_path, kill_step = sys.argv[1], sys.argv[2], sys.argv[3]
-    ACME = Symbol(venue="XSIM", ticker="ACME")
+    ACME = Symbol(venue="ZSIM", ticker="ACME")
 
     class DurableVenue(SimVenue):
         async def place_order(self, request):
@@ -165,8 +165,16 @@ async def test_sigkill_at_a_random_moment_including_mid_commit(
     child = run_child(journal, log, "never", tmp_path)
     assert child.stdout is not None
     assert child.stdout.readline().strip() == "ready"
+    deadline = time.monotonic() + 30
+    while not (log.exists() and log.stat().st_size):
+        assert time.monotonic() < deadline, "the child never sent an order"
+        time.sleep(0.001)
     time.sleep(random.Random(seed).uniform(0.01, 0.25))
     os.kill(child.pid, signal.SIGKILL)
     child.wait(timeout=30)
     child.stdout.close()
+    assert child.returncode == -signal.SIGKILL
+    probe = SqliteJournal(journal)
+    assert any(r.unique_intent for r in probe.records())
+    probe.close()
     await recover_and_check(journal, log)

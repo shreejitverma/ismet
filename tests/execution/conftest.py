@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -9,6 +10,7 @@ import pytest
 
 from ismet.execution import (
     Journal,
+    KillState,
     OrderManager,
     RiskConfig,
     RiskEngine,
@@ -22,6 +24,29 @@ from ismet.transport.clock import ManualClock
 
 ACME = Symbol(venue=SIM_VENUE, ticker="ACME")
 START = datetime(2026, 3, 9, 15, 0, tzinfo=timezone.utc)
+
+
+async def until(condition: Callable[[], bool], timeout: float = 5.0) -> None:
+    """Wait for ``condition``, failing the test instead of hanging CI."""
+
+    async def poll() -> None:
+        while not condition():
+            await asyncio.sleep(0.001)
+
+    await asyncio.wait_for(poll(), timeout)
+
+
+def count_kill_polls(journal: Journal) -> dict[str, int]:
+    """Count kill switch reads, so a test can tell that polls actually ran."""
+    counts = {"reads": 0}
+    read = journal.kill_state
+
+    def counted() -> KillState:
+        counts["reads"] += 1
+        return read()
+
+    journal.kill_state = counted  # type: ignore[method-assign]
+    return counts
 
 
 def permissive_config(**overrides: object) -> RiskConfig:

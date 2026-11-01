@@ -93,6 +93,7 @@ class BookBuilder:
         self.overflowed = False
         self.stale_snapshots = 0
         self._batch: tuple[int, int] | None = None
+        self._dropped_through: int | None = None
 
     @property
     def is_synced(self) -> bool:
@@ -112,9 +113,15 @@ class BookBuilder:
         """Replace the book, then apply any buffered deltas newer than ``sequence``.
 
         A snapshot older than a book in sync is ignored and counted, because applying
-        it would roll the book back. Returns whether it was applied.
+        it would roll the book back. So is one older than a delta the bounded buffer
+        dropped, because nothing could restore that delta: the book stays out of sync
+        until a snapshot covering it arrives. Returns whether it was applied.
         """
-        if self._synced and self._last is not None and sequence < self._last:
+        rolls_back = self._synced and self._last is not None and sequence < self._last
+        misses_dropped = (
+            self._dropped_through is not None and sequence < self._dropped_through
+        )
+        if rolls_back or misses_dropped:
             self.stale_snapshots += 1
             return False
         self._bids.clear()
@@ -126,6 +133,8 @@ class BookBuilder:
         self._last = sequence
         self._synced = True
         self.overflowed = False
+        self._dropped_through = None
+        self._batch = None
         buffered = list(self._buffer)
         self._buffer.clear()
         for delta in buffered:
@@ -161,8 +170,9 @@ class BookBuilder:
 
     def _buffer_delta(self, delta: BookDelta) -> None:
         if len(self._buffer) >= self._max_buffered:
-            self._buffer.popleft()
+            dropped = self._buffer.popleft()
             self.overflowed = True
+            self._dropped_through = max(self._dropped_through or 0, dropped.sequence)
         self._buffer.append(delta)
 
     def snapshot(

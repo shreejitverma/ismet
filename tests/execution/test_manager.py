@@ -40,7 +40,14 @@ from ismet.models.orders import (
 from ismet.testing.simvenue import Fault, SimVenue, sim_instrument
 from ismet.transport.clock import ManualClock
 
-from .conftest import ACME, Factory, order, permissive_config
+from .conftest import (
+    ACME,
+    Factory,
+    count_kill_polls,
+    order,
+    permissive_config,
+    until,
+)
 
 D = Decimal
 S = OrderStatus
@@ -259,13 +266,11 @@ async def test_stream_disconnect_reconnects_and_recovers_missed_fills(
     await oms.submit(order("S1", price="9.50"))
     await venue.drain()
     venue.disconnect_stream()
-    while oms.stream_healthy:
-        await asyncio.sleep(0)
+    await until(lambda: not oms.stream_healthy)
     venue.trade_through(ACME, "9.50", "100")
     state = await oms.wait_for("S1", lambda o: o.is_terminal, 5)
     assert state.status is S.FILLED
-    while not oms.stream_healthy:
-        await asyncio.sleep(0)
+    await until(lambda: oms.stream_healthy)
 
 
 async def test_cancel_is_idempotent_and_too_late_is_harmless(
@@ -616,7 +621,7 @@ async def test_nothing_is_sent_if_send_started_cannot_be_journalled(
         with pytest.raises(JournalError):
             await oms.submit(order("JF2", price="9.50"))
         assert venue.attempts["JF2"] == 0
-        assert oms.order("JF2").status is S.PENDING_SUBMIT
+        assert oms.order("JF2").reject_code == "NEVER_SENT"
     finally:
         await oms.abort()
 
@@ -687,11 +692,6 @@ async def test_hook_failures_do_not_affect_order_handling(
 
 class LiveSim(SimVenue):
     environment = Environment.LIVE
-
-
-class NoDeclaration(SimVenue):
-    environment = Environment.LIVE
-    name = "undeclared"
 
 
 async def test_live_provider_requires_explicit_acknowledgement() -> None:
@@ -861,7 +861,8 @@ async def test_kill_switch_stays_engaged_when_the_journal_cannot_record_it(
     try:
         journal.fail_after = 0  # reads still work and report "not engaged"
         await oms.engage_kill("disk is failing", cancel_open=False)
-        await asyncio.sleep(0.02)  # let the poll read the journal many times
+        polls = count_kill_polls(journal)
+        await until(lambda: polls["reads"] >= 5)
         assert oms.kill_state.engaged
         with pytest.raises(KillSwitchEngaged):
             await oms.submit(order("KJ1", price="9.50"))

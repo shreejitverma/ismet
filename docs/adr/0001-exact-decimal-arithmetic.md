@@ -17,5 +17,6 @@ Its operands stay the source of truth.
 
 ## Consequences
 
-Each operation costs about a microsecond more, as measured in `docs/BENCHMARKS.md`.
+Each operation takes about a microsecond, as measured in `docs/BENCHMARKS.md`.
+No baseline against plain `Decimal` was measured, so the added cost is not known.
 A value outside the bounds is rejected, not rounded.

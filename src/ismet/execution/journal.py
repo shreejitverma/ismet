@@ -51,6 +51,8 @@ class RecordKind(str, Enum):
     RECON_BREAK = "recon_break"
     POSITION_BASELINE = "position_baseline"
     CONFIG_CHANGE = "config_change"
+    POSITION_ADJUSTED = "position_adjusted"
+    SWEEP_MARK = "sweep_mark"
     ANOMALY = "anomaly"
 
 
@@ -162,18 +164,22 @@ def _verify_chain(rows: Iterable[_RawRow]) -> VerifyResult:
     return VerifyResult(True, count, prev)
 
 
+def _kill_state_of(seq: int, kind: str, payload: str) -> KillState:
+    detail = json.loads(payload)
+    return KillState(
+        kind == RecordKind.KILL_ENGAGED.value,
+        detail.get("reason", ""),
+        detail.get("operator", ""),
+        seq,
+        bool(detail.get("cancel_open", False)),
+    )
+
+
 def _kill_state_from(records: Iterator[JournalRecord]) -> KillState:
     state = KillState(False)
     for record in records:
         if record.kind in (RecordKind.KILL_ENGAGED, RecordKind.KILL_RELEASED):
-            detail = json.loads(record.payload)
-            state = KillState(
-                record.kind is RecordKind.KILL_ENGAGED,
-                detail.get("reason", ""),
-                detail.get("operator", ""),
-                record.seq,
-                bool(detail.get("cancel_open", False)),
-            )
+            state = _kill_state_of(record.seq, record.kind.value, record.payload)
     return state
 
 
@@ -374,7 +380,9 @@ class SqliteJournal:
             return None
 
     @staticmethod
-    def _row(row: tuple[int, str, str, str | None, str, str, str]) -> JournalRecord:
+    def _row(
+        row: tuple[int, str, str, str | None, str, str, str, int],
+    ) -> JournalRecord:
         return JournalRecord(
             row[0],
             datetime.fromisoformat(row[1]),
@@ -383,14 +391,15 @@ class SqliteJournal:
             row[4],
             row[5],
             row[6],
+            bool(row[7]),
         )
 
     def records(self, *, after_seq: int = 0) -> Iterator[JournalRecord]:
         with self._lock:
             try:
                 rows = self._conn.execute(
-                    "SELECT seq, ts, kind, client_order_id, payload, prev_hash, hash "
-                    "FROM journal WHERE seq > ? ORDER BY seq",
+                    "SELECT seq, ts, kind, client_order_id, payload, prev_hash, hash, "
+                    "unique_intent FROM journal WHERE seq > ? ORDER BY seq",
                     (after_seq,),
                 ).fetchall()
             except sqlite3.Error as exc:
@@ -408,17 +417,15 @@ class SqliteJournal:
                 raise JournalError(f"journal read failed: {exc}") from exc
         if row is None:
             return KillState(False)
-        detail = json.loads(row[2])
-        return KillState(
-            row[1] == RecordKind.KILL_ENGAGED.value,
-            detail.get("reason", ""),
-            detail.get("operator", ""),
-            row[0],
-            bool(detail.get("cancel_open", False)),
-        )
+        return _kill_state_of(row[0], row[1], row[2])
 
     def verify(self) -> VerifyResult:
-        """Check the chain, then that nothing newer than the anchor has been removed."""
+        """Check the chain, then that nothing newer than the anchor has been removed.
+
+        The anchor is read first: each commit precedes its anchor update, so an anchor
+        read before the rows can never be ahead of them, whatever another process does.
+        """
+        anchor = self._read_anchor()
         with self._lock:
             try:
                 rows = self._conn.execute(
@@ -430,7 +437,6 @@ class SqliteJournal:
         result = _verify_chain(rows)
         if not result.ok:
             return result
-        anchor = self._read_anchor()
         if anchor is None:
             return result
         seq, digest = anchor
@@ -473,7 +479,11 @@ class SqliteJournal:
 
 
 def export_jsonl(journal: Journal, stream: IO[str]) -> int:
-    """Write the journal as JSON lines for regulators and archives. Returns a count."""
+    """Write the journal as JSON lines for regulators and archives. Returns a count.
+
+    ``payload`` is the parsed record for reading, and ``raw_payload`` the exact stored
+    text the hash covers, so :func:`verify_jsonl` can check an archive on its own.
+    """
     count = 0
     for record in journal.records():
         stream.write(
@@ -484,6 +494,8 @@ def export_jsonl(journal: Journal, stream: IO[str]) -> int:
                     "kind": record.kind.value,
                     "client_order_id": record.client_order_id,
                     "payload": json.loads(record.payload),
+                    "raw_payload": record.payload,
+                    "unique_intent": record.unique_intent,
                     "prev_hash": record.prev_hash,
                     "hash": record.hash,
                 },
@@ -493,6 +505,26 @@ def export_jsonl(journal: Journal, stream: IO[str]) -> int:
         )
         count += 1
     return count
+
+
+def verify_jsonl(lines: Iterable[str]) -> VerifyResult:
+    """Check the hash chain of an archive written by :func:`export_jsonl`."""
+    rows: list[_RawRow] = []
+    for line in lines:
+        item = json.loads(line)
+        rows.append(
+            (
+                item["seq"],
+                item["ts"],
+                item["kind"],
+                item["client_order_id"],
+                item["raw_payload"],
+                item["prev_hash"],
+                item["hash"],
+                int(item["unique_intent"]),
+            )
+        )
+    return _verify_chain(rows)
 
 
 __all__ = [
@@ -506,4 +538,5 @@ __all__ = [
     "VerifyResult",
     "chain_contains",
     "export_jsonl",
+    "verify_jsonl",
 ]

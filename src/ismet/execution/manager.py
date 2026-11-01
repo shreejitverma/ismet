@@ -71,7 +71,12 @@ from ismet.execution.journal import (
 )
 from ismet.execution.reconcile import BreakKind, ReconBreak, ReconReport
 from ismet.execution.risk import RiskConfig, RiskContext, RiskEngine
-from ismet.execution.state import OrderState, apply_event, new_order
+from ismet.execution.state import (
+    OrderState,
+    apply_event,
+    fill_adds_detail,
+    new_order,
+)
 from ismet.models import Instrument, Quote, Symbol
 from ismet.models.decimals import absolute, add, mul, sub
 from ismet.models.orders import (
@@ -81,11 +86,13 @@ from ismet.models.orders import (
     Environment,
     EventOrigin,
     Fill,
+    FillBusted,
     Filled,
     OrderEvent,
     OrderRequest,
     OrderStatus,
     OutcomeUnknown,
+    Position,
     Rejected,
     Replaced,
     ReplaceRejected,
@@ -113,12 +120,25 @@ _WORKING = (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED)
 _PENDING = (OrderStatus.PENDING_CANCEL, OrderStatus.PENDING_REPLACE)
 _RESOLVE = (OrderStatus.SUBMITTING, OrderStatus.UNKNOWN)
 # A fill after a cancel is an ordinary race, recorded but not a reason to stop. A fill
-# on an order believed never accepted means the books were wrong.
+# on an order believed never accepted or never sent means the books were wrong.
 _HALTING_ANOMALIES = (
     "overfill",
     "re-reported with different terms",
     "after terminal status rejected",
+    "before the send started",
 )
+_MAX_CONCURRENT_CANCELS = 32
+_FILL_SYNC_ATTEMPTS = 3
+
+
+def _net_quantities(positions: Iterable[Position]) -> dict[Symbol, Decimal]:
+    """One quantity per symbol, whatever number of rows a venue reports it in."""
+    net: dict[Symbol, Decimal] = {}
+    for position in positions:
+        net[position.symbol] = add(
+            net.get(position.symbol, Decimal(0)), position.quantity
+        )
+    return net
 
 
 def _bundled_calendar(venue: str) -> TradingCalendar | None:
@@ -153,6 +173,16 @@ class OrderManager:
     ``stream_settle`` is the delay before a follow-up reconciliation after the execution
     stream connects, covering the time a subscription takes to go live. ``None`` skips
     the follow-up.
+
+    A gross limit values positions at current market marks, never at cost basis. Each
+    new order refreshes the marks of every held symbol older than the risk config's
+    ``max_reference_age_seconds``, one reference quote per symbol, and a symbol with no
+    fresh mark makes gross exposure unknown, which refuses the order.
+
+    Risk limits changed through :meth:`update_risk_config` are journalled. A start with
+    limits different from the latest journalled change is refused, so an incident's
+    tightened limits cannot silently revert: start with the journalled limits, then
+    change them through :meth:`update_risk_config`.
     """
 
     def __init__(
@@ -214,7 +244,7 @@ class OrderManager:
         # Derived indexes, kept so submit does not slow as finished orders accumulate.
         self._open: dict[str, OrderState] = {}
         self._filled_net: dict[Symbol, Decimal] = {}
-        self._last_fill_price: dict[Symbol, Decimal] = {}
+        self._marks: dict[Symbol, tuple[Decimal, float]] = {}
         self._symbols_seen: set[Symbol] = set()
         self._created_at: dict[str, datetime] = {}
         self._baseline: dict[Symbol, Decimal] | None = None
@@ -230,6 +260,11 @@ class OrderManager:
         self._kill_unrecorded: dict[str, Any] | None = None
         self._reconcile_blind: str | None = None
         self._last_sweep: datetime | None = None
+        self._durable_sweep: datetime | None = None
+        self._reported_orphan_fills: set[str] = set()
+        self._adjustments_seen = 0
+        self._journalled_config: RiskConfig | None = None
+        self._unjournalled: list[OrderEvent] = []
         self._position_suspect_since: dict[Symbol, float] = {}
         self._journal_failed: str | None = None
         self.stream_healthy = False
@@ -295,6 +330,14 @@ class OrderManager:
                     "it was truncated or replaced"
                 )
         await self._recover()
+        if (
+            self._journalled_config is not None
+            and self._journalled_config != self._risk.config
+        ):
+            raise ConfigError(
+                "risk limits differ from the latest journalled change; start with the "
+                "journalled limits, then change them with update_risk_config"
+            )
         await self._establish_baseline()
         self._started = True
         for symbol in self._symbols_with_exposure():
@@ -387,16 +430,35 @@ class OrderManager:
         self._orders.clear()
         self._open.clear()
         self._filled_net.clear()
-        self._last_fill_price.clear()
+        self._marks.clear()
         self._symbols_seen.clear()
         self._created_at.clear()
         self._baseline = None
-        self._last_sweep = None
+        self._reported_orphan_fills.clear()
+        self._adjustments_seen = 0
+        self._journalled_config = None
+        self._unjournalled.clear()
         records = await self._call_journal(lambda: list(self._journal.records()))
+        self._durable_sweep = None
+        # With no clean sweep on record, every fill since the first record is unproven.
+        self._last_sweep = records[0].ts if records else None
         for record in records:
-            # Fills made while stopped lie after the last thing this journal saw.
-            self._last_sweep = record.ts
-            if record.kind is RecordKind.ORDER_EVENT:
+            if record.kind is RecordKind.SWEEP_MARK:
+                self._durable_sweep = datetime.fromisoformat(
+                    json.loads(record.payload)["at"]
+                )
+                self._last_sweep = self._durable_sweep
+            elif record.kind is RecordKind.CONFIG_CHANGE:
+                self._journalled_config = RiskConfig.model_validate(
+                    json.loads(record.payload)["risk"]
+                )
+            elif record.kind is RecordKind.RECON_BREAK:
+                detail = json.loads(record.payload)
+                if detail["kind"] == BreakKind.ORPHAN_FILL.value:
+                    self._reported_orphan_fills.add(detail["subject"])
+            elif record.kind is RecordKind.POSITION_ADJUSTED:
+                self._apply_adjustment(record)
+            elif record.kind is RecordKind.ORDER_EVENT:
                 event = parse_order_event(record.payload)
                 cid = event.client_order_id
                 if isinstance(event, SubmitIntent) and cid not in self._orders:
@@ -407,24 +469,16 @@ class OrderManager:
                 else:
                     raise JournalError(f"event {event.kind} for {cid} has no intent")
             elif record.kind is RecordKind.POSITION_BASELINE:
-                self._baseline = {}
-                for key, value in json.loads(record.payload).items():
-                    symbol = Symbol.parse(key)
-                    self._baseline[symbol] = Decimal(value["quantity"])
-                    if value["price"] is not None:
-                        self._last_fill_price[symbol] = Decimal(value["price"])
+                self._baseline = {
+                    Symbol.parse(key): Decimal(value["quantity"])
+                    for key, value in json.loads(record.payload).items()
+                }
+        self._adjustments_seen = records[-1].seq if records else 0
+        self._marks.clear()  # replayed fills are history, not the market now
         self._kill = await self._call_journal(self._journal.kill_state)
         for state in list(self._open.values()):
             if state.status is OrderStatus.PENDING_SUBMIT:
-                await self._record(
-                    Rejected(
-                        client_order_id=state.client_order_id,
-                        ts=self._clock.now(),
-                        origin=EventOrigin.RECONCILE,
-                        reason="process stopped before the send started; never sent",
-                        code="NEVER_SENT",
-                    )
-                )
+                await self._never_sent(state.client_order_id)
             elif state.status is OrderStatus.SUBMITTING:
                 # The send's result died with the old process.
                 await self._mark_unknown(
@@ -440,20 +494,15 @@ class OrderManager:
             positions = []
         else:
             return
+        quantities = _net_quantities(positions)
         await self._append(
             RecordKind.POSITION_BASELINE,
             {
-                str(p.symbol): {
-                    "quantity": str(p.quantity),
-                    "price": None if p.average_price is None else str(p.average_price),
-                }
-                for p in positions
+                str(symbol): {"quantity": str(quantity)}
+                for symbol, quantity in quantities.items()
             },
         )
-        self._baseline = {p.symbol: p.quantity for p in positions}
-        for p in positions:
-            if p.average_price is not None:
-                self._last_fill_price[p.symbol] = p.average_price
+        self._baseline = quantities
 
     # State
 
@@ -494,7 +543,7 @@ class OrderManager:
                 self._filled_net.get(symbol, Decimal(0)), signed
             )
         if len(state.fills) > fills_before:
-            self._last_fill_price[symbol] = state.fills[-1].price
+            self._set_mark(symbol, state.fills[-1].price)
 
     def net_position(self, symbol: Symbol) -> Decimal | None:
         """Baseline plus every recorded fill, or ``None`` if the baseline is unknown."""
@@ -518,7 +567,13 @@ class OrderManager:
             symbols |= set(self._baseline)
         return symbols
 
-    async def _record(self, event: OrderEvent, *, durable: bool = False) -> OrderState:
+    async def _record(
+        self,
+        event: OrderEvent,
+        *,
+        durable: bool = False,
+        only_if: OrderState | None = None,
+    ) -> OrderState:
         """Journal and apply one event, atomically with respect to other events.
 
         ``durable=True`` is for events that must be on disk before the next step,
@@ -527,8 +582,14 @@ class OrderManager:
 
         A cancelled caller cannot split the journal from memory: the write and the
         update finish together before the cancellation is honoured.
+
+        ``only_if`` drops the event unless the order is still in that state, checked
+        atomically with other events. A conclusion drawn from a query is out of date
+        once a newer event has landed.
         """
-        task = asyncio.create_task(self._record_now(event, durable=durable))
+        task = asyncio.create_task(
+            self._record_now(event, durable=durable, only_if=only_if)
+        )
         try:
             return await asyncio.shield(task)
         except asyncio.CancelledError:
@@ -538,19 +599,22 @@ class OrderManager:
                 task.exception()  # retrieved, so it is not reported as unobserved
             raise
 
-    async def _record_now(self, event: OrderEvent, *, durable: bool) -> OrderState:
+    async def _record_now(
+        self, event: OrderEvent, *, durable: bool, only_if: OrderState | None
+    ) -> OrderState:
         anomalies: tuple[str, ...]
         async with self._state_lock:
+            if only_if is not None:
+                latest = self._orders[event.client_order_id]
+                if latest is not only_if:
+                    return latest
             try:
-                await self._append(
-                    RecordKind.ORDER_EVENT,
-                    dump_order_event(event),
-                    client_order_id=event.client_order_id,
-                    unique_intent=isinstance(event, SubmitIntent),
-                )
+                await self._write_unjournalled()
+                await self._write_event(event)
             except (JournalError, ConfigError, OSError) as exc:
                 if durable:
                     raise
+                self._unjournalled.append(event)
                 self._journal_failed = str(exc)
                 logger.critical("journal write failed: %s", exc)
             cid = event.client_order_id
@@ -574,6 +638,33 @@ class OrderManager:
         async with self._changed:
             self._changed.notify_all()
         return state
+
+    async def _write_event(self, event: OrderEvent) -> None:
+        await self._append(
+            RecordKind.ORDER_EVENT,
+            dump_order_event(event),
+            client_order_id=event.client_order_id,
+            unique_intent=isinstance(event, SubmitIntent),
+        )
+
+    async def _write_unjournalled(self) -> None:
+        """Write events a failed journal missed, first and in order, so replay holds.
+
+        New orders stay refused until a restart even once this succeeds: the failure
+        means this process's record of the outage cannot be fully trusted.
+        """
+        while self._unjournalled:
+            await self._write_event(self._unjournalled[0])
+            self._unjournalled.pop(0)
+
+    async def _retry_unjournalled(self) -> None:
+        if not self._unjournalled:
+            return
+        async with self._state_lock:
+            try:
+                await self._write_unjournalled()
+            except (JournalError, ConfigError, OSError) as exc:
+                logger.critical("journal still failing: %s", exc)
 
     def _notify_event(self, event: OrderEvent, state: OrderState) -> None:
         if self._on_event is None:
@@ -737,6 +828,7 @@ class OrderManager:
             await asyncio.sleep(self._kill_poll_interval)
             try:
                 await self._record_kill()
+                await self._retry_unjournalled()
                 await self._merge_kill(
                     await self._call_journal(self._journal.kill_state)
                 )
@@ -784,13 +876,18 @@ class OrderManager:
             logger.exception("reference quote failed for %s", symbol)
         return None
 
-    def _gross_notional(self, exclude: str | None = None) -> Decimal | None:
-        """Absolute value of positions and open orders at their last known prices.
+    def _gross_notional(
+        self, exclude: str | None = None, currency: str | None = None
+    ) -> Decimal | None:
+        """Absolute value of positions and open orders at current marks.
 
-        ``None`` if a position's price or an instrument's multiplier is unknown, which
-        fails a gross limit closed. A multiplier of 1 is never assumed.
+        ``None`` if holdings, a mark or an instrument's multiplier is unknown, or if
+        exposure spans currencies, since adding them would need a rate nobody declared.
+        All of these fail a gross limit closed. A multiplier of 1 is never assumed.
         """
-        last_price = self._last_fill_price
+        if self._baseline is None:
+            return None
+        currencies = {currency} if currency is not None else set()
         gross = Decimal(0)
         for symbol in self._tracked_symbols():
             position = self.net_position(symbol)
@@ -799,27 +896,74 @@ class OrderManager:
             if position == 0:
                 continue
             instrument = self._instruments.get(symbol)
-            if symbol not in last_price or instrument is None:
+            mark = self._mark(symbol)
+            if mark is None or instrument is None:
                 return None
-            value = mul(mul(position, last_price[symbol]), instrument.multiplier)
+            currencies.add(instrument.currency)
+            value = mul(mul(position, mark), instrument.multiplier)
             gross = add(gross, absolute(value))
         for order in self.open_orders():
             if order.client_order_id == exclude:
                 continue
             symbol = order.request.symbol
+            prices = [
+                absolute(price)
+                for price in (order.limit_price, order.pending_limit_price)
+                if price is not None
+            ]
             price = (
-                order.limit_price
-                if order.limit_price is not None
+                max(prices)
+                if prices
                 else order.request.stop_price
+                if order.request.stop_price is not None
+                else self._mark(symbol)
             )
-            if price is None:
-                price = last_price.get(symbol)
             instrument = self._instruments.get(symbol)
             if price is None or instrument is None:
                 return None
+            currencies.add(instrument.currency)
             value = mul(mul(order.leaves_quantity, price), instrument.multiplier)
             gross = add(gross, absolute(value))
-        return gross
+        return gross if len(currencies) <= 1 else None
+
+    def _mark(self, symbol: Symbol) -> Decimal | None:
+        entry = self._marks.get(symbol)
+        return None if entry is None else entry[0]
+
+    def _set_mark(self, symbol: Symbol, price: Decimal) -> None:
+        if price == 0:
+            self._marks.pop(symbol, None)  # a value of zero would pass any gross limit
+        else:
+            self._marks[symbol] = (price, self._clock.monotonic())
+
+    def _mark_quote(self, symbol: Symbol, reference: Quote | None) -> None:
+        """Adopt a quote as the mark. One that is missing or old leaves no mark."""
+        limit = float(self._risk.config.max_reference_age_seconds)
+        price = None
+        if reference is not None and (
+            abs((self._clock.now() - reference.exchange_ts).total_seconds()) <= limit
+        ):
+            price = reference.mid if reference.mid is not None else reference.last
+        if price is None:
+            self._marks.pop(symbol, None)
+        else:
+            self._set_mark(symbol, price)
+
+    async def _refresh_marks(self, request: OrderRequest) -> None:
+        """Bring marks up to date, if a gross limit applies to this order."""
+        scopes = self._risk.config.limits_for(request)
+        if all(limits.max_gross_notional is None for _, limits in scopes):
+            return
+        limit = float(self._risk.config.max_reference_age_seconds)
+        now = self._clock.monotonic()
+        stale = [
+            symbol
+            for symbol in self._symbols_with_exposure() - {request.symbol}
+            if symbol not in self._marks or now - self._marks[symbol][1] > limit
+        ]
+        quotes = await asyncio.gather(*(self._reference(symbol) for symbol in stale))
+        for symbol, quote in zip(stale, quotes, strict=True):
+            self._mark_quote(symbol, quote)
 
     def _risk_context(
         self,
@@ -847,7 +991,9 @@ class OrderManager:
             calendar=self._calendar_source(request.symbol.venue),
             rules=rules,
             locate_available=locate,
-            gross_notional=self._gross_notional(exclude),
+            gross_notional=self._gross_notional(
+                exclude, None if instrument is None else instrument.currency
+            ),
         )
 
     async def submit(self, request: OrderRequest) -> OrderState:
@@ -867,7 +1013,8 @@ class OrderManager:
             return existing
         instrument = await self._instrument(request.symbol)
         reference = await self._reference(request.symbol)
-        self._seed_mark(request.symbol, reference)
+        self._mark_quote(request.symbol, reference)
+        await self._refresh_marks(request)
         async with self._submit_lock:
             existing = self._existing_order(request)
             if existing is not None:
@@ -895,6 +1042,11 @@ class OrderManager:
                     ),
                     durable=True,
                 )
+            except asyncio.CancelledError:
+                # The cancelled write still finished, so the intent is on record.
+                await self._close_unsent(cid, "CANCELED_BEFORE_SEND")
+                self._submitting.discard(cid)
+                raise
             except BaseException:
                 self._submitting.discard(cid)
                 raise
@@ -902,20 +1054,20 @@ class OrderManager:
             self._pass("after_intent", cid)
             return await self._send(request)
         except asyncio.CancelledError:
-            # The caller gave up before the send. Nothing went out, so say so.
-            if self._orders[cid].status is OrderStatus.PENDING_SUBMIT:
-                await self._refuse_send(cid, "CANCELED_BEFORE_SEND")
+            await self._close_unsent(cid, "CANCELED_BEFORE_SEND")
+            raise
+        except Exception:
+            await self._close_unsent(cid, "NEVER_SENT")
             raise
         finally:
             self._submitting.discard(cid)
             self._cancel_before_send.discard(cid)
 
-    def _seed_mark(self, symbol: Symbol, reference: Quote | None) -> None:
-        """Value a position with no fills yet at the market."""
-        if symbol not in self._last_fill_price and reference is not None:
-            mark = reference.mid if reference.mid is not None else reference.last
-            if mark is not None:
-                self._last_fill_price[symbol] = mark
+    async def _close_unsent(self, cid: str, code: str) -> None:
+        """The send path stopped short and nothing went out, so record that."""
+        state = self._orders.get(cid)
+        if state is not None and state.status is OrderStatus.PENDING_SUBMIT:
+            await self._refuse_send(cid, code)
 
     def _existing_order(self, request: OrderRequest) -> OrderState | None:
         existing = self._orders.get(request.client_order_id)
@@ -1002,6 +1154,17 @@ class OrderManager:
             )
         )
 
+    async def _never_sent(self, cid: str) -> OrderState:
+        return await self._record(
+            Rejected(
+                client_order_id=cid,
+                ts=self._clock.now(),
+                origin=EventOrigin.RECONCILE,
+                reason="the send never started; never sent",
+                code="NEVER_SENT",
+            )
+        )
+
     async def _rejected(self, cid: str, reason: str, code: str | None) -> OrderState:
         return await self._record(
             Rejected(
@@ -1062,21 +1225,25 @@ class OrderManager:
         A cancel already sent is left alone until ``cancel_retry_interval`` passes
         unanswered, then sent again.
         """
-        results: list[OrderState] = []
         now = self._clock.monotonic()
-        for order in self.open_orders(symbol):
+        slots = asyncio.Semaphore(_MAX_CONCURRENT_CANCELS)
+
+        async def cancel_one(order: OrderState) -> OrderState:
             cid = order.client_order_id
             if order.status is OrderStatus.PENDING_CANCEL:
                 sent = self._change_requested_at.get(cid)
                 if sent is not None and now - sent < self._cancel_retry_interval:
-                    results.append(order)
-                    continue
-            try:
-                results.append(await self.cancel(cid))
-            except Exception:
-                logger.exception("cancel failed for %s", cid)
-                results.append(order)
-        return results
+                    return order
+            async with slots:
+                try:
+                    return await self.cancel(cid)
+                except Exception:
+                    logger.exception("cancel failed for %s", cid)
+                    return order
+
+        # One slow answer must not hold back the cancels behind it.
+        orders = self.open_orders(symbol)
+        return list(await asyncio.gather(*(cancel_one(o) for o in orders)))
 
     async def amend(
         self,
@@ -1087,33 +1254,17 @@ class OrderManager:
     ) -> OrderState:
         """Change a working order's terms, after risk checks on the result."""
         self._require_started()
-        state = self.order(client_order_id)
         if not self._venue.trading_rules().supports_amend:
             raise NotSupported(self._provider.name, "amend_order")
-        if state.status not in _WORKING:
-            raise OrderStateError(
-                f"cannot amend {client_order_id} in {state.status.value}"
-            )
-        if quantity is not None and quantity <= state.filled_quantity:
-            raise ValidationError(
-                f"new quantity {quantity} is not above filled {state.filled_quantity}"
-            )
-        symbol = state.request.symbol
-        # Judge what would be live after the amend: the unfilled part, on the new terms.
-        new_total = quantity if quantity is not None else state.quantity
-        terms = state.request.model_dump()
-        terms["quantity"] = sub(new_total, state.filled_quantity)
-        if limit_price is not None:
-            terms["limit_price"] = limit_price
-        elif state.limit_price is not None:
-            terms["limit_price"] = state.limit_price
-        try:
-            amended = OrderRequest.model_validate(terms)
-        except ValueError as exc:
-            raise ValidationError(f"invalid amend: {exc}") from exc
+        amended = self._amended_request(client_order_id, quantity, limit_price)
+        symbol = amended.symbol
         instrument = await self._instrument(symbol)
         reference = await self._reference(symbol)
+        self._mark_quote(symbol, reference)
+        await self._refresh_marks(amended)
         async with self._submit_lock:
+            # Those awaits may have let fills or a cancel land.
+            amended = self._amended_request(client_order_id, quantity, limit_price)
             await self._check_can_trade()
             decision = self._risk.check(
                 self._risk_context(
@@ -1132,7 +1283,8 @@ class OrderManager:
                     client_order_id=client_order_id,
                 )
                 raise RiskRejected(decision.check, decision.reason)
-            await self._record(
+            self._change_requested_at[client_order_id] = self._clock.monotonic()
+            state = await self._record(
                 ReplaceRequested(
                     client_order_id=client_order_id,
                     ts=self._clock.now(),
@@ -1141,7 +1293,8 @@ class OrderManager:
                 ),
                 durable=True,
             )
-        self._change_requested_at[client_order_id] = self._clock.monotonic()
+        if state.status is not OrderStatus.PENDING_REPLACE:
+            return state  # a cancel or a last fill won while the record was written
         try:
             await self._venue.amend_order(
                 client_order_id, symbol, quantity=quantity, limit_price=limit_price
@@ -1159,6 +1312,101 @@ class OrderManager:
         except Exception as exc:
             return await self._mark_unknown(client_order_id, f"amend: {exc!r}")
         return self.order(client_order_id)
+
+    def _amended_request(
+        self,
+        client_order_id: str,
+        quantity: Decimal | None,
+        limit_price: Decimal | None,
+    ) -> OrderRequest:
+        """What would be live after the amend: the unfilled part, on the new terms."""
+        state = self.order(client_order_id)
+        if state.status not in _WORKING:
+            raise OrderStateError(
+                f"cannot amend {client_order_id} in {state.status.value}"
+            )
+        if quantity is not None and quantity <= state.filled_quantity:
+            raise ValidationError(
+                f"new quantity {quantity} is not above filled {state.filled_quantity}"
+            )
+        new_total = quantity if quantity is not None else state.quantity
+        terms = state.request.model_dump()
+        terms["quantity"] = sub(new_total, state.filled_quantity)
+        if limit_price is not None:
+            terms["limit_price"] = limit_price
+        elif state.limit_price is not None:
+            terms["limit_price"] = state.limit_price
+        try:
+            return OrderRequest.model_validate(terms)
+        except ValueError as exc:
+            raise ValidationError(f"invalid amend: {exc}") from exc
+
+    async def adjust_position(
+        self, symbol: Symbol, delta: Decimal, *, operator: str, reason: str
+    ) -> None:
+        """Record a position change no order explains, such as a split or a transfer.
+
+        The next reconciliation compares against the adjusted position, which is how a
+        ``POSITION_MISMATCH`` with an outside cause is cleared. Journalled, and also
+        accepted from another process through ``ismet position adjust``.
+        """
+        if not operator or not reason:
+            raise ValidationError(
+                "adjusting a position requires an operator and reason"
+            )
+        if self._baseline is None:
+            raise ConfigError(
+                "this venue's position is unknown, so it cannot be adjusted"
+            )
+        await self._append(
+            RecordKind.POSITION_ADJUSTED,
+            {
+                "symbol": str(symbol),
+                "delta": str(delta),
+                "operator": operator,
+                "reason": reason,
+            },
+        )
+        await self._merge_adjustments()
+
+    def _apply_adjustment(self, record: JournalRecord) -> None:
+        detail = json.loads(record.payload)
+        if self._baseline is None or not detail.get("operator"):
+            logger.critical("ignoring position adjustment at record %s", record.seq)
+            return
+        symbol = Symbol.parse(detail["symbol"])
+        self._baseline[symbol] = add(
+            self._baseline.get(symbol, Decimal(0)), Decimal(detail["delta"])
+        )
+        logger.warning(
+            "position of %s adjusted by %s: %s, %s",
+            symbol,
+            detail["delta"],
+            detail["operator"],
+            detail.get("reason", ""),
+        )
+
+    async def _merge_adjustments(self) -> None:
+        """Adopt adjustments journalled since the last look, if the chain is intact."""
+        seen = self._adjustments_seen
+        records = await self._call_journal(
+            lambda: list(self._journal.records(after_seq=seen))
+        )
+        adjustments = [r for r in records if r.kind is RecordKind.POSITION_ADJUSTED]
+        if adjustments:
+            result = await self._call_journal(self._journal.verify)
+            if not result.ok:
+                logger.critical(
+                    "ignoring position adjustments: journal failed verification at "
+                    "record %s: %s",
+                    result.first_bad_seq,
+                    result.detail,
+                )
+                return
+        for record in adjustments:
+            self._apply_adjustment(record)
+        if records:
+            self._adjustments_seen = records[-1].seq
 
     async def update_risk_config(self, config: RiskConfig, *, operator: str) -> None:
         """Replace risk limits, recording the change durably first."""
@@ -1184,13 +1432,20 @@ class OrderManager:
                     client_order_id=cid,
                 )
             detail = f"{event.kind} from venue for an order ismet never sent: {payload}"
-            kind = (
-                BreakKind.ORPHAN_FILL
-                if isinstance(event, Filled)
-                else BreakKind.ORPHAN_ORDER
-            )
-            await self._report_break(ReconBreak(kind, cid, detail))
+            if isinstance(event, Filled):
+                fill_id = event.fill.fill_id
+                if fill_id in self._reported_orphan_fills:
+                    return
+                self._reported_orphan_fills.add(fill_id)
+                item = ReconBreak(BreakKind.ORPHAN_FILL, fill_id, detail)
+            else:
+                item = ReconBreak(BreakKind.ORPHAN_ORDER, cid, detail)
+            await self._report_break(item)
             return
+        if isinstance(event, FillBusted) and (
+            event.fill_id in self._orders[cid].busted_fill_ids
+        ):
+            return  # a venue may repeat a bust, and the record already has it
         await self._record(event)
 
     async def _consume_stream(self, stream: AsyncIterator[OrderEvent]) -> None:
@@ -1295,8 +1550,10 @@ class OrderManager:
         """
         async with self._recon_lock:
             report = ReconReport(at=self._clock.now())
+            await self._merge_adjustments()
             for state in self.open_orders():
-                if state.client_order_id in self._in_flight:
+                cid = state.client_order_id
+                if cid in self._in_flight or cid in self._submitting:
                     # Its send has not returned, so "not found" would mean nothing.
                     continue
                 report.orders_checked += 1
@@ -1325,15 +1582,45 @@ class OrderManager:
 
     async def _reconcile_order(self, state: OrderState, report: ReconReport) -> None:
         cid = state.client_order_id
+        if state.status is OrderStatus.PENDING_SUBMIT:
+            await self._never_sent(cid)  # nothing went out, so the venue cannot help
+            report.resolved.append(cid)
+            return
         snapshot = await self._venue.order_status(cid, state.request.symbol)
+        if self._orders[cid] is not state:
+            # The answer may predate what just landed, so ask again.
+            state = self._orders[cid]
+            snapshot = await self._venue.order_status(cid, state.request.symbol)
+            if self._orders[cid] is not state:
+                report.complete = False  # still moving: the next pass judges it
+                return
+        if state.is_terminal:
+            return
         if snapshot is None:
             await self._resolve_not_found(state, report)
             return
         self._unknown_since.pop(cid, None)
-        if snapshot.filled_quantity != state.filled_quantity:
-            await self._sync_fills(state, snapshot, report)
+        request = state.request
+        if (snapshot.symbol, snapshot.side) != (request.symbol, request.side):
+            report.breaks.append(
+                ReconBreak(
+                    BreakKind.ORPHAN_ORDER,
+                    cid,
+                    f"the venue's order under this id is {snapshot.side.value} "
+                    f"{snapshot.symbol}; ismet sent {request.side.value} "
+                    f"{request.symbol}",
+                )
+            )
+            return
         await self._sync_terms(snapshot, report)
+        if snapshot.filled_quantity != state.filled_quantity:
+            latest = await self._sync_fills(state, snapshot, report)
+            if latest is None:
+                return
+            snapshot = latest
         current = self._orders[cid]
+        if current.is_terminal and not snapshot.status.is_terminal:
+            return  # closed while the fills were fetched, which is newer than the query
         # Never close an order while its fills disagree: closing would hide the
         # difference from every later pass.
         fills_agree = current.filled_quantity == snapshot.filled_quantity
@@ -1348,7 +1635,8 @@ class OrderManager:
                     ts=self._clock.now(),
                     origin=EventOrigin.RECONCILE,
                     reason="the venue did not apply the change",
-                )
+                ),
+                only_if=current,
             )
         else:
             await self._record(
@@ -1360,7 +1648,8 @@ class OrderManager:
                     venue_order_id=snapshot.venue_order_id,
                     venue_filled_quantity=snapshot.filled_quantity,
                     reason="reconciliation",
-                )
+                ),
+                only_if=current,
             )
         report.resolved.append(cid)
 
@@ -1370,26 +1659,24 @@ class OrderManager:
         """Adopt the venue's quantity and price, so exposure uses what is live."""
         cid = snapshot.client_order_id
         state = self._orders[cid]
-        new_quantity = (
-            snapshot.quantity if snapshot.quantity != state.quantity else None
-        )
-        new_price = (
-            snapshot.limit_price
-            if snapshot.limit_price is not None
-            and snapshot.limit_price != state.limit_price
-            else None
-        )
-        if new_quantity is None and new_price is None:
+        if snapshot.quantity == state.quantity and (
+            snapshot.limit_price is None or snapshot.limit_price == state.limit_price
+        ):
             return
         await self._record(
             Replaced(
                 client_order_id=cid,
                 ts=self._clock.now(),
                 origin=EventOrigin.RECONCILE,
-                quantity=new_quantity,
-                limit_price=new_price,
+                quantity=snapshot.quantity,
+                limit_price=(
+                    snapshot.limit_price
+                    if snapshot.limit_price is not None
+                    else state.limit_price
+                ),
                 venue_order_id=snapshot.venue_order_id,
-            )
+            ),
+            only_if=state,
         )
         report.resolved.append(cid)
 
@@ -1406,22 +1693,36 @@ class OrderManager:
 
     async def _sync_fills(
         self, state: OrderState, snapshot: VenueOrderSnapshot, report: ReconReport
-    ) -> None:
+    ) -> VenueOrderSnapshot | None:
+        """Book the venue's fills. Returns the latest answer, or ``None`` if unsettled.
+
+        A difference counts only when the venue's count held still across a fill query:
+        any other difference can be a fill landing between the two questions.
+        """
         cid = state.client_order_id
-        if not await self._recover_order_fills(state, report):
-            return
-        current = self._orders[cid]
-        if current.filled_quantity != snapshot.filled_quantity:
-            report.breaks.append(
-                ReconBreak(
-                    BreakKind.FILL_MISMATCH,
-                    cid,
-                    f"ismet has {current.filled_quantity} filled, venue reports "
-                    f"{snapshot.filled_quantity}",
+        for _ in range(_FILL_SYNC_ATTEMPTS):
+            if not await self._recover_order_fills(state, report):
+                return None
+            current = self._orders[cid]
+            if current.filled_quantity == snapshot.filled_quantity:
+                report.resolved.append(cid)
+                return snapshot
+            fresh = await self._venue.order_status(cid, state.request.symbol)
+            if fresh is None:
+                return None
+            if fresh.filled_quantity == snapshot.filled_quantity:
+                report.breaks.append(
+                    ReconBreak(
+                        BreakKind.FILL_MISMATCH,
+                        cid,
+                        f"ismet has {self._orders[cid].filled_quantity} filled, venue "
+                        f"reports {fresh.filled_quantity}",
+                    )
                 )
-            )
-        else:
-            report.resolved.append(cid)
+                return fresh
+            snapshot = fresh
+        report.complete = False  # still trading: the next pass judges it
+        return None
 
     async def _recover_order_fills(
         self, state: OrderState, report: ReconReport
@@ -1434,17 +1735,15 @@ class OrderManager:
         except Exception as exc:
             self._query_failed(report, cid, exc)
             return False
-        known = {f.fill_id for f in self._orders[cid].fills}
-        for fill in fills:
-            if fill.client_order_id == cid and fill.fill_id not in known:
-                await self._record_recovered_fill(fill)
+        await self._book_fills([f for f in fills if f.client_order_id == cid], report)
         return True
 
     async def _sweep_fills(self, report: ReconReport) -> None:
         """Book every recent fill not already recorded, on any order.
 
         This is what catches a fill on an order already closed. Only a clean sweep moves
-        the window forward, so a failure leaves the fills for the next pass to find.
+        the window forward, so a failure leaves the fills for the next pass to find, and
+        the journal holds where the window stands so a restart resumes from there.
         """
         began = self._last_sweep if self._last_sweep is not None else report.at
         try:
@@ -1452,22 +1751,47 @@ class OrderManager:
         except Exception as exc:
             self._query_failed(report, "fills", exc)
             return
+        await self._book_fills(fills, report)
+        if not self._unjournalled:
+            self._last_sweep = report.at
+            await self._save_sweep(report.at)
+
+    async def _save_sweep(self, at: datetime) -> None:
+        """Note the window now and then: an older note only widens a restart's sweep."""
+        saved = self._durable_sweep
+        if saved is not None and at - saved < self._fill_lookback / 4:
+            return
+        with contextlib.suppress(IsmetError, OSError):
+            await self._append(RecordKind.SWEEP_MARK, {"at": at.isoformat()})
+            self._durable_sweep = at
+
+    async def _book_fills(self, fills: Iterable[Fill], report: ReconReport) -> None:
+        """Record what a venue query knows and this manager does not.
+
+        A fill on an unknown order is reported once. It reaches the journal, so an
+        operator's release of the halt it causes is final, even across a restart.
+        """
         for fill in fills:
             state = self._orders.get(fill.client_order_id)
             if state is None:
-                report.breaks.append(
-                    ReconBreak(
-                        BreakKind.ORPHAN_FILL,
-                        fill.fill_id,
-                        f"{fill.side.value} {fill.quantity} {fill.symbol} at "
-                        f"{fill.price} on {fill.client_order_id}, which ismet never "
-                        "sent",
+                if fill.fill_id not in self._reported_orphan_fills:
+                    self._reported_orphan_fills.add(fill.fill_id)
+                    report.breaks.append(
+                        ReconBreak(
+                            BreakKind.ORPHAN_FILL,
+                            fill.fill_id,
+                            f"{fill.side.value} {fill.quantity} {fill.symbol} at "
+                            f"{fill.price} on {fill.client_order_id}, which ismet "
+                            "never sent",
+                        )
                     )
-                )
-            elif all(known.fill_id != fill.fill_id for known in state.fills):
+                continue
+            if fill.fill_id in state.busted_fill_ids:
+                continue
+            known = any(f.fill_id == fill.fill_id for f in state.fills)
+            if not known or fill_adds_detail(state, fill):
                 await self._record_recovered_fill(fill)
                 report.resolved.append(fill.client_order_id)
-        self._last_sweep = report.at
 
     async def _record_recovered_fill(self, fill: Fill) -> None:
         await self._record(
@@ -1591,7 +1915,7 @@ class OrderManager:
             report.positions_verified = False
             self._query_failed(report, "positions", exc)
             return
-        venue = {p.symbol: p.quantity for p in positions}
+        venue = _net_quantities(positions)
         now = self._clock.monotonic()
         for symbol in sorted({*venue, *self._tracked_symbols()}, key=str):
             ours = self.net_position(symbol) or Decimal(0)
@@ -1608,7 +1932,7 @@ class OrderManager:
                 report.positions_verified = False
                 self._query_failed(report, str(symbol), exc)
                 continue
-            theirs = next((p.quantity for p in fresh if p.symbol == symbol), Decimal(0))
+            theirs = _net_quantities(fresh).get(symbol, Decimal(0))
             if ours == theirs:
                 self._position_suspect_since.pop(symbol, None)
                 continue
@@ -1637,19 +1961,7 @@ class OrderManager:
         except Exception as exc:
             self._query_failed(report, str(symbol), exc)
             return
-        for fill in fills:
-            state = self._orders.get(fill.client_order_id)
-            if state is None:
-                report.breaks.append(
-                    ReconBreak(
-                        BreakKind.ORPHAN_FILL,
-                        fill.fill_id,
-                        f"fill for {fill.client_order_id}, which ismet never sent",
-                    )
-                )
-            elif all(f.fill_id != fill.fill_id for f in state.fills):
-                await self._record_recovered_fill(fill)
-                report.resolved.append(fill.client_order_id)
+        await self._book_fills(fills, report)
 
 
 def events_of(journal: Journal) -> Iterable[OrderEvent]:

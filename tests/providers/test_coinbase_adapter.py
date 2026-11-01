@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import dataclasses
+import json
+import logging
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlsplit
 
@@ -18,11 +21,14 @@ from ismet.providers.coinbase import (
     WS_URL,
     CoinbaseProvider,
 )
-from ismet.testing.replay import WsReplayServer
+from ismet.refdata import validate_currency
+from ismet.testing.replay import ReplayTransport, WsReplayServer, load_exchanges
 from ismet.transport.backoff import NO_RETRY, ExponentialBackoff, RetryPolicy
 from ismet.transport.clock import ManualClock
+from ismet.transport.ratelimit import TokenBucket
+from ismet.transport.ws import ConnectionState
 
-from ._support import FAST_BACKOFF, frames, manifest, replay, session, take
+from ._support import FAST_BACKOFF, FIXTURES, frames, manifest, replay, session, take
 
 BTC = Symbol(venue="ZCBS", ticker="BTC-USD")
 UTC = timezone.utc
@@ -63,11 +69,21 @@ def test_default_hosts_and_settings() -> None:
     assert provider._ws_url == "wss://b"
 
 
-def test_rate_limits_match_the_documentation() -> None:
-    assert RATE_LIMITS["public"].rate == 10
-    assert RATE_LIMITS["public"].capacity == 15
-    assert RATE_LIMITS["ws_subscribe"].rate == 8
-    assert RATE_LIMITS["ws_subscribe"].capacity == 20
+@pytest.mark.parametrize(
+    ("key", "per_second", "burst"),
+    [("public", 10, 15), ("ws_subscribe", 8, 20)],
+)
+async def test_rate_limits_admit_the_documented_burst_then_the_documented_rate(
+    key: str, per_second: int, burst: int
+) -> None:
+    clock = ManualClock()
+
+    async def sleep(seconds: float) -> None:
+        clock.advance(seconds)
+
+    bucket = TokenBucket(RATE_LIMITS[key], clock=clock, sleep=sleep)
+    assert [await bucket.acquire() for _ in range(burst)] == [0.0] * burst
+    assert await bucket.acquire() == pytest.approx(1 / per_second)
 
 
 async def test_requests_are_charged_to_the_public_bucket() -> None:
@@ -127,9 +143,11 @@ async def test_bars_paginate_in_aligned_windows_ascending() -> None:
     end = manifest("coinbase", "bars_paged_end")
     async with _provider("bars_paged", candles_per_request=3) as provider:
         bars = await provider.bars(BTC, Interval.M1, start, end)
-    stamps = [b.exchange_ts for b in bars]
-    assert stamps == sorted(set(stamps))
-    assert all(start <= ts < end for ts in stamps)
+    recorded = load_exchanges(FIXTURES / "coinbase" / "rest_bars_paged.json")
+    opens = {row[0] for page in recorded for row in json.loads(page.body)}
+    assert [b.exchange_ts for b in bars] == [
+        datetime.fromtimestamp(second, UTC) for second in sorted(opens)
+    ]
     pages = [_query(u) for u in _requests(provider)]
     minute = timedelta(minutes=1)
     assert [(p["start"], p["end"]) for p in pages] == [
@@ -178,7 +196,11 @@ async def test_daily_bars_and_open_bucket() -> None:
             manifest("coinbase", "bars_daily_start"),
             manifest("coinbase", "bars_daily_end"),
         )
-    assert all(b.session_date == b.exchange_ts.date() for b in daily)
+    assert [b.session_date.isoformat() for b in daily if b.session_date] == [
+        "2026-10-29",
+        "2026-10-30",
+        "2026-10-31",
+    ]
     clock = ManualClock(manifest("coinbase", "recorded_at"))
     async with _provider("bars_open", clock=clock) as provider:
         recent = await provider.bars(
@@ -189,6 +211,102 @@ async def test_daily_bars_and_open_bucket() -> None:
         )
     assert recent
     assert all(b.exchange_ts + timedelta(minutes=1) <= clock.now() for b in recent)
+
+
+def _open_candles_served_at(moment: datetime, age: int) -> ReplayTransport:
+    recording = load_exchanges(FIXTURES / "coinbase" / "rest_bars_open.json")
+    return ReplayTransport(
+        dataclasses.replace(
+            exchange,
+            headers={
+                **exchange.headers,
+                "date": moment.strftime("%a, %d %b %Y %H:%M:%S GMT"),
+                "age": str(age),
+            },
+        )
+        for exchange in recording
+    )
+
+
+async def test_a_partial_candle_in_a_cached_copy_is_never_returned_as_final() -> None:
+    # The recording was made at 02:08:39 and holds a partial 02:08 row. Its headers
+    # say max-age=300, so the CDN may serve this copy at 02:10:01, with Age 82.
+    now = datetime(2026, 11, 1, 2, 10, 1, tzinfo=UTC)
+    provider = CoinbaseProvider(
+        http_transport=_open_candles_served_at(now, 82), clock=ManualClock(now)
+    )
+    async with provider:
+        bars = await provider.bars(
+            BTC,
+            Interval.M1,
+            manifest("coinbase", "bars_open_start"),
+            manifest("coinbase", "bars_open_end"),
+        )
+    assert [b.exchange_ts.strftime("%H:%M") for b in bars] == [
+        "02:05",
+        "02:06",
+        "02:07",
+    ]
+    assert all(b.quality == {QualityFlag.STALE} for b in bars)
+
+
+async def test_a_copy_that_predates_a_traded_bucket_flags_its_bars() -> None:
+    # Page two of this recording is a real cache hit: Age 94 at 02:08:39 means the copy
+    # was made at 02:07:05, and it lacks the 02:07 bucket that rest_bars_open.json has.
+    clock = ManualClock(datetime(2026, 11, 1, 2, 8, 39, tzinfo=UTC))
+    async with _provider("bars_full_pages", clock=clock) as provider:
+        bars = await provider.bars(
+            BTC,
+            Interval.M1,
+            manifest("coinbase", "bars_full_pages_start"),
+            manifest("coinbase", "conformance_end"),
+        )
+    boundary = datetime(2026, 11, 1, 1, 58, tzinfo=UTC)
+    assert bars[-1].exchange_ts == datetime(2026, 11, 1, 2, 6, tzinfo=UTC)
+    assert all(b.quality == frozenset() for b in bars if b.exchange_ts < boundary)
+    assert all(
+        b.quality == {QualityFlag.STALE} for b in bars if b.exchange_ts >= boundary
+    )
+
+
+async def test_a_fresh_copy_of_a_still_open_window_is_not_stale() -> None:
+    clock = ManualClock(manifest("coinbase", "recorded_at"))
+    async with _provider("bars_open", clock=clock) as provider:
+        bars = await provider.bars(
+            BTC,
+            Interval.M1,
+            manifest("coinbase", "bars_open_start"),
+            manifest("coinbase", "bars_open_end"),
+        )
+    assert bars
+    assert all(b.quality == frozenset() for b in bars)
+
+
+async def test_a_mistyped_ticker_registers_no_currency() -> None:
+    mistyped = Symbol(venue="ZCBS", ticker="NOPE-QZQZ")
+    provider = CoinbaseProvider(
+        http_transport=httpx.MockTransport(lambda _: httpx.Response(404, json={})),
+        retry_policy=NO_RETRY,
+    )
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    async with provider:
+        with pytest.raises(VenueError):
+            await provider.bars(mistyped, Interval.M1, now, now + timedelta(minutes=1))
+    rejected = session("coinbase", "rejected")
+    request = {
+        "type": "subscribe",
+        "product_ids": ["NOPE-QZQZ"],
+        "channels": ["matches"],
+    }
+    answering = dataclasses.replace(rejected, sent=(request,))
+    async with (
+        WsReplayServer([answering]) as server,
+        _stream_provider(server) as streaming,
+    ):
+        with pytest.raises(VenueError):
+            await take(streaming.stream_trades([mistyped]), 1)
+    with pytest.raises(ValueError, match="QZQZ"):
+        validate_currency("QZQZ")
 
 
 @pytest.mark.parametrize(
@@ -361,6 +479,75 @@ async def test_reconnect_resubscribes_and_loses_nothing_when_nothing_was_missed(
     wanted = frames("coinbase", "matches")[1:12]
     assert [t.trade_id for t in trades] == [str(f["trade_id"]) for f in wanted]
     assert all(t.quality == frozenset() for t in trades)
+
+
+def _with_last_match_on_second_connection(index: int, then: int) -> tuple:  # type: ignore[type-arg]
+    """The feed opens every connection with ``last_match``, the newest trade.
+
+    The recording has one connection, so the frame opening the second is a recorded
+    match retyped, which has the same fields as the recorded ``last_match``.
+    """
+    recorded = session("coinbase", "matches")
+    retyped = {**json.loads(recorded.frames[index]), "type": "last_match"}
+    sent = (
+        *recorded.frames[:5],
+        json.dumps(retyped),
+        *recorded.frames[then : then + 4],
+    )
+    return dataclasses.replace(recorded, frames=sent), [slice(0, 5), slice(5, 10)]
+
+
+async def test_a_newer_last_match_after_reconnect_is_delivered_and_flagged() -> None:
+    recorded, plan = _with_last_match_on_second_connection(7, 8)
+    async with (
+        WsReplayServer([recorded], plan=plan) as server,
+        _stream_provider(server) as provider,
+    ):
+        trades = await take(provider.stream_trades([BTC]), 9)
+    wanted = frames("coinbase", "matches")
+    assert [t.trade_id for t in trades] == [
+        str(f["trade_id"]) for f in (*wanted[1:5], *wanted[7:12])
+    ]
+    assert trades[4].quality == {QualityFlag.AFTER_GAP}
+    assert all(t.quality == frozenset() for t in trades[:4] + trades[5:])
+
+
+async def test_a_last_match_already_seen_after_reconnect_is_dropped() -> None:
+    recorded, plan = _with_last_match_on_second_connection(4, 5)
+    async with (
+        WsReplayServer([recorded], plan=plan) as server,
+        _stream_provider(server) as provider,
+    ):
+        trades = await take(provider.stream_trades([BTC]), 8)
+    wanted = frames("coinbase", "matches")
+    assert [t.trade_id for t in trades] == [str(f["trade_id"]) for f in wanted[1:9]]
+    assert all(t.quality == frozenset() for t in trades)
+
+
+async def test_a_server_that_only_acknowledges_exhausts_the_reconnect_bound() -> None:
+    plan = [slice(0, 0)] * 6
+    async with (
+        WsReplayServer([session("coinbase", "matches")], plan=plan) as server,
+        _stream_provider(server, ws_max_reconnects=2) as provider,
+    ):
+        with pytest.raises(TransportError, match="after 2 reconnects"):
+            await take(provider.stream_trades([BTC]), 1)
+    assert len(server.connections) == 3
+
+
+async def test_an_outage_is_logged_and_reported_to_the_state_hook(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    states: list[ConnectionState] = []
+    plan = [slice(0, 3), slice(3, 6)]
+    async with (
+        WsReplayServer([session("coinbase", "matches")], plan=plan) as server,
+        _stream_provider(server, ws_on_state=states.append) as provider,
+    ):
+        with caplog.at_level(logging.WARNING, logger="ismet.transport.ws"):
+            await take(provider.stream_trades([BTC]), 4)
+    assert ConnectionState.RECONNECTING in states
+    assert any("reconnect attempt 1" in r.getMessage() for r in caplog.records)
 
 
 async def test_a_trade_repeated_after_reconnect_is_delivered_once() -> None:

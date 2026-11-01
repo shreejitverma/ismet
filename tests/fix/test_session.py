@@ -11,6 +11,7 @@ from pydantic import SecretStr
 from ismet.errors import AmbiguousOutcome, ConfigError, TransportError
 from ismet.fix.message import format_utc_timestamp
 from ismet.fix.session import (
+    APPL_VER_FIX50SP2,
     ApplicationRejectError,
     FixSession,
     FixSessionConfig,
@@ -21,7 +22,12 @@ from ismet.fix.session import (
     SessionState,
     _DisconnectError,
 )
-from ismet.fix.store import FixStoreError, MemoryFixStore, SqliteFixStore
+from ismet.fix.store import (
+    FixStoreError,
+    MemoryFixStore,
+    SqliteFixStore,
+    StoredMessage,
+)
 
 from .acceptor import FixAcceptor
 from .conftest import RecordingListener, SessionFactory, eventually, session_config
@@ -99,13 +105,6 @@ class TestLogon:
         with pytest.raises(SessionDownError):
             await session.send_application("D", [(11, "A")])
         assert acceptor.of_type("D") == []
-
-    async def test_barrier_can_be_disabled(
-        self, acceptor: FixAcceptor, make_session: SessionFactory
-    ) -> None:
-        session, _ = await make_session(sync_on_logon=False)
-        assert session.is_ready
-        assert acceptor.of_type("1") == []
 
     async def test_logon_answered_with_logout_stops_for_good(
         self, acceptor: FixAcceptor, make_session: SessionFactory
@@ -188,12 +187,7 @@ class TestLogon:
     ) -> None:
         session, _ = await make_session()
         before = len(acceptor.logons)
-        acceptor.next_in = 1
-        acceptor.next_out = 1
-        await acceptor.write(
-            acceptor.frame(1, "A", [(98, "0"), (108, "30"), (141, "Y")])
-        )
-        acceptor.next_out = 2
+        await acceptor.reset_sequences_at_logon()
         await acceptor.wait_until(lambda: len(acceptor.logons) > before)
         reply = acceptor.logons[-1]
         assert reply.get(141) == "Y"
@@ -552,6 +546,17 @@ class TestHeaderChecks:
         assert acceptor.of_type("3")[0].get(373) == "9"
         assert "CompID" in acceptor.of_type("5")[0].require(58)
 
+    async def test_wrong_comp_id_on_a_report_is_recorded_as_discarded(
+        self, acceptor: FixAcceptor, make_session: SessionFactory
+    ) -> None:
+        _, listener = await make_session()
+        acceptor.faults.wrong_comp_id_next = 1
+        await acceptor.send("8", [(11, "C1"), (150, "F"), (32, "10"), (31, "5")])
+        await acceptor.wait_until(lambda: bool(acceptor.of_type("5")))
+        assert [(m.get(11), why) for m, why in listener.discarded] == [
+            ("C1", "CompID problem")
+        ]
+
     async def test_sending_time_out_of_range_rejects_and_logs_out(
         self, acceptor: FixAcceptor, make_session: SessionFactory
     ) -> None:
@@ -837,26 +842,33 @@ class TestServingResendRequests:
         self, acceptor: FixAcceptor, make_session: SessionFactory
     ) -> None:
         session, _ = await make_session()
-        for index in range(50):
+        for index in range(3):
             await session.send_application("D", [(11, f"C{index}")])
-        await acceptor.wait_until(lambda: len(acceptor.of_type("D")) == 50)
-        count = len(acceptor.received)
+        await acceptor.wait_until(lambda: len(acceptor.of_type("D")) == 3)
+        real_write = session._write
+        paused = asyncio.Event()
+        resume = asyncio.Event()
+
+        async def pausing_write(frame: bytes) -> None:
+            await real_write(frame)
+            if b"43=Y" in frame and not paused.is_set():
+                paused.set()
+                await resume.wait()
+
+        session._write = pausing_write  # type: ignore[method-assign]
         await acceptor.send("2", [(7, "1"), (16, "0")])
-        extra = await session.send_application("D", [(11, "NEW")])
+        await asyncio.wait_for(paused.wait(), 5.0)
+        sending = asyncio.create_task(session.send_application("D", [(11, "NEW")]))
+        await asyncio.sleep(0.05)
+        assert not sending.done(), "a new message was sent during the resend"
+        assert all(m.get(11) != "NEW" for m in acceptor.received)
+        resume.set()
+        await sending
         await acceptor.wait_until(
-            lambda: (
-                any(m.get(11) == "NEW" and m.get(43) != "Y" for m in acceptor.received)
-                and sum(m.get(43) == "Y" for m in acceptor.of_type("D")) >= 50
-            )
+            lambda: any(m.get(11) == "NEW" for m in acceptor.received)
         )
-        after = [m for m in acceptor.received[count:] if m.msg_type in ("D", "4")]
-        flags = [m.get(43) == "Y" for m in after]
-        # The one new message comes before or after the resend, never inside it.
-        assert flags.count(False) == 1
-        assert flags[0] is False or flags[-1] is False
-        resent = [int(m.require(34)) for m in after if m.get(43) == "Y"]
-        assert resent == sorted(resent)
-        assert extra not in resent or flags[0] is False
+        order = [m.get(11) for m in acceptor.of_type("D")]
+        assert order == ["C0", "C1", "C2", "C0", "C1", "C2", "NEW"]
 
 
 class TestOutboundDurability:
@@ -1021,7 +1033,7 @@ class TestConnectionLoss:
         assert listener.messages[0].require(34) == str(lost)
         assert listener.messages[0].get(43) == "Y"
         assert acceptor.connections == 2
-        assert session.is_ready or session.state is SessionState.SYNCING
+        await session.wait_ready(5.0)
 
     async def test_backoff_retries_while_the_venue_is_away(
         self, acceptor: FixAcceptor, make_session: SessionFactory
@@ -1080,7 +1092,7 @@ class TestLogout:
         session, listener = await make_session()
         await session.stop()
         assert acceptor.of_type("5")[0].get(58) == "session stopping"
-        assert "session stopped" in listener.downs or listener.downs
+        assert listener.downs[-1] == "session stopped"
         assert session.state is SessionState.STOPPED
 
     async def test_stop_does_not_hang_without_a_confirmation(
@@ -1098,14 +1110,8 @@ class TestLogout:
         await acceptor.send("5", [(58, "end of day")])
         await acceptor.wait_until(lambda: bool(acceptor.of_type("5")))
         assert acceptor.of_type("5")[0].get(58) == "Logout confirmed"
-        assert session.state in (
-            SessionState.LOGOUT_SENT,
-            SessionState.CONNECTING,
-            SessionState.LOGON_SENT,
-            SessionState.SYNCING,
-            SessionState.READY,
-            SessionState.DISCONNECTED,
-        )
+        await acceptor.wait_until(lambda: acceptor.connections == 2)
+        await session.wait_ready(5.0)
 
     async def test_peer_logout_with_a_gap_requests_a_resend_then_confirms(
         self, acceptor: FixAcceptor, make_session: SessionFactory
@@ -1238,3 +1244,190 @@ class TestParametrizedAcrossVersions:
         await acceptor.wait_until(lambda: len(acceptor.of_type("D")) == 2)
         assert acceptor.of_type("D")[1].begin_string == acceptor.begin_string
         await session.stop()
+
+
+class TestResetOnLogonHappensOncePerPeriod:
+    async def test_a_reconnect_in_the_same_period_keeps_the_numbers(
+        self, acceptor: FixAcceptor, make_session: SessionFactory
+    ) -> None:
+        session, listener = await make_session(
+            reset_on_logon=True, session_period=lambda _: "day-1"
+        )
+        await acceptor.drop_connection()
+        # Sent while we are away, as a fill would be. Only its number can recover it.
+        lost = acceptor.next_out
+        acceptor.next_out += 1
+        acceptor.sent[lost] = ("8", [(58, "while away")], acceptor._now())
+        await acceptor.wait_until(lambda: len(acceptor.logons) == 2)
+        assert acceptor.logons[0].get(141) == "Y"
+        assert acceptor.logons[1].get(141) is None
+        assert acceptor.logons[1].require(34) != "1"
+        assert listener.resets == 1
+        await eventually(lambda: session.next_inbound == acceptor.next_out)
+        assert [m.get(58) for m in listener.messages] == ["while away"]
+
+    async def test_a_new_period_resets_again(
+        self, acceptor: FixAcceptor, make_session: SessionFactory
+    ) -> None:
+        period = ["day-1"]
+        session, listener = await make_session(
+            reset_on_logon=True, session_period=lambda _: period[0]
+        )
+        period[0] = "day-2"
+        await acceptor.drop_connection()
+        await acceptor.wait_until(lambda: len(acceptor.logons) == 2)
+        assert acceptor.logons[1].get(141) == "Y"
+        assert acceptor.logons[1].require(34) == "1"
+        await session.wait_ready(5.0)
+        assert listener.resets == 2
+
+    async def test_a_reset_the_venue_never_confirmed_is_repeated(
+        self, acceptor: FixAcceptor, make_session: SessionFactory
+    ) -> None:
+        acceptor.faults.ignore_logon = True
+        session, _ = await make_session(
+            ready=False, reset_on_logon=True, logon_timeout=0.1
+        )
+        await acceptor.wait_until(lambda: bool(acceptor.logons))
+        acceptor.faults.ignore_logon = False
+        await session.wait_ready(5.0)
+        assert all(logon.get(141) == "Y" for logon in acceptor.logons)
+        assert len(acceptor.logons) >= 2
+
+    async def test_the_marker_survives_a_restart(
+        self, acceptor: FixAcceptor, make_session: SessionFactory, tmp_path: Path
+    ) -> None:
+        store = SqliteFixStore(tmp_path / "fix.db", "s")
+        first, _ = await make_session(
+            store=store, reset_on_logon=True, session_period=lambda _: "day-1"
+        )
+        await first.stop()
+        second, _ = await make_session(
+            store=store, reset_on_logon=True, session_period=lambda _: "day-1"
+        )
+        assert acceptor.logons[-1].get(141) is None
+        assert second.is_ready
+        await second.stop()
+        store.close()
+
+
+class TestPeerResets:
+    async def test_the_answer_to_a_reset_carries_the_whole_logon(
+        self, versioned_acceptor: FixAcceptor, begin_string: str
+    ) -> None:
+        acceptor = versioned_acceptor
+        session = FixSession(
+            session_config(
+                acceptor, username=SecretStr("alice"), logon_fields=((1408, "x"),)
+            ),
+            MemoryFixStore(),
+            RecordingListener(),
+        )
+        await session.start()
+        await session.wait_ready(5.0)
+        before = len(acceptor.logons)
+        await acceptor.reset_sequences_at_logon()
+        await acceptor.wait_until(lambda: len(acceptor.logons) > before)
+        reply = acceptor.logons[-1]
+        assert reply.get(141) == "Y"
+        assert reply.get(34) == "1"
+        assert reply.get(553) == "alice"
+        assert reply.get(1408) == "x"
+        expected = APPL_VER_FIX50SP2 if begin_string == "FIXT.1.1" else None
+        assert reply.get(1137) == expected
+        await session.stop()
+
+    async def test_no_application_message_can_precede_our_logon(
+        self, acceptor: FixAcceptor
+    ) -> None:
+        entered = asyncio.Event()
+        leave = asyncio.Event()
+
+        class Holding(RecordingListener):
+            async def on_possible_message_loss(
+                self, first_seq: int, last_seq: int | None, reason: str
+            ) -> None:
+                await super().on_possible_message_loss(first_seq, last_seq, reason)
+                entered.set()
+                await leave.wait()
+
+        listener = Holding()
+        session = FixSession(session_config(acceptor), MemoryFixStore(), listener)
+        await session.start()
+        await session.wait_ready(5.0)
+        unread_from = session.next_inbound
+        before = len(acceptor.logons)
+        await acceptor.reset_sequences_at_logon()
+        await asyncio.wait_for(entered.wait(), 5.0)
+        with pytest.raises(SessionDownError):
+            await session.send_application("D", [(11, "C1")])
+        leave.set()
+        await acceptor.wait_until(lambda: len(acceptor.logons) > before)
+        assert acceptor.of_type("D") == []
+        assert listener.possible_losses[0][0] == unread_from
+        await session.wait_ready(5.0)
+        await session.stop()
+
+    async def test_a_reset_to_a_higher_number_reports_what_it_skipped(
+        self, acceptor: FixAcceptor, make_session: SessionFactory
+    ) -> None:
+        session, listener = await make_session()
+        expected = session.next_inbound
+        await acceptor.send_raw_seq(expected, "4", [(36, "500")])
+        await eventually(lambda: session.next_inbound == 500)
+        assert listener.possible_losses == [
+            (expected, 499, "SequenceReset-Reset skipped these numbers")
+        ]
+
+
+class TestSequenceNumberFormat:
+    async def test_leading_zeros_are_the_same_number(
+        self, acceptor: FixAcceptor, make_session: SessionFactory
+    ) -> None:
+        """The FIX int datatype: "may contain leading zeros (e.g. "00023" = "23")"."""
+        session, listener = await make_session()
+        seq = acceptor.next_out
+        acceptor.next_out += 1
+        body = (
+            f"35=8\x0149=VENUE\x0156=CLIENT\x0134=000{seq}\x01"
+            f"52={format_utc_timestamp(datetime.now(timezone.utc))}\x0158=ok\x01"
+        ).encode()
+        head = f"8=FIX.4.4\x019={len(body)}\x01".encode() + body
+        await acceptor.write(head + f"10={sum(head) % 256:03d}\x01".encode())
+        await eventually(lambda: session.next_inbound == seq + 1)
+        assert listener.messages[0].get(58) == "ok"
+
+
+class TestResendProgress:
+    async def test_a_slow_recovery_that_progresses_is_not_abandoned(
+        self, acceptor: FixAcceptor, make_session: SessionFactory
+    ) -> None:
+        session, listener = await make_session(
+            resend_timeout=0.2, max_resend_requests=2
+        )
+        acceptor.faults.silent = True
+        start = acceptor.next_out
+        await acceptor.send_raw_seq(start + 12, "8", NEWS)
+        for offset in range(9):
+            await asyncio.sleep(0.1)
+            await acceptor.send_raw_seq(start + offset, "8", NEWS)
+        await eventually(lambda: session.next_inbound == start + 9)
+        assert "message gap was not filled" not in listener.downs
+
+
+class TestStaleResendDefault:
+    async def test_an_old_order_is_gap_filled_rather_than_sent_again(
+        self, acceptor: FixAcceptor, make_session: SessionFactory
+    ) -> None:
+        store = MemoryFixStore()
+        long_ago = datetime.now(timezone.utc) - timedelta(minutes=5)
+        store.allocate_outbound(
+            StoredMessage(0, "D", format_utc_timestamp(long_ago), b"11=OLD\x01")
+        )
+        session, _ = await make_session(store=store)
+        await acceptor.wait_until(lambda: bool(acceptor.of_type("4")))
+        fill = acceptor.of_type("4")[0]
+        assert (fill.get(34), fill.get(123)) == ("1", "Y")
+        assert int(fill.require(36)) >= 2
+        assert acceptor.of_type("D") == []
+        assert session.is_ready

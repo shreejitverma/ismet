@@ -21,10 +21,15 @@ pip install ismet
 ```bash
 ISMET_PROVIDERS=coinbase ismet quote BTC-USD@ZCBS
 ismet calendar XNSE
-python examples/safe_order_path.py
 ```
 
-The last one runs the order path against the bundled simulated venue:
+The examples are not in the wheel, so run them from a clone of this repository:
+
+```bash
+uv sync && uv run python examples/safe_order_path.py
+```
+
+That runs the order path against the bundled simulated venue:
 
 ```text
 refused before sending: price_collar: 150.00 is 4998.50 bps through 100.01; default limit 100 bps
@@ -112,13 +117,15 @@ async with OrderManager(provider, SqliteJournal("orders.db"), risk) as oms:
 What happens, and why it matters:
 
 - **Journal first.** The intent is flushed to disk before the network call.
-- **Send once.** Orders are never retried automatically, because a timeout does not mean the order failed.
+- **Send once.** Orders are never retried automatically, because a timeout does not mean the order failed. FIX has one exception the protocol requires: a counterparty's resend request retransmits a stored order with PossDupFlag=Y, only within 60 seconds by default.
 - **Unknown is a state.** A lost response leaves the order `UNKNOWN`, blocks new risk in that symbol, and is resolved by asking the venue by client order id.
-- **Fail closed.** No instrument, no reference price, no calendar answer, unverified positions, a stale quote, or an error inside a check all refuse the order.
+- **Fail closed.** No instrument, no reference price, no calendar answer, unverified positions, a stale quote, a zero price where a notional is needed, or an error inside a check all refuse the order.
+- **Gross limits use the market.** A gross limit values held positions at current marks, never cost basis. Each order refreshes marks older than `max_reference_age_seconds`, costing one quote per such symbol, and a failed quote refuses new risk. Exposure across currencies fails the limit closed, because no rate is assumed, and `RiskConfig.limit_currency` refuses orders in any other currency.
 - **Crash safe.** Restart on the same journal to recover: orders that never reached the send are closed, the rest are looked up, and fills made while down are booked. Tested with real `SIGKILL`.
 - **Kill switch.** `ismet kill engage --journal orders.db --reason "..." --operator "..."` stops every process using that journal.
-- **Reconciliation.** Orders, fills, and positions are compared with the venue, and a disagreement that means exposure may be wrong halts new orders.
-- **Audit trail.** The journal is append-only and hash-chained, and `ismet journal verify` checks it.
+- **Reconciliation.** Orders, fills, and positions are compared with the venue, and a disagreement that means exposure may be wrong halts new orders. `ismet position adjust` records a position change with an outside cause, such as a split, under a named operator.
+- **Limits survive restarts.** A start with limits different from the latest journalled `update_risk_config` is refused.
+- **Audit trail.** The journal is append-only and hash-chained, and `ismet journal verify` checks it. `verify_jsonl` checks an exported archive on its own.
 - **Live trading is opt-in.** A provider that does not declare itself simulated or paper is treated as live, and it requires `allow_live=True`.
 
 Limits, measured in [docs/BENCHMARKS.md](docs/BENCHMARKS.md): durable writes cap this at tens of orders per second per process, with submit taking tens of milliseconds.
@@ -130,7 +137,9 @@ It is not for colocated, sub-millisecond strategies.
 - **Real markets are representable.** Zero and negative prices, locked and crossed books, and clock skew are valid data, flagged rather than rejected.
 - **Identity is validated.** MICs and currencies against ISO snapshots, and ISIN, CUSIP, SEDOL, FIGI, and LEI by check digit.
 - **Calendars refuse to guess.** A date outside a venue's sourced data raises `CalendarOutOfRange`, which also refuses the order.
-- **History is reproducible.** `BarStore` keeps restated bars and reads data as it stood at a past time. `SecurityMaster` answers "what did this ticker mean then, and what did we know then".
+- **History is reproducible.** `BarStore` keeps restated bars and reads data as it stood at a past time, and with no `as_of` returns the latest. `SecurityMaster` answers "what did this ticker mean then, and what did we know then". A later record for the same symbol and start date replaces an earlier one from that time on, and a past query still sees what was believed then.
+- **Backfills do not overclaim.** With a calendar, a window stays open until each session in it has a bar, and `BackfillReport` lists `sessions_missing`. A session with truly no trades therefore keeps the report incomplete.
+- **Flags travel with the data.** Exports carry `quality`, `source`, and `timeliness` columns. A Coinbase bar served from a CDN copy too old to show its bucket closed is flagged `STALE`; repeat the request once the copy expires.
 - **Support is proven, not claimed.** A provider is listed only if it passes conformance on recorded responses.
 
 ## Providers
@@ -140,12 +149,13 @@ It is not for colocated, sub-millisecond strategies.
 | `binance` | `BNCX` spot | market data, bars, streams, reference | Conformance on recorded responses and live, public data only |
 | `coinbase` | `ZCBS` spot | market data, bars, streams, reference | Conformance on recorded responses and live, public data only |
 | `mock` | `XMOK` | market data, bars, streams, reference | Deterministic, ships with the package |
-| `SimVenue` (`ismet.testing.simvenue`) | `XSIM` | everything, with scriptable faults | Trading conformance |
+| `SimVenue` (`ismet.testing.simvenue`) | `ZSIM` | everything, with scriptable faults | Trading conformance |
 | `FixProvider` (`ismet.fix`) | Configured per counterparty | order entry over FIX 4.2, 4.4, 5.0 SP2 | Experimental: QuickFIX interop only, no real counterparty |
 
 Interactive Brokers, Alpaca, Zerodha Kite, and Polygon need accounts or API keys to record real fixtures, and an adapter is not shipped without them.
 
 Third-party providers register through the `ismet.providers` entry-point group, and must pass `ismet.testing.run_conformance`, plus `ismet.testing.trading_conformance.run_trading_conformance` for order entry.
+`ismet providers` lists installed names without importing them, and `ismet providers <name>` imports that one to show its venues and capabilities.
 
 ## Calendars
 
@@ -159,11 +169,13 @@ nyse.session(date(2026, 11, 27)).early_close  # True: closes at 13:00 New York
 nyse.is_open(datetime.now(timezone.utc))
 nyse.settlement_date(date(2026, 11, 25), 1)  # T+1 across Thanksgiving
 
-closed = nyse.with_closure(date(2026, 12, 7))  # apply an announced closure at once
+closed = nyse.with_closure(date(2026, 12, 7))  # a copy; register_calendar(closed) applies it
 ```
 
 Bundled: XNYS, XNAS, XNSE, XBOM, XLON, XTKS, XJPX, XHKG, XSHG, XSHE, XETR, XFRA, XPAR, XAMS, XBRU, XMIL, XMAD, XSWX, XSTO, XTSE, XASX, XKRX, XSES, XTAI, XJSE, BVMF, XMEX, XNZE, and 24x7 crypto venues.
-Data comes from `exchange_calendars`, and CI proves it matches session by session.
+Data comes from `exchange_calendars`, and CI checks each source venue session by session.
+XNSE, XNAS, XJPX, and XSHE are stated aliases of XBOM, XNYS, XTKS, and XSHG, so that proof does not reach them.
+A registered closure lasts for the running process, so apply it at startup in each one.
 **XNSE, XBOM, XSHG, XSHE, and XSES data ends on 2026-12-31**, because the source's lists end there.
 Pre-open, auction, and extended sessions are not modelled.
 
@@ -176,7 +188,8 @@ export ISMET_PROVIDERS=coinbase
 export ISMET_ALPACA_API_KEY=...   # KEY, SECRET, TOKEN, PASSWORD, PASSPHRASE mark credentials
 ```
 
-Credentials are held in `SecretStr`, and they never appear in logs, reprs, or exceptions.
+Credentials are held in `SecretStr`, and ismet does not put them in logs, reprs, or exception messages.
+One exception: a transport error's `__cause__` can hold a URL carrying query authentication, so never serialize exception causes to shared logs. See [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
 `ismet doctor` reports what is configured, without showing values.
 
 ## Documentation
@@ -185,6 +198,7 @@ Credentials are held in `SecretStr`, and they never appear in logs, reprs, or ex
 |---|---|
 | [docs/GAP_MATRIX.md](docs/GAP_MATRIX.md) | What exists, the evidence, and what does not exist |
 | [docs/OPERATIONS.md](docs/OPERATIONS.md) | Runbook: halts, crashes, every failure mode |
+| [docs/BEHAVIOUR_NOTES.md](docs/BEHAVIOUR_NOTES.md) | Rules callers depend on, by subsystem |
 | [docs/COMPLIANCE.md](docs/COMPLIANCE.md) | Regulatory control mapping, and what stays the firm's responsibility |
 | [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) | Threats, controls, remaining risk |
 | [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | Measured latency and limits |
@@ -200,6 +214,7 @@ uv run pytest --cov
 ```
 
 CI runs on Linux, macOS, and Windows for every supported Python version, with `mypy --strict`, a 90 percent coverage gate, a calendar differential test, performance budgets, a dependency audit, CodeQL, and a fresh-install smoke test.
+A release publishes only from a tag naming the package's version, and only after all of that passes on the tagged commit.
 
 ## Disclaimer
 

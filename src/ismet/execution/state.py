@@ -164,6 +164,7 @@ class OrderState:
     reject_reason: str | None = None
     reject_code: str | None = None
     anomalies: tuple[str, ...] = ()
+    busted_fill_ids: frozenset[str] = frozenset()
 
     @property
     def client_order_id(self) -> str:
@@ -219,7 +220,16 @@ def _note(state: OrderState, message: str) -> OrderState:
     return replace(state, anomalies=(*state.anomalies, message))
 
 
+def _fill_ceiling(state: OrderState) -> Decimal:
+    """The most this order may fill: while a replace is pending, either may be live."""
+    if state.pending_quantity is None:
+        return state.quantity
+    return max(state.quantity, state.pending_quantity)
+
+
 def _apply_fill(state: OrderState, fill: Fill) -> OrderState:
+    if fill.fill_id in state.busted_fill_ids:
+        return _note(state, f"fill {fill.fill_id} reported again after its bust")
     for index, known in enumerate(state.fills):
         if known.fill_id == fill.fill_id:
             if known == fill:
@@ -236,10 +246,11 @@ def _apply_fill(state: OrderState, fill: Fill) -> OrderState:
         filled_quantity=add(state.filled_quantity, fill.quantity),
         filled_notional=add(state.filled_notional, mul(fill.price, fill.quantity)),
     )
-    if updated.filled_quantity > updated.quantity:
+    ceiling = _fill_ceiling(updated)
+    if updated.filled_quantity > ceiling:
         updated = _note(
             updated,
-            f"overfill: {updated.filled_quantity} filled against {updated.quantity}",
+            f"overfill: {updated.filled_quantity} filled against {ceiling}",
         )
     if state.status is S.PENDING_SUBMIT:
         updated = _note(updated, f"fill {fill.fill_id} before the send started")
@@ -247,11 +258,21 @@ def _apply_fill(state: OrderState, fill: Fill) -> OrderState:
         updated = _note(
             updated, f"fill {fill.fill_id} after terminal status {state.status.value}"
         )
-    if updated.filled_quantity >= updated.quantity:
+    if updated.filled_quantity >= ceiling:
         return replace(updated, status=S.FILLED)
     if state.status in (S.ACCEPTED, S.SUBMITTING):
         return replace(updated, status=S.PARTIALLY_FILLED)
     return updated
+
+
+def fill_adds_detail(state: OrderState, fill: Fill) -> bool:
+    """Whether a report of a known fill says more than the record of it does."""
+    known = next((f for f in state.fills if f.fill_id == fill.fill_id), None)
+    return (
+        known is not None
+        and _same_execution(known, fill)
+        and _merged(known, fill) != known
+    )
 
 
 def _same_execution(a: Fill, b: Fill) -> bool:
@@ -281,11 +302,18 @@ def _merged(known: Fill, report: Fill) -> Fill:
 
 
 def _apply_bust(state: OrderState, event: FillBusted) -> OrderState:
+    if event.fill_id in state.busted_fill_ids:
+        return state  # the same bust delivered twice
+    busted = state.busted_fill_ids | {event.fill_id}
     target = next((f for f in state.fills if f.fill_id == event.fill_id), None)
     if target is None:
-        return _note(state, f"bust of unknown fill {event.fill_id}")
+        return _note(
+            replace(state, busted_fill_ids=busted),
+            f"bust of unknown fill {event.fill_id}",
+        )
     updated = replace(
         state,
+        busted_fill_ids=busted,
         fills=tuple(f for f in state.fills if f.fill_id != event.fill_id),
         filled_quantity=sub(state.filled_quantity, target.quantity),
         filled_notional=sub(state.filled_notional, mul(target.price, target.quantity)),
@@ -323,7 +351,19 @@ def _transition(
 
 
 def apply_event(state: OrderState, event: OrderEvent) -> OrderState:
-    """Return the state after ``event``. Pure; ``state`` is not changed."""
+    """Return the state after ``event``. Pure; ``state`` is not changed.
+
+    Requested terms last only while the outcome of the request is open.
+    """
+    updated = _apply(state, event)
+    if updated.status in (*_PENDING, S.UNKNOWN):
+        return updated
+    if updated.pending_quantity is None and updated.pending_limit_price is None:
+        return updated
+    return replace(updated, pending_quantity=None, pending_limit_price=None)
+
+
+def _apply(state: OrderState, event: OrderEvent) -> OrderState:
     if event.client_order_id != state.client_order_id:
         raise OrderStateError(
             f"event for {event.client_order_id} applied to {state.client_order_id}"
@@ -343,6 +383,8 @@ def apply_event(state: OrderState, event: OrderEvent) -> OrderState:
     if isinstance(event, Rejected):
         return replace(next_state, reject_reason=event.reason, reject_code=event.code)
     if isinstance(event, ReplaceRequested):
+        if state.status not in TRANSITIONS[event.kind]:
+            return next_state  # nothing will be sent, so no new terms can go live
         return replace(
             next_state,
             pending_quantity=event.quantity,
@@ -351,7 +393,14 @@ def apply_event(state: OrderState, event: OrderEvent) -> OrderState:
     if isinstance(event, Replaced):
         return _apply_replaced(state, next_state, event)
     if isinstance(event, ReplaceRejected):
-        return replace(next_state, pending_quantity=None, pending_limit_price=None)
+        settled = replace(next_state, pending_quantity=None, pending_limit_price=None)
+        if settled.filled_quantity > settled.quantity:
+            return _note(
+                settled,
+                f"overfill: {settled.filled_quantity} filled against "
+                f"{settled.quantity}",
+            )
+        return settled
     if isinstance(event, CancelRejected):
         return replace(next_state, reject_reason=event.reason, reject_code=event.code)
     if isinstance(
@@ -403,4 +452,11 @@ def replay(events: Iterable[OrderEvent]) -> dict[str, OrderState]:
     return orders
 
 
-__all__ = ["TRANSITIONS", "OrderState", "apply_event", "new_order", "replay"]
+__all__ = [
+    "TRANSITIONS",
+    "OrderState",
+    "apply_event",
+    "fill_adds_detail",
+    "new_order",
+    "replay",
+]

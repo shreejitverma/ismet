@@ -481,3 +481,11 @@ def test_sequence_tracker_distinguishes_gap_duplicate_and_late_delivery() -> Non
     assert (tracker.duplicates, tracker.out_of_order) == (1, 1)
     tracker.reset()
     assert tracker.classify(1).outcome is SequenceOutcome.FIRST
+
+
+def test_built_in_private_venues_are_not_real_mics() -> None:
+    from ismet.refdata.codes import _private_venues
+
+    assert "ZSIM" in _private_venues
+    for code in _private_venues:
+        assert register_private_venue(code, "same check as any other") == code

@@ -22,6 +22,7 @@ Credentials never reach this module, because Logon is not stored.
 
 from __future__ import annotations
 
+import dataclasses
 import sqlite3
 import threading
 from collections.abc import Iterator
@@ -57,17 +58,28 @@ class StoredExecution:
     fill: str | None
     busted: bool
     received_at: str
+    latest_us: int = 0
+    """The later of the venue's time and receipt, in microseconds since the epoch."""
 
 
 @dataclass(frozen=True)
 class QuarantinedMessage:
-    """A message rejected or discarded unapplied. ``content`` has credentials masked."""
+    """A message rejected or discarded unapplied. ``content`` has credentials masked.
+
+    ``halted`` means it may have been a fill, so the stream stays stopped until an
+    operator's release is recorded here. A row whose ``msg_type`` is ``*`` stands for a
+    range of numbers the peer skipped or reset away, which may have held fills.
+    """
 
     seq: int
     msg_type: str
     content: str
     reason: str
     received_at: str
+    halted: bool = False
+    released_by: str | None = None
+    release_reason: str | None = None
+    released_at: str | None = None
 
 
 class FixStore(Protocol):
@@ -90,19 +102,31 @@ class FixStore(Protocol):
 
     def messages(self, begin: int, end: int) -> list[StoredMessage]: ...
 
-    def prune_messages(self, before_seq: int) -> int: ...
+    def prune_messages_sent_before(self, sending_time: str) -> int:
+        """Drop outbound messages older than a UTCTimestamp, so they get gap-filled."""
+        ...
 
     def reset_sequences(self) -> None:
         """Begin a new FIX session: both numbers become 1, stored messages go."""
         ...
 
-    def put_order(self, client_order_id: str, payload: str) -> None: ...
+    def reset_period(self) -> str | None:
+        """The session period of the last confirmed ``reset_on_logon``."""
+        ...
+
+    def set_reset_period(self, period: str) -> None: ...
+
+    def put_order(
+        self, client_order_id: str, payload: str, *, is_open: bool = True
+    ) -> None: ...
 
     def delete_order(self, client_order_id: str) -> None: ...
 
     def get_order(self, client_order_id: str) -> str | None: ...
 
-    def all_orders(self) -> list[str]: ...
+    def open_orders(self) -> list[str]:
+        """Payloads last stored with ``is_open``, found through an index."""
+        ...
 
     def link_wire_id(self, wire_id: str, client_order_id: str) -> None: ...
 
@@ -117,19 +141,30 @@ class FixStore(Protocol):
         client_order_id: str,
         *,
         order_payload: str | None,
+        order_open: bool = True,
         execution: StoredExecution | None = None,
         bust_exec_id: str | None = None,
     ) -> None:
         """Atomically update the order, add the execution, and mark a bust."""
         ...
 
-    def executions(self) -> list[StoredExecution]: ...
+    def fills_since(self, since_us: int) -> list[StoredExecution]:
+        """Unbusted fills with ``latest_us`` at or after ``since_us``, by index."""
+        ...
+
+    def busted_executions(self) -> list[StoredExecution]:
+        """Every execution marked busted, found through an index."""
+        ...
 
     def quarantine(self, record: QuarantinedMessage) -> None:
         """Keep a message that consumed a sequence number but could not be applied."""
         ...
 
     def quarantined(self) -> list[QuarantinedMessage]: ...
+
+    def release_quarantine(self, operator: str, reason: str, at: str) -> int:
+        """Record an operator's release of every unreleased row. Returns the count."""
+        ...
 
     def close(self) -> None: ...
 
@@ -142,6 +177,8 @@ class MemoryFixStore:
         self._next_in = 1
         self._messages: dict[int, StoredMessage] = {}
         self._orders: dict[str, str] = {}
+        self._open_orders: set[str] = set()
+        self._reset_period: str | None = None
         self._wire: dict[str, str] = {}
         self._executions: dict[tuple[str, str], StoredExecution] = {}
         self._quarantine: list[QuarantinedMessage] = []
@@ -172,8 +209,12 @@ class MemoryFixStore:
             self._messages[seq] for seq in sorted(self._messages) if begin <= seq <= end
         ]
 
-    def prune_messages(self, before_seq: int) -> int:
-        stale = [seq for seq in self._messages if seq < before_seq]
+    def prune_messages_sent_before(self, sending_time: str) -> int:
+        stale = [
+            seq
+            for seq, message in self._messages.items()
+            if message.sending_time < sending_time
+        ]
         for seq in stale:
             del self._messages[seq]
         return len(stale)
@@ -183,19 +224,32 @@ class MemoryFixStore:
         self._next_in = 1
         self._messages.clear()
 
-    def put_order(self, client_order_id: str, payload: str) -> None:
+    def reset_period(self) -> str | None:
+        return self._reset_period
+
+    def set_reset_period(self, period: str) -> None:
+        self._reset_period = period
+
+    def put_order(
+        self, client_order_id: str, payload: str, *, is_open: bool = True
+    ) -> None:
         self._orders[client_order_id] = payload
+        if is_open:
+            self._open_orders.add(client_order_id)
+        else:
+            self._open_orders.discard(client_order_id)
 
     def delete_order(self, client_order_id: str) -> None:
         self._orders.pop(client_order_id, None)
+        self._open_orders.discard(client_order_id)
         for wire in [w for w, c in self._wire.items() if c == client_order_id]:
             del self._wire[wire]
 
     def get_order(self, client_order_id: str) -> str | None:
         return self._orders.get(client_order_id)
 
-    def all_orders(self) -> list[str]:
-        return list(self._orders.values())
+    def open_orders(self) -> list[str]:
+        return [self._orders[cid] for cid in self._open_orders]
 
     def link_wire_id(self, wire_id: str, client_order_id: str) -> None:
         self._wire[wire_id] = client_order_id
@@ -211,28 +265,31 @@ class MemoryFixStore:
         client_order_id: str,
         *,
         order_payload: str | None,
+        order_open: bool = True,
         execution: StoredExecution | None = None,
         bust_exec_id: str | None = None,
     ) -> None:
         if order_payload is not None:
-            self._orders[client_order_id] = order_payload
+            self.put_order(client_order_id, order_payload, is_open=order_open)
         if execution is not None:
             key = (execution.client_order_id, execution.exec_id)
             self._executions.setdefault(key, execution)
         if bust_exec_id is not None:
             known = self._executions.get((client_order_id, bust_exec_id))
             if known is not None:
-                self._executions[(client_order_id, bust_exec_id)] = StoredExecution(
-                    known.client_order_id,
-                    known.exec_id,
-                    known.digest,
-                    known.fill,
-                    True,
-                    known.received_at,
+                self._executions[(client_order_id, bust_exec_id)] = dataclasses.replace(
+                    known, busted=True
                 )
 
-    def executions(self) -> list[StoredExecution]:
-        return list(self._executions.values())
+    def fills_since(self, since_us: int) -> list[StoredExecution]:
+        return [
+            e
+            for e in self._executions.values()
+            if e.fill is not None and not e.busted and e.latest_us >= since_us
+        ]
+
+    def busted_executions(self) -> list[StoredExecution]:
+        return [e for e in self._executions.values() if e.busted]
 
     def quarantine(self, record: QuarantinedMessage) -> None:
         self._quarantine.append(record)
@@ -240,15 +297,30 @@ class MemoryFixStore:
     def quarantined(self) -> list[QuarantinedMessage]:
         return list(self._quarantine)
 
+    def release_quarantine(self, operator: str, reason: str, at: str) -> int:
+        count = 0
+        for index, record in enumerate(self._quarantine):
+            if record.released_by is None:
+                self._quarantine[index] = dataclasses.replace(
+                    record, released_by=operator, release_reason=reason, released_at=at
+                )
+                count += 1
+        return count
+
     def close(self) -> None:
         """Nothing to release."""
 
+
+_EXECUTION_COLUMNS = (
+    "client_order_id, exec_id, digest, fill, busted, received_at, latest_us"
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS fix_sequence (
     session TEXT PRIMARY KEY,
     next_out INTEGER NOT NULL,
-    next_in INTEGER NOT NULL
+    next_in INTEGER NOT NULL,
+    reset_period TEXT
 );
 CREATE TABLE IF NOT EXISTS fix_outbound (
     session TEXT NOT NULL,
@@ -262,8 +334,10 @@ CREATE TABLE IF NOT EXISTS fix_order (
     session TEXT NOT NULL,
     client_order_id TEXT NOT NULL,
     payload TEXT NOT NULL,
+    is_open INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (session, client_order_id)
 );
+CREATE INDEX IF NOT EXISTS fix_order_open ON fix_order (session) WHERE is_open = 1;
 CREATE TABLE IF NOT EXISTS fix_wire_id (
     session TEXT NOT NULL,
     wire_id TEXT NOT NULL,
@@ -278,15 +352,23 @@ CREATE TABLE IF NOT EXISTS fix_execution (
     fill TEXT,
     busted INTEGER NOT NULL DEFAULT 0,
     received_at TEXT NOT NULL,
+    latest_us INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (session, client_order_id, exec_id)
 );
+CREATE INDEX IF NOT EXISTS fix_execution_latest ON fix_execution (session, latest_us);
+CREATE INDEX IF NOT EXISTS fix_execution_busted ON fix_execution (session)
+    WHERE busted = 1;
 CREATE TABLE IF NOT EXISTS fix_quarantine (
     session TEXT NOT NULL,
     seq INTEGER NOT NULL,
     msg_type TEXT NOT NULL,
     content TEXT NOT NULL,
     reason TEXT NOT NULL,
-    received_at TEXT NOT NULL
+    received_at TEXT NOT NULL,
+    halted INTEGER NOT NULL DEFAULT 0,
+    released_by TEXT,
+    release_reason TEXT,
+    released_at TEXT
 );
 """
 
@@ -414,11 +496,11 @@ class SqliteFixStore:
             for r in rows
         ]
 
-    def prune_messages(self, before_seq: int) -> int:
+    def prune_messages_sent_before(self, sending_time: str) -> int:
         with self._transaction() as conn:
             cursor = conn.execute(
-                "DELETE FROM fix_outbound WHERE session = ? AND seq < ?",
-                (self.session, before_seq),
+                "DELETE FROM fix_outbound WHERE session = ? AND sending_time < ?",
+                (self.session, sending_time),
             )
             return int(cursor.rowcount)
 
@@ -430,12 +512,27 @@ class SqliteFixStore:
             )
             conn.execute("DELETE FROM fix_outbound WHERE session = ?", (self.session,))
 
-    def put_order(self, client_order_id: str, payload: str) -> None:
+    def reset_period(self) -> str | None:
+        rows = self._query(
+            "SELECT reset_period FROM fix_sequence WHERE session = ?", self.session
+        )
+        return None if rows[0][0] is None else str(rows[0][0])
+
+    def set_reset_period(self, period: str) -> None:
         with self._transaction() as conn:
             conn.execute(
-                "INSERT OR REPLACE INTO fix_order (session, client_order_id, payload) "
-                "VALUES (?, ?, ?)",
-                (self.session, client_order_id, payload),
+                "UPDATE fix_sequence SET reset_period = ? WHERE session = ?",
+                (period, self.session),
+            )
+
+    def put_order(
+        self, client_order_id: str, payload: str, *, is_open: bool = True
+    ) -> None:
+        with self._transaction() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO fix_order "
+                "(session, client_order_id, payload, is_open) VALUES (?, ?, ?, ?)",
+                (self.session, client_order_id, payload, int(is_open)),
             )
 
     def delete_order(self, client_order_id: str) -> None:
@@ -457,9 +554,10 @@ class SqliteFixStore:
         )
         return str(rows[0][0]) if rows else None
 
-    def all_orders(self) -> list[str]:
+    def open_orders(self) -> list[str]:
         rows = self._query(
-            "SELECT payload FROM fix_order WHERE session = ?", self.session
+            "SELECT payload FROM fix_order WHERE session = ? AND is_open = 1",
+            self.session,
         )
         return [str(r[0]) for r in rows]
 
@@ -481,8 +579,7 @@ class SqliteFixStore:
 
     def execution(self, client_order_id: str, exec_id: str) -> StoredExecution | None:
         rows = self._query(
-            "SELECT client_order_id, exec_id, digest, fill, busted, received_at "
-            "FROM fix_execution "
+            f"SELECT {_EXECUTION_COLUMNS} FROM fix_execution "
             "WHERE session = ? AND client_order_id = ? AND exec_id = ?",
             self.session,
             client_order_id,
@@ -495,6 +592,7 @@ class SqliteFixStore:
         client_order_id: str,
         *,
         order_payload: str | None,
+        order_open: bool = True,
         execution: StoredExecution | None = None,
         bust_exec_id: str | None = None,
     ) -> None:
@@ -502,14 +600,14 @@ class SqliteFixStore:
             if order_payload is not None:
                 conn.execute(
                     "INSERT OR REPLACE INTO fix_order "
-                    "(session, client_order_id, payload) VALUES (?, ?, ?)",
-                    (self.session, client_order_id, order_payload),
+                    "(session, client_order_id, payload, is_open) VALUES (?, ?, ?, ?)",
+                    (self.session, client_order_id, order_payload, int(order_open)),
                 )
             if execution is not None:
                 conn.execute(
                     "INSERT OR IGNORE INTO fix_execution "
                     "(session, client_order_id, exec_id, digest, fill, busted, "
-                    "received_at) VALUES (?, ?, ?, ?, ?, 0, ?)",
+                    "received_at, latest_us) VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
                     (
                         self.session,
                         execution.client_order_id,
@@ -517,6 +615,7 @@ class SqliteFixStore:
                         execution.digest,
                         execution.fill,
                         execution.received_at,
+                        execution.latest_us,
                     ),
                 )
             if bust_exec_id is not None:
@@ -526,10 +625,19 @@ class SqliteFixStore:
                     (self.session, client_order_id, bust_exec_id),
                 )
 
-    def executions(self) -> list[StoredExecution]:
+    def fills_since(self, since_us: int) -> list[StoredExecution]:
         rows = self._query(
-            "SELECT client_order_id, exec_id, digest, fill, busted, received_at "
-            "FROM fix_execution WHERE session = ?",
+            f"SELECT {_EXECUTION_COLUMNS} FROM fix_execution WHERE session = ? "
+            "AND latest_us >= ? AND fill IS NOT NULL AND busted = 0",
+            self.session,
+            since_us,
+        )
+        return [_execution(r) for r in rows]
+
+    def busted_executions(self) -> list[StoredExecution]:
+        rows = self._query(
+            f"SELECT {_EXECUTION_COLUMNS} FROM fix_execution "
+            "WHERE session = ? AND busted = 1",
             self.session,
         )
         return [_execution(r) for r in rows]
@@ -538,8 +646,9 @@ class SqliteFixStore:
         with self._transaction() as conn:
             conn.execute(
                 "INSERT INTO fix_quarantine "
-                "(session, seq, msg_type, content, reason, received_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "(session, seq, msg_type, content, reason, received_at, halted, "
+                "released_by, release_reason, released_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     self.session,
                     record.seq,
@@ -547,21 +656,43 @@ class SqliteFixStore:
                     record.content,
                     record.reason,
                     record.received_at,
+                    int(record.halted),
+                    record.released_by,
+                    record.release_reason,
+                    record.released_at,
                 ),
             )
 
     def quarantined(self) -> list[QuarantinedMessage]:
         rows = self._query(
-            "SELECT seq, msg_type, content, reason, received_at FROM fix_quarantine "
+            "SELECT seq, msg_type, content, reason, received_at, halted, released_by, "
+            "release_reason, released_at FROM fix_quarantine "
             "WHERE session = ? ORDER BY rowid",
             self.session,
         )
         return [
             QuarantinedMessage(
-                int(str(r[0])), str(r[1]), str(r[2]), str(r[3]), str(r[4])
+                int(str(r[0])),
+                str(r[1]),
+                str(r[2]),
+                str(r[3]),
+                str(r[4]),
+                bool(r[5]),
+                None if r[6] is None else str(r[6]),
+                None if r[7] is None else str(r[7]),
+                None if r[8] is None else str(r[8]),
             )
             for r in rows
         ]
+
+    def release_quarantine(self, operator: str, reason: str, at: str) -> int:
+        with self._transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE fix_quarantine SET released_by = ?, release_reason = ?, "
+                "released_at = ? WHERE session = ? AND released_by IS NULL",
+                (operator, reason, at, self.session),
+            )
+            return int(cursor.rowcount)
 
     def close(self) -> None:
         with self._lock:
@@ -584,6 +715,7 @@ def _execution(row: tuple[object, ...]) -> StoredExecution:
         None if row[3] is None else str(row[3]),
         bool(row[4]),
         str(row[5]),
+        int(str(row[6])),
     )
 
 

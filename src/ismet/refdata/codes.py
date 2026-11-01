@@ -94,7 +94,7 @@ _BUILTIN_CRYPTO = frozenset(
 _crypto_assets: set[str] = set(_BUILTIN_CRYPTO)
 _private_venues: dict[str, str] = {
     "XMOK": "ismet deterministic mock venue",
-    "XSIM": "ismet simulated matching venue",
+    "ZSIM": "ismet simulated matching venue",
     "ZCBS": "Coinbase Exchange spot (no ISO 10383 MIC is published)",
 }
 

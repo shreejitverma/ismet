@@ -32,7 +32,8 @@ _POLL_SECONDS = 0.05
 _JOIN_TIMEOUT = 5.0
 
 
-def _as_datetime(value: datetime | date | str | None, default: datetime) -> datetime:
+def as_datetime(value: datetime | date | str | None, default: datetime) -> datetime:
+    """A time from an ISO string or date. Dates are UTC midnight; naive times refuse."""
     if value is None:
         return default
     if isinstance(value, str):
@@ -73,8 +74,7 @@ class IsmetSyncClient:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._opened = False
-        self._streams: set[threading.Event] = set()
-        self._closing = False
+        self._streams: dict[threading.Event, list[BaseException]] = {}
 
     # Lifecycle
 
@@ -105,6 +105,9 @@ class IsmetSyncClient:
         """Close providers, stop the loop, and join the thread. Idempotent."""
         if self._thread is None:
             return
+        for stop, failure in list(self._streams.items()):
+            failure.append(ConfigError("the client was closed during this stream"))
+            stop.set()
         try:
             if self._opened:
                 self._run(self._client.close())
@@ -117,9 +120,6 @@ class IsmetSyncClient:
         self._loop, self._thread = None, None
         if loop is None or thread is None:
             return
-        self._closing = True
-        for stop in list(self._streams):
-            stop.set()
 
         async def cancel_rest() -> None:
             tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
@@ -127,12 +127,13 @@ class IsmetSyncClient:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
-        asyncio.run_coroutine_threadsafe(cancel_rest(), loop).result(_JOIN_TIMEOUT)
-        loop.call_soon_threadsafe(loop.stop)
-        thread.join(_JOIN_TIMEOUT)
-        if not thread.is_alive():
-            loop.close()
-        self._closing = False
+        try:
+            asyncio.run_coroutine_threadsafe(cancel_rest(), loop).result(_JOIN_TIMEOUT)
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(_JOIN_TIMEOUT)
+            if not thread.is_alive():
+                loop.close()
 
     def _run(self, coroutine: Coroutine[Any, Any, T]) -> T:
         if self._loop is None:
@@ -196,8 +197,8 @@ class IsmetSyncClient:
             self._client.bars(
                 symbol,
                 interval=interval,
-                start=_as_datetime(start, now),
-                end=_as_datetime(end, now),
+                start=as_datetime(start, now),
+                end=as_datetime(end, now),
                 venue=venue,
                 provider=provider,
             )
@@ -242,7 +243,7 @@ class IsmetSyncClient:
         stop = threading.Event()
         finished = threading.Event()
         failure: list[BaseException] = []
-        self._streams.add(stop)
+        self._streams[stop] = failure
 
         def put(item: Any) -> None:
             while not stop.is_set():
@@ -266,6 +267,7 @@ class IsmetSyncClient:
             except Exception as exc:
                 failure.append(exc)
             finally:
+                self._streams.pop(stop, None)
                 finished.set()
 
         future = asyncio.run_coroutine_threadsafe(pump(), loop)
@@ -278,15 +280,13 @@ class IsmetSyncClient:
                         continue
                     except Empty:
                         pass
-                    if self._closing or self._loop is None:
-                        raise ConfigError("the client was closed during this stream")
+                    if failure:
+                        raise failure[0]
                     if finished.is_set() and queue.empty():
-                        if failure:
-                            raise failure[0]
                         return
             finally:
                 stop.set()
-                self._streams.discard(stop)
+                self._streams.pop(stop, None)
                 future.cancel()
 
         return generate()

@@ -12,6 +12,7 @@ Retrying creates duplicates, and assuming failure leaves unmanaged risk.
 
 - Write the intent, then a `send_started` record, durably, before the network call.
 - Send once, and never retry automatically.
+  FIX adds one exception the protocol requires: a counterparty's resend request retransmits a stored order under its original sequence number with PossDupFlag=Y, only within `stale_resend_after`, 60 seconds by default, and older messages are gap-filled.
 - A failure that may have delivered becomes `UNKNOWN`, which blocks new orders in that symbol and is resolved only by querying the venue by client order id.
 - Before declaring an order lost, wait out a grace period and send a cancel by client order id, to catch a late arrival.
 - The order's state is a pure function of its events, and a contradictory venue report is recorded and surfaced, never dropped.

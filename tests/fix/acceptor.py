@@ -114,6 +114,7 @@ class FixAcceptor:
         self.resend_requests_answered = 0
         self.logout_text: str | None = None
         self.heartbeat_interval = 30
+        self._reset_answer_due = False
         self._hb_task: asyncio.Task[None] | None = None
 
     # Lifecycle
@@ -244,6 +245,14 @@ class FixAcceptor:
         """Send with an exact sequence number and no bookkeeping."""
         await self.write(self.frame(seq, msg_type, fields, **kw))  # type: ignore[arg-type]
 
+    async def reset_sequences_at_logon(self) -> None:
+        """Start a new FIX session from this side: a Logon at 1 with ResetSeqNumFlag."""
+        self.next_in = 1
+        self.next_out = 2
+        self.sent.clear()
+        self._reset_answer_due = True
+        await self.write(self.frame(1, "A", [(98, "0"), (108, "30"), (141, "Y")]))
+
     # Accepting
 
     async def _accept(
@@ -325,6 +334,10 @@ class FixAcceptor:
 
     async def _on_logon(self, message: FixMessage, seq: int) -> None:
         self.logons.append(message)
+        if self._reset_answer_due:
+            self._reset_answer_due = False
+            self.next_in = seq + 1
+            return
         faults = self.faults
         self.heartbeat_interval = int(message.require(108))
         if faults.ignore_logon:

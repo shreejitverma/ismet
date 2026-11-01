@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter, deque
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
@@ -66,7 +66,7 @@ from ismet.models.orders import (
 from ismet.providers.base import Provider
 from ismet.transport.clock import SYSTEM_CLOCK, Clock
 
-SIM_VENUE = "XSIM"
+SIM_VENUE = "ZSIM"
 
 
 class Fault(str, Enum):
@@ -168,6 +168,14 @@ class SimVenue(Provider):
         """Positions stay frozen for this many queries after each fill."""
         self.fee_only_on_query = False
         """Stream fills carry no fee; the fee appears only in ``fills_since``."""
+        self.retain_busted_fills = False
+        """``fills_since`` keeps reporting a busted fill, as some venues do."""
+        self.answer_ticks = 1
+        """Event loop turns a venue call takes after fixing its answer, as a network
+        call would, so stream events can overtake any answer. Zero never suspends."""
+        self.after_answer: Callable[[str], None] | None = None
+        """Called with the method name once its answer is fixed, before it returns:
+        what this does is what the caller's answer does not yet know."""
         self._status_lag: Counter[str] = Counter()
         self._positions_view: dict[Symbol, Decimal] | None = None
         self._positions_view_left = 0
@@ -236,7 +244,8 @@ class SimVenue(Provider):
     def bust(self, fill_id: str) -> None:
         """Cancel an execution and publish the bust."""
         fill = next(f for f in self._fills if f.fill_id == fill_id)
-        self._fills.remove(fill)
+        if not self.retain_busted_fills:
+            self._fills.remove(fill)
         self._adjust_position(fill.symbol, mul(Decimal(-fill.side.sign), fill.quantity))
         order = self._orders[fill.client_order_id]
         order.filled = sub(order.filled, fill.quantity)
@@ -246,6 +255,8 @@ class SimVenue(Provider):
                 if order.filled > 0
                 else OrderStatus.CANCELED
             )
+        elif order.status is OrderStatus.PARTIALLY_FILLED and order.filled == 0:
+            order.status = OrderStatus.ACCEPTED
         self._publish(
             FillBusted(
                 client_order_id=fill.client_order_id,
@@ -295,6 +306,12 @@ class SimVenue(Provider):
             self._deliver(event)
 
     # Internals
+
+    async def _answer(self, method: str) -> None:
+        if self.after_answer is not None:
+            self.after_answer(method)
+        for _ in range(self.answer_ticks):
+            await asyncio.sleep(0)
 
     def _next_id(self, prefix: str) -> str:
         self._sequence += 1
@@ -500,6 +517,7 @@ class SimVenue(Provider):
             raise AmbiguousOutcome("simulated: response lost after acceptance")
         if fault is Fault.SERVER_ERROR_ACCEPTED:
             raise AmbiguousOutcome("simulated: 502 after acceptance", status=502)
+        await self._answer("place_order")
         return OrderAck(
             client_order_id=cid,
             venue_order_id=order.venue_order_id,
@@ -544,6 +562,7 @@ class SimVenue(Provider):
         if self.lose_cancel_response > 0:
             self.lose_cancel_response -= 1
             raise AmbiguousOutcome("simulated: cancel applied, response lost")
+        await self._answer("cancel_order")
 
     async def amend_order(
         self,
@@ -573,6 +592,7 @@ class SimVenue(Provider):
             )
         )
         self._take_liquidity(order)
+        await self._answer("amend_order")
 
     def _snapshot(self, order: _Order) -> VenueOrderSnapshot:
         return VenueOrderSnapshot(
@@ -599,31 +619,37 @@ class SimVenue(Provider):
     ) -> VenueOrderSnapshot | None:
         self._maybe_fail_query()
         order = self._orders.get(client_order_id)
+        answer = None if order is None else self._snapshot(order)
         if self._status_lag[client_order_id] > 0:
             self._status_lag[client_order_id] -= 1
-            return None
-        return None if order is None else self._snapshot(order)
+            answer = None
+        await self._answer("order_status")
+        return answer
 
     async def open_orders(
         self, symbol: Symbol | None = None
     ) -> list[VenueOrderSnapshot]:
         self._maybe_fail_query()
-        return [
+        answer = [
             self._snapshot(o)
             for o in self._orders.values()
             if not o.status.is_terminal
             and (symbol is None or o.request.symbol == symbol)
         ]
+        await self._answer("open_orders")
+        return answer
 
     async def fills_since(
         self, since: datetime, symbol: Symbol | None = None
     ) -> list[Fill]:
         self._maybe_fail_query()
-        return [
+        answer = [
             f
             for f in self._fills
             if f.ts >= since and (symbol is None or f.symbol == symbol)
         ]
+        await self._answer("fills_since")
+        return answer
 
     def stream_executions(self) -> AsyncIterator[OrderEvent]:
         """Subscribe now, so nothing published after this call is missed."""
@@ -657,11 +683,13 @@ class SimVenue(Provider):
             self._positions_view_left -= 1
             if self._positions_view_left <= 0:
                 self._positions_view = None
-        return [
+        answer = [
             Position(symbol=symbol, quantity=quantity)
             for symbol, quantity in view.items()
             if quantity != 0
         ]
+        await self._answer("positions")
+        return answer
 
     async def balances(self) -> list[Balance]:
         return [

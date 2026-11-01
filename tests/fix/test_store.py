@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sqlite3
 import subprocess
 import sys
 import textwrap
@@ -64,11 +63,13 @@ class TestBothStores:
         assert [m.seq for m in store.messages(2, 4)] == [2, 3, 4]
 
     def test_prune_removes_only_older_messages(self, store: FixStore) -> None:
-        for _ in range(4):
-            store.allocate_outbound(message())
-        assert store.prune_messages(3) == 2
-        assert [m.seq for m in store.messages(1, 10)] == [3, 4]
-        assert store.next_outbound() == 5
+        store.allocate_outbound(
+            StoredMessage(0, "D", "20260309-14:30:15.122", b"11=A\x01")
+        )
+        store.allocate_outbound(message())
+        assert store.prune_messages_sent_before("20260309-14:30:15.123") == 1
+        assert [m.seq for m in store.messages(1, 10)] == [2]
+        assert store.next_outbound() == 3
 
     def test_inbound_number_moves(self, store: FixStore) -> None:
         store.set_next_inbound(42)
@@ -94,7 +95,10 @@ class TestBothStores:
         store.link_wire_id("C1", "C1")
         store.link_wire_id("C1~1", "C1")
         assert store.get_order("C1") == "two"
-        assert store.all_orders() == ["two"]
+        assert store.open_orders() == ["two"]
+        store.put_order("C1", "closed", is_open=False)
+        assert store.open_orders() == []
+        assert store.get_order("C1") == "closed"
         assert store.resolve_wire_id("C1~1") == "C1"
         assert store.resolve_wire_id("nope") is None
         assert store.get_order("nope") is None
@@ -113,7 +117,6 @@ class TestBothStores:
         assert found is not None
         assert found.fill == "f"
         assert store.execution("C3", "E1") is None
-        assert len(store.executions()) == 2
 
     def test_first_record_of_an_exec_id_wins(self, store: FixStore) -> None:
         store.record_report("C1", order_payload=None, execution=execution(fill="a"))
@@ -128,6 +131,39 @@ class TestBothStores:
         found = store.execution("C1", "E1")
         assert found is not None
         assert found.busted
+        assert [e.exec_id for e in store.busted_executions()] == ["E1"]
+        assert store.fills_since(0) == []
+
+    def test_a_closing_report_leaves_the_open_index(self, store: FixStore) -> None:
+        store.record_report("C1", order_payload="working")
+        assert store.open_orders() == ["working"]
+        store.record_report("C1", order_payload="filled", order_open=False)
+        assert store.open_orders() == []
+
+    def test_fills_since_uses_the_later_of_venue_time_and_receipt(
+        self, store: FixStore
+    ) -> None:
+        for exec_id, latest in (("OLD", 99), ("EDGE", 100), ("NEW", 101)):
+            store.record_report(
+                "C1",
+                order_payload=None,
+                execution=StoredExecution(
+                    "C1", exec_id, "d", "fill", False, "t", latest
+                ),
+            )
+        store.record_report(
+            "C1",
+            order_payload=None,
+            execution=StoredExecution("C1", "ACK", "d", None, False, "t", 500),
+        )
+        found = {e.exec_id for e in store.fills_since(100)}
+        assert found == {"EDGE", "NEW"}
+
+    def test_the_reset_period_survives_a_sequence_reset(self, store: FixStore) -> None:
+        assert store.reset_period() is None
+        store.set_reset_period("2026-03-09")
+        store.reset_sequences()
+        assert store.reset_period() == "2026-03-09"
 
 
 class TestQuarantine:
@@ -135,6 +171,18 @@ class TestQuarantine:
         record = QuarantinedMessage(5, "8", "content", "why", "now")
         store.quarantine(record)
         assert store.quarantined() == [record]
+
+    def test_release_records_the_operator_once(self, store: FixStore) -> None:
+        store.quarantine(QuarantinedMessage(5, "8", "c", "r", "t", halted=True))
+        assert store.release_quarantine("alice", "checked", "now") == 1
+        store.quarantine(QuarantinedMessage(6, "8", "c", "r", "t", halted=True))
+        assert store.release_quarantine("bob", "checked too", "later") == 1
+        first, second = store.quarantined()
+        assert (first.released_by, first.release_reason) == ("alice", "checked")
+        assert first.released_at == "now"
+        assert first.halted
+        assert second.released_by == "bob"
+        assert store.release_quarantine("carol", "nothing left", "last") == 0
 
     def test_it_survives_a_reset_and_a_reopen(self, tmp_path: Path) -> None:
         path = tmp_path / "fix.db"
@@ -274,12 +322,15 @@ class TestSqlite:
         assert store.get_order("C1") == "before"
         store.close()
 
-    def test_nothing_secret_can_be_stored_by_the_schema_of_logon(
+    def test_the_quarantine_and_reset_period_survive_a_reopen(
         self, tmp_path: Path
     ) -> None:
         store = SqliteFixStore(tmp_path / "fix.db", SESSION)
-        store.allocate_outbound()
+        store.quarantine(QuarantinedMessage(5, "8", "c", "r", "t", halted=True))
+        store.set_reset_period("2026-03-09")
         store.close()
-        conn = sqlite3.connect(tmp_path / "fix.db")
-        assert conn.execute("SELECT COUNT(*) FROM fix_outbound").fetchone() == (0,)
-        conn.close()
+        again = SqliteFixStore(tmp_path / "fix.db", SESSION)
+        assert again.quarantined()[0].halted
+        assert again.quarantined()[0].released_by is None
+        assert again.reset_period() == "2026-03-09"
+        again.close()

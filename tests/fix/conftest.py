@@ -48,6 +48,7 @@ class RecordingListener:
         self.rejects: list[FixMessage] = []
         self.discarded: list[tuple[FixMessage, str]] = []
         self.resets = 0
+        self.possible_losses: list[tuple[int, int | None, str]] = []
         self.ready = 0
         self.downs: list[str] = []
         self.failures: list[Exception] = []
@@ -68,6 +69,11 @@ class RecordingListener:
 
     async def on_discarded_message(self, message: FixMessage, reason: str) -> None:
         self.discarded.append((message, reason))
+
+    async def on_possible_message_loss(
+        self, first_seq: int, last_seq: int | None, reason: str
+    ) -> None:
+        self.possible_losses.append((first_seq, last_seq, reason))
 
     def on_sequence_reset(self) -> None:
         self.resets += 1

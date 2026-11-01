@@ -21,7 +21,8 @@ async def main() -> None:
         print(f"{len(bars)} bars, last close {bars[-1].close}")
 
     nyse = get_calendar("XNYS")
-    print(f"NYSE next opens at {nyse.next_open(datetime.now(timezone.utc))}")
+    a_saturday = datetime(2026, 3, 7, 12, tzinfo=timezone.utc)
+    print(f"NYSE next opens at {nyse.next_open(a_saturday)}")
 
 
 if __name__ == "__main__":

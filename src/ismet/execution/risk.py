@@ -60,6 +60,11 @@ class RiskConfig(BaseModel):
 
     ``default`` limits are required so a forgotten limit cannot mean "unlimited":
     to run without a limit, a value must be set explicitly very high.
+
+    Notional limits are plain numbers. ``limit_currency`` says what they are in, and
+    any order in another currency is refused, because no conversion rate is assumed.
+    Without it, an order is judged in its own instrument's currency. Either way a gross
+    limit fails closed if exposure spans more than one currency.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -69,6 +74,7 @@ class RiskConfig(BaseModel):
     per_strategy: dict[str, RiskLimits] = Field(default_factory=dict)
     per_symbol: dict[str, RiskLimits] = Field(default_factory=dict)
     restricted_symbols: frozenset[str] = frozenset()
+    limit_currency: str | None = None
     max_reference_age_seconds: PositiveDecimal = Decimal(5)
     duplicate_window_seconds: Decimal = Decimal(1)
     allow_short: bool = False
@@ -86,6 +92,15 @@ class RiskConfig(BaseModel):
                 raise ValueError(f"per_symbol key {key!r} must be TICKER@MIC")
             normalized[str(Symbol.parse(key))] = limits
         return normalized
+
+    @field_validator("restricted_symbols")
+    @classmethod
+    def _normalized_restrictions(cls, value: frozenset[str]) -> frozenset[str]:
+        """An entry spelled unlike a symbol would silently restrict nothing."""
+        return frozenset(
+            str(Symbol.parse(entry)) if "@" in entry else entry.strip().upper()
+            for entry in value
+        )
 
     def limits_for(self, request: OrderRequest) -> list[tuple[str, RiskLimits]]:
         """Every scope that applies to ``request``, labelled for messages."""
@@ -156,11 +171,9 @@ def _pricing_for_notional(ctx: RiskContext) -> Decimal | None:
     if own is None:
         own = ctx.request.stop_price
     market = _reference_price(ctx)
-    if own is None:
-        return market
-    if market is None:
-        return own
-    return own if absolute(own) >= absolute(market) else market
+    prices = [absolute(p) for p in (own, market) if p is not None]
+    # A notional of zero would pass every limit, so a zero price is no price.
+    return max(prices) if prices and max(prices) != 0 else None
 
 
 def check_supported(ctx: RiskContext) -> RiskDecision:
@@ -200,11 +213,17 @@ def check_instrument(ctx: RiskContext) -> RiskDecision:
         )
     if instrument.expiry is not None and instrument.expiry <= ctx.now:
         return _reject("instrument", f"{request.symbol} expired {instrument.expiry}")
-    today = ctx.now.date()
-    if instrument.delisting_date is not None and instrument.delisting_date <= today:
-        return _reject("instrument", f"{request.symbol} was delisted")
-    if instrument.listing_date is not None and instrument.listing_date > today:
-        return _reject("instrument", f"{request.symbol} is not listed yet")
+    if instrument.delisting_date is not None or instrument.listing_date is not None:
+        if ctx.calendar is None:
+            return _reject(
+                "instrument",
+                f"no trading calendar to judge the listing dates of {request.symbol}",
+            )
+        today = ctx.calendar.local_date(ctx.now)
+        if instrument.delisting_date is not None and instrument.delisting_date <= today:
+            return _reject("instrument", f"{request.symbol} was delisted")
+        if instrument.listing_date is not None and instrument.listing_date > today:
+            return _reject("instrument", f"{request.symbol} is not listed yet")
     if request.expire_at is not None and request.expire_at <= ctx.now:
         return _reject("time_in_force", f"expire_at {request.expire_at} has passed")
     for label, price in (("limit", request.limit_price), ("stop", request.stop_price)):
@@ -229,6 +248,16 @@ def check_instrument(ctx: RiskContext) -> RiskDecision:
     ):
         return _reject("max_quantity", f"above venue maximum {instrument.max_quantity}")
     return APPROVED
+
+
+def check_limit_currency(ctx: RiskContext, config: RiskConfig) -> RiskDecision:
+    expected, instrument = config.limit_currency, ctx.instrument
+    if expected is None or instrument is None or instrument.currency == expected:
+        return APPROVED
+    return _reject(
+        "limit_currency",
+        f"{ctx.request.symbol} trades in {instrument.currency}; limits in {expected}",
+    )
 
 
 def check_session(ctx: RiskContext, config: RiskConfig) -> RiskDecision:
@@ -464,7 +493,9 @@ def _reduces_position(ctx: RiskContext) -> bool:
     """Whether this order only shrinks a known position, which must never be blocked."""
     if ctx.position is None or ctx.position == 0:
         return False
-    signed = mul(Decimal(ctx.request.side.sign), ctx.request.quantity)
+    request = ctx.request
+    pending = _sum_leaves(ctx.open_orders, request.symbol, request.side)
+    signed = mul(Decimal(request.side.sign), add(pending, request.quantity))
     resulting = add(ctx.position, signed)
     same_direction = (resulting >= 0) == (ctx.position > 0)
     return same_direction and absolute(resulting) < absolute(ctx.position)
@@ -535,12 +566,20 @@ def check_self_match(ctx: RiskContext, config: RiskConfig) -> RiskDecision:
     for order in ctx.open_orders:
         if order.request.symbol != request.symbol or order.request.side is request.side:
             continue
-        resting = order.limit_price
         price = request.limit_price
+        resting_prices = (order.limit_price, order.pending_limit_price)
         crosses = (
-            resting is None
+            order.limit_price is None
             or price is None
-            or (price >= resting if request.side is OrderSide.BUY else price <= resting)
+            or any(
+                resting is not None
+                and (
+                    price >= resting
+                    if request.side is OrderSide.BUY
+                    else price <= resting
+                )
+                for resting in resting_prices
+            )
         )
         if crosses:
             return _reject(
@@ -605,6 +644,7 @@ class RiskEngine:
         single: list[Callable[[], RiskDecision]] = [
             lambda: check_supported(ctx),
             lambda: check_instrument(ctx),
+            lambda: check_limit_currency(ctx, config),
             lambda: check_restricted(ctx, config),
             lambda: check_session(ctx, config),
             lambda: check_unknown(ctx, config),

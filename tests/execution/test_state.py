@@ -47,7 +47,7 @@ from ismet.models.orders import (
 S = OrderStatus
 D = Decimal
 TS = datetime(2026, 3, 9, 15, 0, tzinfo=timezone.utc)
-SYM = Symbol(venue="XSIM", ticker="ACME")
+SYM = Symbol(venue="ZSIM", ticker="ACME")
 CID = "C1"
 REQ = OrderRequest(
     client_order_id=CID,
@@ -106,21 +106,63 @@ def test_every_lifecycle_kind_is_in_the_table_and_every_kind_is_handled() -> Non
     }
 
 
+# Written out by hand from the order lifecycle, with no read of TRANSITIONS, for an
+# order of 100 with nothing filled. A status left out of a row is an illegal event.
+# Replaced carries quantity 50, so with nothing filled the order works at 50.
+PS, SU, UN, AC, PF = (
+    S.PENDING_SUBMIT,
+    S.SUBMITTING,
+    S.UNKNOWN,
+    S.ACCEPTED,
+    S.PARTIALLY_FILLED,
+)
+PC, PR, FI, CA, RE, EX = (
+    S.PENDING_CANCEL,
+    S.PENDING_REPLACE,
+    S.FILLED,
+    S.CANCELED,
+    S.REJECTED,
+    S.EXPIRED,
+)
+EXPECTED_LIFECYCLE: dict[str, dict[OrderStatus, OrderStatus]] = {
+    "send_started": {PS: SU},
+    "ack": {SU: AC, UN: AC, AC: AC, PF: PF, PC: PC, PR: PR, FI: FI, CA: CA, EX: EX},
+    "reject": {PS: RE, SU: RE, UN: RE, RE: RE, AC: RE, PF: RE, PC: RE, PR: RE},
+    "outcome_unknown": {SU: UN, UN: UN, AC: UN, PF: UN, PC: UN, PR: UN},
+    "cancel_requested": {AC: PC, PF: PC, PC: PC, PR: PC, SU: SU, UN: UN},
+    "canceled": {SU: CA, UN: CA, AC: CA, PF: CA, PC: CA, PR: CA, CA: CA},
+    "cancel_rejected": {
+        PC: AC,
+        AC: AC,
+        PF: PF,
+        PR: PR,
+        UN: UN,
+        SU: SU,
+        FI: FI,
+        CA: CA,
+        RE: RE,
+        EX: EX,
+    },
+    "replace_requested": {AC: PR, PF: PR},
+    "replaced": {PR: AC, PC: PC, UN: AC, AC: AC, PF: AC},
+    "replace_rejected": {PR: AC, PC: PC, UN: UN, FI: FI, CA: CA, EX: EX},
+    "expired": {SU: EX, UN: EX, AC: EX, PF: EX, PC: EX, PR: EX, EX: EX},
+}
+
+
 @pytest.mark.parametrize("kind", sorted(LIFECYCLE))
 @pytest.mark.parametrize("status", list(OrderStatus))
-def test_every_status_and_event_pair_follows_the_table(
+def test_every_status_and_event_pair_follows_the_lifecycle(
     kind: str, status: OrderStatus
 ) -> None:
-    before = in_status(status)
-    after = apply_event(before, LIFECYCLE[kind])
-    target = TRANSITIONS[kind].get(status)
-    if target is None:
+    after = apply_event(in_status(status), LIFECYCLE[kind])
+    expected = EXPECTED_LIFECYCLE[kind].get(status)
+    if expected is None:
         assert after.status is status
         assert any("illegal transition" in a for a in after.anomalies)
     else:
         assert not after.anomalies
-        if isinstance(target, OrderStatus):
-            assert after.status is target
+        assert after.status is expected
 
 
 @pytest.mark.parametrize("terminal", [S.FILLED, S.CANCELED, S.REJECTED, S.EXPIRED])

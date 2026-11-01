@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import copy
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from enum import Enum
 from functools import lru_cache
@@ -119,7 +119,6 @@ class TradingCalendar:
         self.last_date = last
         self.source = source
         self._eras = eras
-        self._era_starts = [start for start, _ in eras]
         self._closed = closed
         self._extra = extra
         self._special = dict(special)
@@ -370,6 +369,13 @@ class AlwaysOpenCalendar(TradingCalendar):
     def _is_session_unchecked(self, day: date) -> bool:
         return day not in self._closed
 
+    def session(self, day: date) -> Session | None:
+        """A full day runs to the next midnight, with no closed moment between days."""
+        found = super().session(day)
+        if found is None or found.close.time() != time.max:
+            return found
+        return replace(found, close=found.close + timedelta(microseconds=1))
+
 
 def calendar_from_dict(
     venue: str, data: dict[str, Any], *, source: str = ""
@@ -457,7 +463,7 @@ def load_calendar_file(path: str | Path, venue: str) -> TradingCalendar:
 
 for _code, _name in (
     ("XMOK", "mock venue"),
-    ("XSIM", "simulated venue"),
+    ("ZSIM", "simulated venue"),
     ("BNCX", "Binance spot trades continuously"),
     ("ZCBS", "Coinbase Exchange spot trades continuously"),
 ):

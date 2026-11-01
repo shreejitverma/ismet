@@ -12,11 +12,16 @@ import asyncio
 import importlib.metadata
 import importlib.util
 import json
+import os
 import platform
+import shlex
+import sqlite3
 import sys
+import tempfile
 import traceback
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -43,7 +48,9 @@ from ismet.execution.journal import (
 )
 from ismet.execution.manager import events_of
 from ismet.execution.state import replay
+from ismet.models import Symbol
 from ismet.providers import ProviderRegistry
+from ismet.sync import as_datetime
 
 DESCRIPTION = (
     "Typed access to market data, trading calendars, and the safety controls "
@@ -61,6 +68,7 @@ _COMMANDS = (
     "doctor",
     "journal",
     "kill",
+    "position",
 )
 Out = Mapping[str, Any]
 
@@ -137,7 +145,12 @@ def _build_parser() -> _Parser:
         "--next-open", action="store_true", help="print only the next open"
     )
 
-    command("providers", "List installed providers and their capabilities")
+    providers = command(
+        "providers", "List installed providers, without importing any of them"
+    )
+    providers.add_argument(
+        "name", nargs="?", help="import this provider and show what it can do"
+    )
     command("doctor", "Check the installation and configuration")
 
     journal = command("journal", "Inspect an order journal")
@@ -147,7 +160,9 @@ def _build_parser() -> _Parser:
         ("orders", "Rebuild order state from the journal"),
         ("export", "Write the journal as JSON lines"),
     ):
-        action = journal_commands.add_parser(name, help=summary, description=summary)
+        action = journal_commands.add_parser(
+            name, help=summary, description=summary, allow_abbrev=False
+        )
         action.add_argument("path", help="journal file")
         if name == "export":
             action.add_argument("--out", required=True, help="output file")
@@ -165,7 +180,9 @@ def _build_parser() -> _Parser:
         ("engage", "Stop new orders in every process using this journal"),
         ("release", "Allow new orders again"),
     ):
-        action = kill_commands.add_parser(name, help=summary, description=summary)
+        action = kill_commands.add_parser(
+            name, help=summary, description=summary, allow_abbrev=False
+        )
         action.add_argument("--journal", required=True, help="journal file")
         if name == "engage":
             action.add_argument(
@@ -182,6 +199,22 @@ def _build_parser() -> _Parser:
                 action="store_true",
                 help="stop new orders but leave open orders working",
             )
+
+    position = command("position", "Record position changes no order explains")
+    position_commands = position.add_subparsers(dest="action", parser_class=_Parser)
+    adjust = position_commands.add_parser(
+        "adjust",
+        help="Clear a position mismatch with an outside cause, such as a split",
+        description="Clear a position mismatch with an outside cause, such as a split",
+        allow_abbrev=False,
+    )
+    adjust.add_argument("symbol", help="TICKER@MIC")
+    adjust.add_argument("--journal", required=True, help="journal file")
+    adjust.add_argument(
+        "--delta", required=True, help="signed quantity to add to ismet's position"
+    )
+    adjust.add_argument("--reason", required=True, help="recorded in the audit")
+    adjust.add_argument("--operator", required=True, help="who is doing this")
     return parser
 
 
@@ -231,18 +264,6 @@ async def _with_client(call: Callable[[IsmetClient], Awaitable[int]]) -> int:
         return await call(client)
 
 
-def _normalize_iso(text: str) -> str:
-    """Python 3.10's ``fromisoformat`` does not accept a trailing ``Z``."""
-    return f"{text[:-1]}+00:00" if text.endswith(("Z", "z")) else text
-
-
-def _parse_time(text: str | None, default: datetime) -> datetime:
-    if text is None:
-        return default
-    value = datetime.fromisoformat(_normalize_iso(text))
-    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
-
-
 async def _quote(args: argparse.Namespace, client: IsmetClient) -> int:
     quote = await client.quote(args.symbol, venue=args.venue, provider=args.provider)
     _print(
@@ -279,11 +300,13 @@ async def _book(args: argparse.Namespace, client: IsmetClient) -> int:
 
 async def _bars(args: argparse.Namespace, client: IsmetClient) -> int:
     now = _now()
+    start = as_datetime(args.start, now - timedelta(days=30))
+    end = as_datetime(args.end, now)
     bars = await client.bars(
         args.symbol,
         interval=args.interval,
-        start=_parse_time(args.start, now - timedelta(days=30)),
-        end=_parse_time(args.end, now),
+        start=start,
+        end=end,
         venue=args.venue,
         provider=args.provider,
     )
@@ -306,7 +329,14 @@ async def _bars(args: argparse.Namespace, client: IsmetClient) -> int:
         ],
     }
     if len(shown) < len(bars):
-        payload["help"] = [f"Run `ismet bars {args.symbol} --full` for all rows"]
+        words = ["ismet", "bars", args.symbol]
+        if args.venue:
+            words += ["--venue", args.venue]
+        if args.provider:
+            words += ["--provider", args.provider]
+        words += ["--interval", args.interval]
+        words += ["--start", start.isoformat(), "--end", end.isoformat(), "--full"]
+        payload["help"] = [f"Run `{shlex.join(words)}` for all rows"]
     _print(payload)
     return EXIT_OK
 
@@ -353,23 +383,31 @@ def _calendar(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def _providers() -> int:
+def _providers(args: argparse.Namespace) -> int:
     registry = ProviderRegistry.discover()
-    rows = []
-    for name in registry.names():
-        provider = registry.get(name)
-        capabilities = sorted(c.value for c in capabilities_of(provider))
-        rows.append(
+    if args.name is not None:
+        provider = registry.get(args.name)
+        _print(
             {
-                "name": name,
+                "name": args.name.lower(),
                 "venues": " ".join(sorted(provider.venues)),
-                "capabilities": " ".join(capabilities),
+                "capabilities": " ".join(
+                    sorted(c.value for c in capabilities_of(provider))
+                ),
             }
         )
-    if not rows:
+        return EXIT_OK
+    names = registry.names()
+    if not names:
         _print({"providers": "0 providers installed"})
         return EXIT_OK
-    _print({"count": len(rows), "providers": rows})
+    _print(
+        {
+            "count": len(names),
+            "providers": names,
+            "help": ["Run `ismet providers <name>` for its venues and capabilities"],
+        }
+    )
     return EXIT_OK
 
 
@@ -419,38 +457,79 @@ def _doctor() -> int:
                     "detail": f"data ends {calendar.last_date}; update ismet",
                 }
             )
-    _print(
-        {
-            "version": _version(),
-            "python": platform.python_version(),
-            "os": f"{platform.system()} {platform.machine()}",
-            "config_file": str(default_config_path()),
-            "providers_configured": ",".join(configured) or "none",
-            "problems": problems,
-            "checks": checks,
-        }
-    )
+    payload: dict[str, Any] = {
+        "version": _version(),
+        "python": platform.python_version(),
+        "os": f"{platform.system()} {platform.machine()}",
+        "config_file": str(default_config_path()),
+        "providers_configured": ",".join(configured) or "none",
+        "problems": problems,
+        "checks": checks,
+    }
     if not configured:
         example = f"{ENV_PREFIX}PROVIDERS=mock"
-        print(f"help[1]:\n  Set {ENV_PREFIX}PROVIDERS, for example {example}")
+        payload["help"] = [f"Set {ENV_PREFIX}PROVIDERS, for example {example}"]
+    _print(payload)
     return EXIT_FAILED if problems else EXIT_OK
+
+
+def _holds_a_journal(path: Path) -> bool:
+    """Whether ``path`` is a journal, judged without writing anything to it."""
+    try:
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return False
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'journal'"
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    finally:
+        conn.close()
+    return row is not None
 
 
 def _existing_journal(path: str) -> SqliteJournal:
     file_path = Path(path)
     if not file_path.exists():
         raise ValidationError(f"no journal at {file_path}")
+    if not _holds_a_journal(file_path):
+        raise ValidationError(f"{file_path} is not an ismet journal")
     return SqliteJournal(file_path)
+
+
+def _export(journal: SqliteJournal, out: Path) -> int:
+    """Write the export beside its destination, so a failure leaves nothing behind."""
+    if out.exists():
+        raise ValidationError(f"{out} already exists; choose a new --out")
+    descriptor, name = tempfile.mkstemp(dir=out.parent, prefix=f".{out.name}.")
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            count = export_jsonl(journal, stream)
+        temporary.replace(out)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    return count
 
 
 def _journal(args: argparse.Namespace) -> int:
     if args.action is None:
         raise _UsageError("journal needs an action", "ismet journal --help")
+    if args.action == "verify" and args.expect_head == "":
+        raise _UsageError(
+            "--expect-head is empty; was the variable holding it set?",
+            "ismet journal --help",
+        )
     journal = _existing_journal(args.path)
     try:
         if args.action == "verify":
             result = journal.verify()
-            if args.expect_head and not chain_contains(journal, args.expect_head):
+            if args.expect_head is not None and not chain_contains(
+                journal, args.expect_head
+            ):
                 _print(
                     {
                         "ok": False,
@@ -474,8 +553,7 @@ def _journal(args: argparse.Namespace) -> int:
             )
             return EXIT_OK if result.ok else EXIT_FAILED
         if args.action == "export":
-            with Path(args.out).open("w", encoding="utf-8") as stream:
-                count = export_jsonl(journal, stream)
+            count = _export(journal, Path(args.out))
             _print({"exported": count, "path": args.out})
             return EXIT_OK
         orders = replay(events_of(journal))
@@ -507,7 +585,9 @@ def _journal(args: argparse.Namespace) -> int:
 def _kill(args: argparse.Namespace) -> int:
     if args.action is None:
         raise _UsageError("kill needs an action", "ismet kill --help")
-    creating = args.action == "engage" and args.create
+    creating = (
+        args.action == "engage" and args.create and not Path(args.journal).exists()
+    )
     # A mistyped path must not look like a successful halt while trading continues.
     journal = (
         SqliteJournal(args.journal) if creating else _existing_journal(args.journal)
@@ -552,18 +632,60 @@ def _kill(args: argparse.Namespace) -> int:
         journal.close()
 
 
+def _position(args: argparse.Namespace) -> int:
+    if args.action is None:
+        raise _UsageError("position needs an action", "ismet position --help")
+    symbol = Symbol.parse(args.symbol)
+    try:
+        delta = Decimal(args.delta)
+    except ArithmeticError:
+        raise _UsageError(
+            f"--delta {args.delta!r} is not a number", "ismet position --help"
+        ) from None
+    if not delta.is_finite():
+        raise _UsageError(
+            f"--delta {args.delta!r} is not a number", "ismet position --help"
+        )
+    journal = _existing_journal(args.journal)
+    try:
+        record = journal.append(
+            RecordKind.POSITION_ADJUSTED,
+            json.dumps(
+                {
+                    "symbol": str(symbol),
+                    "delta": str(delta),
+                    "operator": args.operator,
+                    "reason": args.reason,
+                }
+            ),
+        )
+    finally:
+        journal.close()
+    _print(
+        {
+            "adjusted": str(symbol),
+            "delta": str(delta),
+            "record": record.seq,
+            "help": ["The next reconciliation compares against the new position"],
+        }
+    )
+    return EXIT_OK
+
+
 def _dispatch(args: argparse.Namespace) -> int:
     command = args.command
     if command == "calendar":
         return _calendar(args)
     if command == "providers":
-        return _providers()
+        return _providers(args)
     if command == "doctor":
         return _doctor()
     if command == "journal":
         return _journal(args)
     if command == "kill":
         return _kill(args)
+    if command == "position":
+        return _position(args)
     handler = {"quote": _quote, "book": _book, "bars": _bars}[command]
     return asyncio.run(_with_client(lambda client: handler(args, client)))
 
@@ -574,7 +696,7 @@ def _error_hint(exc: Exception) -> str:
     if isinstance(exc, AuthError):
         return "Check the provider's credentials with `ismet doctor`"
     if isinstance(exc, NotSupported):
-        return "Run `ismet providers` to see each provider's capabilities"
+        return "Run `ismet providers <name>` to see a provider's capabilities"
     if isinstance(exc, CalendarOutOfRange):
         return "Update ismet for newer calendar data"
     return "Run `ismet doctor` to check configuration"

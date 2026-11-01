@@ -44,7 +44,6 @@ _MAX_BEGIN_STRING_FIELD = 32
 _TRAILER_LENGTH = 7  # "10=xxx" and its SOH
 _BEGIN_STRING = re.compile(rb"^FIX(T)?\.\d+\.\d+$")
 _DECIMAL = re.compile(r"^-?(\d+(\.\d*)?|\.\d+)$", re.ASCII)
-_INT = re.compile(r"^-?\d+$", re.ASCII)
 _SEQ_NUM = re.compile(r"^\d{1,18}$", re.ASCII)
 _TIMESTAMP = re.compile(
     r"^(\d{4})(\d{2})(\d{2})-(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,12}))?$", re.ASCII
@@ -228,12 +227,6 @@ def parse_decimal(text: str, tag: int = 0) -> Decimal:
         raise FieldFormatError(f"tag {tag}: not a FIX decimal", tag=tag) from exc
 
 
-def parse_int(text: str, tag: int = 0) -> int:
-    if not _INT.match(text) or len(text) > 19:
-        raise FieldFormatError(f"tag {tag}: not a FIX int", tag=tag)
-    return int(text)
-
-
 def parse_seq_num(text: str, tag: int = 0) -> int:
     """A sequence number small enough for any store, whatever a peer declares."""
     if not _SEQ_NUM.match(text):
@@ -360,12 +353,6 @@ def encode(
 ) -> bytes:
     """Encode a whole message. ``fields`` starts at MsgType(35)."""
     return encode_frame(begin_string, encode_fields(fields, data_fields=data_fields))
-
-
-def encode_message(
-    message: FixMessage, *, data_fields: Mapping[int, int] = DATA_FIELDS
-) -> bytes:
-    return encode(message.begin_string, message.fields, data_fields=data_fields)
 
 
 def parse_fields(
@@ -644,13 +631,11 @@ __all__ = [
     "encode",
     "encode_fields",
     "encode_frame",
-    "encode_message",
     "format_utc_timestamp",
     "format_value",
     "normalize_fields",
     "parse_decimal",
     "parse_fields",
-    "parse_int",
     "parse_seq_num",
     "parse_utc_timestamp",
 ]

@@ -9,7 +9,7 @@ from enum import Enum
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
-from ismet.models.decimals import Rounding, is_multiple, round_to_step
+from ismet.models.decimals import Rounding, absolute, is_multiple, round_to_step
 from ismet.models.symbol import Symbol
 from ismet.models.types import (
     AssetClass,
@@ -97,7 +97,7 @@ class TickLadder(BaseModel):
     def tick_at(self, price: Decimal) -> Decimal:
         """The tick applying at ``price``."""
         starts = [band.from_price for band in self.bands]
-        return self.bands[bisect_right(starts, abs(price)) - 1].tick
+        return self.bands[bisect_right(starts, absolute(price)) - 1].tick
 
 
 class Instrument(BaseModel):

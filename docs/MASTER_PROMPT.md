@@ -39,8 +39,9 @@ Integrate with those instead.
   Use `pathlib`, `platformdirs` for config and cache directories, `zoneinfo` for timezones with `tzdata` as a dependency so Windows has a tz database.
 - Event loop policy must be left alone.
   The library never calls `asyncio.set_event_loop_policy`, never installs `uvloop`, and never assumes a running loop at import time.
-- Support the four most recent CPython minor versions and PyPy where dependencies allow.
-  Drop a version only when it reaches end of life.
+- Support CPython 3.10 to 3.14, as `pyproject.toml` declares.
+  PyPy is not tested in CI.
+  Drop a version only after it reaches end of life.
 - CI runs the full test suite on the matrix `{ubuntu, macos, windows} x {supported Python versions}` on every pull request.
   A green matrix is a merge requirement, not a nice-to-have.
 
@@ -87,7 +88,7 @@ Key facts:
 - The name is `ismet` everywhere: GitHub repository, PyPI distribution, import package, CLI command, and brand.
   The name `isme` is history.
   Never reintroduce it as a distribution, import, alias, or shim.
-- Supported Python: 3.10 to 3.14.
+- Supported Python: 3.10 to 3.14. Python 3.10 reached end of life in October 2026, so dropping it is an open decision.
 - Orders go through `ismet.execution.OrderManager`, the one supported path to a venue.
   Read `docs/adr/0002-order-path.md` before changing it.
 - Trading adapters must pass `ismet.testing.trading_conformance`.
@@ -113,8 +114,8 @@ ismet/
   normalize/     Vendor payload -> domain model mapping, tested field by field
   config/        Settings from env, file, and code, with precedence rules and secret handling
   client/        IsmetClient (async) and IsmetSyncClient (sync facade), registry, capability discovery, lifecycle
-  cli/           `ismet` command: quote, bars, book, calendar, providers, doctor
-  testing/       Fixture recorder and replayer, conformance suite, MockProvider
+  cli/           `ismet` command: quote, bars, book, calendar, providers, doctor, journal, kill, position
+  testing/       Fixture replayer, market data and trading conformance suites, simulated venue. MockProvider lives in providers/, the recorder in scripts/
 ```
 
 Design rules:
@@ -125,7 +126,9 @@ Design rules:
 - Providers are discovered through the `ismet.providers` entry-point group so third parties can ship adapters as separate packages.
 - Every adapter is thin: authentication, request shaping, and a call into `normalize/`.
   Business logic never lives in an adapter.
-- Every network call goes through `transport/` and inherits retry with jittered exponential backoff, per-endpoint token-bucket rate limits declared by the adapter, a circuit breaker, request and response hooks for logging and metrics, and a monotonic clock for latency measurement.
+- Every HTTP and WebSocket call goes through `transport/` and inherits per-endpoint token-bucket rate limits declared by the adapter, a circuit breaker, request and response hooks for logging and metrics, and a monotonic clock for latency measurement.
+  Idempotent requests retry with jittered exponential backoff, and non-idempotent requests are never retried.
+  `fix/` runs its own session over TCP, with sequence recovery in place of retries.
 - Streams are async iterators with bounded internal queues, explicit backpressure policy (block, drop-oldest, drop-newest, chosen by the caller), automatic reconnect with resubscribe, sequence-gap detection, and a heartbeat watchdog.
 - The sync facade runs the async client in a dedicated background thread with its own loop.
   It never calls `asyncio.run` inside an existing loop and never leaks threads on exit.
@@ -164,9 +167,11 @@ The suite exercises each declared capability against recorded fixtures and check
 - Unsupported capabilities raise `NotSupported` at call time with a clear message.
 
 Fixtures are recorded from real sessions with secrets scrubbed and committed under `tests/fixtures/<provider>/`.
-A `make record PROVIDER=x` target regenerates them.
+`python scripts/record_fixtures.py <provider>` regenerates them.
 
 ## Developer experience targets
+
+These are targets. The equity examples need a provider that does not ship yet, because a provider needs real fixtures first.
 
 The five-line quick start must work on a fresh machine on any OS:
 
@@ -196,7 +201,8 @@ ismet calendar XNSE --next-open
 ismet doctor
 ```
 
-`ismet doctor` reports Python version, OS, installed extras, configured providers, credential presence (never values), and connectivity, so support requests start with facts.
+`ismet doctor` must report Python version, OS, installed extras, configured providers, credential presence (never values), and connectivity, so support requests start with facts.
+Connectivity is not checked yet.
 
 ## How you work
 

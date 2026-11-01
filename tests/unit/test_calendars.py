@@ -247,9 +247,23 @@ def test_every_entry_point_refuses_dates_outside_the_data(call) -> None:  # type
 
 
 def test_the_first_and_last_covered_dates_are_answered() -> None:
-    assert XNYS.is_session(XNYS.last_date) in (True, False)
-    assert XNYS.is_session(XNYS.first_date) in (True, False)
-    assert XNYS.sessions(XNYS.last_date, XNYS.last_date) is not None
+    """The snapshot runs from NYSE's session of 2007-01-03 to that of 2027-10-29."""
+    assert (XNYS.first_date, XNYS.last_date) == (date(2007, 1, 3), date(2027, 10, 29))
+    assert XNYS.is_session(XNYS.first_date) and XNYS.is_session(XNYS.last_date)
+    assert [s.date for s in XNYS.sessions(XNYS.last_date, XNYS.last_date)] == [
+        date(2027, 10, 29)
+    ]
+
+
+def test_a_24x7_calendar_has_no_closed_moment_between_days() -> None:
+    crypto = get_calendar("BNCX")
+    last_instant = datetime(2026, 3, 9, 23, 59, 59, 999999, tzinfo=timezone.utc)
+    assert crypto.is_open(last_instant)
+    today = crypto.session(date(2026, 3, 9))
+    tomorrow = crypto.session(date(2026, 3, 10))
+    assert today is not None and tomorrow is not None
+    assert today.close == tomorrow.open == datetime(2026, 3, 10, tzinfo=timezone.utc)
+    assert not today.early_close
 
 
 def test_session_lookup_uses_the_venue_date_not_the_utc_date() -> None:

@@ -23,7 +23,6 @@ from ismet.errors import (
 from ismet.models import Interval, QualityFlag, Symbol
 from ismet.providers.binance import (
     BINANCE_RETRY,
-    ENDPOINT_WEIGHTS,
     RATE_LIMITS,
     REQUEST_WEIGHT_PER_MINUTE,
     REST_URL,
@@ -95,14 +94,28 @@ def test_rate_limit_declarations_match_the_venue() -> None:
     weight = next(x for x in limits if x["rateLimitType"] == "REQUEST_WEIGHT")
     assert (weight["interval"], weight["intervalNum"]) == ("MINUTE", 1)
     assert weight["limit"] == REQUEST_WEIGHT_PER_MINUTE
-    assert ENDPOINT_WEIGHTS == {
-        "exchange_info": 20,
-        "klines": 2,
-        "depth_100": 5,
-        "depth_500": 25,
-        "depth_1000": 50,
-        "depth_5000": 250,
-    }
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "documented_weight"),
+    [
+        ("exchange_info", 20),
+        ("klines", 2),
+        ("depth_100", 5),
+        ("depth_500", 25),
+        ("depth_1000", 50),
+        ("depth_5000", 250),
+    ],
+)
+async def test_each_endpoint_is_charged_its_documented_weight(
+    endpoint: str, documented_weight: int
+) -> None:
+    provider = BinanceProvider(clock=ManualClock())
+    bucket = provider._limiter.bucket("weight")
+    assert bucket is not None
+    before = bucket.available
+    await provider._limiter.acquire(endpoint)
+    assert before - bucket.available == documented_weight
 
 
 def test_buckets_cannot_exceed_the_fixed_window_limits() -> None:
@@ -443,6 +456,28 @@ async def test_418_ban_is_rate_limited_never_retried_and_says_until_when() -> No
     assert len(seen) == 1
 
 
+async def test_a_ban_is_honoured_locally_until_it_ends() -> None:
+    clock = ManualClock(datetime(2030, 1, 1, tzinfo=UTC))
+    banned_until = int(clock.now().timestamp() * 1000) + 90_000
+    ban = httpx.Response(
+        418, json={"code": -1003, "msg": f"IP banned until {banned_until}."}
+    )
+    transport, seen = _serving(ban)
+    provider = BinanceProvider(http_transport=transport, clock=clock)
+    async with provider:
+        with pytest.raises(RateLimited):
+            await provider._get("/api/v3/depth", {}, "klines")
+        clock.advance(60)
+        with pytest.raises(RateLimited, match="not sending") as caught:
+            await provider._get("/api/v3/depth", {}, "klines")
+        assert caught.value.retry_after == pytest.approx(30)
+        assert len(seen) == 1
+        clock.advance(31)
+        with pytest.raises(RateLimited):
+            await provider._get("/api/v3/depth", {}, "klines")
+        assert len(seen) == 2
+
+
 async def test_403_waf_block_is_auth_error_and_not_retried() -> None:
     transport, seen = _serving(httpx.Response(403))
     provider = BinanceProvider(http_transport=transport)
@@ -659,5 +694,17 @@ async def test_closing_the_provider_ends_a_running_stream() -> None:
         assert isinstance(first.bid, Decimal)
         await provider.close()
         remaining = [q async for q in stream]
-    assert len(remaining) <= len(recorded.frames)
+    wanted = frames("binance", "book_ticker")[1 : 1 + len(remaining)]
+    assert [q.sequence for q in remaining] == [f["u"] for f in wanted]
     assert provider._streams == set()
+
+
+async def test_a_server_that_only_acknowledges_exhausts_the_reconnect_bound() -> None:
+    recorded = session("binance", "book_ticker")
+    async with (
+        WsReplayServer([recorded], plan=[slice(0, 0)] * 6) as server,
+        _stream_provider(server, ws_max_reconnects=2) as provider,
+    ):
+        with pytest.raises(TransportError, match="after 2 reconnects"):
+            await take(provider.stream_quotes([BTC]), 1)
+    assert len(server.connections) == 3

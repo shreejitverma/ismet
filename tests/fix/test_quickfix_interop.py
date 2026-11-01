@@ -702,9 +702,7 @@ class TestSequenceRecovery:
         assert fill.fill_id == exec_id
         assert provider.session.next_inbound > seen
         assert client.store is not None
-        replayed = [
-            e for e in client.store.executions() if e.exec_id == exec_id and e.fill
-        ]
+        replayed = [e for e in client.store.fills_since(0) if e.exec_id == exec_id]
         assert len(replayed) == 1
         _assert_no_rejects(venue)
 

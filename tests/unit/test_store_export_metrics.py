@@ -18,10 +18,15 @@ from ismet.execution import BreakKind, ReconBreak, apply_event, new_order
 from ismet.export import BarSeries, to_pandas, to_polars, to_records
 from ismet.marketdata import GapPolicy
 from ismet.models import Adjustment, Bar, Interval, QualityFlag, Quote, Symbol
+from ismet.models.market_data import DataSource, Timeliness
 from ismet.models.orders import (
     Canceled,
+    Fill,
+    Filled,
     OrderRequest,
     OrderSide,
+    OrderStatus,
+    Restated,
     SubmitIntent,
 )
 from ismet.observability import (
@@ -219,9 +224,142 @@ def test_same_clock_tick_and_same_batch_restatements_are_stored_in_order(
     assert (result.inserted, result.revised) == (1, 1)
     store.write([bar(close="10.30")])
     assert store.revisions(SYM, Interval.D1, DAY) == 3
-    assert store.read(
-        SYM, Interval.D1, *span(), as_of=datetime(2030, 1, 1, tzinfo=UTC)
-    )[0].close == D("10.30")
+    assert store.read(SYM, Interval.D1, *span())[0].close == D("10.30")
+
+
+def test_reformatting_a_price_is_not_a_revision(store: BarStore) -> None:
+    store.write([bar(close="10.10")])
+    result = store.write([bar(close="10.1")])
+    assert (result.inserted, result.unchanged, result.revised) == (0, 1, 0)
+    assert store.revisions(SYM, Interval.D1, DAY) == 1
+
+
+async def test_backfill_refuses_a_range_that_is_not_a_range(store: BarStore) -> None:
+    async def fetch(symbol, interval, start, end):  # type: ignore[no-untyped-def]
+        raise AssertionError("nothing should be fetched")
+
+    for start, end in (
+        (DAY + timedelta(days=5), DAY),
+        (DAY, DAY),
+    ):
+        with pytest.raises(ValidationError, match="not before"):
+            await backfill(fetch, store, SYM, Interval.D1, start, end)
+
+
+async def test_backfill_leaves_a_window_open_when_sessions_are_missing(
+    store: BarStore,
+) -> None:
+    """XNYS traded every weekday from 2026-03-02 to 03-13; one bar is not enough."""
+    calendar = get_calendar("XNYS")
+    start = datetime(2026, 3, 2, tzinfo=UTC)
+    end = datetime(2026, 3, 14, tzinfo=UTC)
+    weekdays = [date(2026, 3, d) for d in (2, 3, 4, 5, 6, 9, 10, 11, 12, 13)]
+    answers = [
+        [bar(DAY)],
+        [
+            bar(datetime(d.year, d.month, d.day, 14, 30, tzinfo=UTC), session_date=d)
+            for d in weekdays
+        ],
+    ]
+    calls = 0
+
+    async def fetch(symbol, interval, lower, upper):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        return answers.pop(0)
+
+    args = (fetch, store, SYM, Interval.D1, start, end)
+    partial = await backfill(*args, window=timedelta(days=30), calendar=calendar)
+    assert not partial.complete and partial.windows_incomplete == 1
+    assert partial.windows_fetched == 0 and partial.bars_inserted == 1
+    assert partial.sessions_missing == [d for d in weekdays if d != date(2026, 3, 9)]
+    full = await backfill(*args, window=timedelta(days=30), calendar=calendar)
+    assert full.complete and full.windows_fetched == 1 and calls == 2
+    assert store.missing_sessions(SYM, calendar, weekdays[0], weekdays[-1]) == []
+    rerun = await backfill(*args, window=timedelta(days=30), calendar=calendar)
+    assert rerun.complete and rerun.windows_skipped == 1 and calls == 2
+
+
+async def test_backfill_judges_intraday_windows_by_session_presence(
+    store: BarStore,
+) -> None:
+    start = datetime(2026, 3, 9, tzinfo=UTC)
+    end = datetime(2026, 3, 11, tzinfo=UTC)
+    first_session_only = bar(DAY, interval=Interval.H1, session_date=date(2026, 3, 9))
+
+    async def fetch(symbol, interval, lower, upper):  # type: ignore[no-untyped-def]
+        return [first_session_only]
+
+    report = await backfill(
+        fetch,
+        store,
+        SYM,
+        Interval.H1,
+        start,
+        end,
+        window=timedelta(days=2),
+        calendar=get_calendar("XNYS"),
+    )
+    assert report.windows_incomplete == 1
+    assert report.sessions_missing == [date(2026, 3, 10)]
+
+
+def test_records_keep_quality_flags_and_provenance() -> None:
+    flagged = bar(
+        quality=frozenset({QualityFlag.OUTLIER, QualityFlag.AFTER_GAP}),
+        source=DataSource(
+            provider="vendor", timeliness=Timeliness.DELAYED, delay_seconds=900
+        ),
+    )
+    record = to_records([flagged])[0]
+    assert record["quality"] == ",".join(
+        sorted((QualityFlag.OUTLIER.value, QualityFlag.AFTER_GAP.value))
+    )
+    assert record["source"] == "vendor"
+    assert record["timeliness"] == Timeliness.DELAYED.value
+    clean = to_records([bar()])[0]
+    assert clean["quality"] == "" and clean["source"] is None
+
+
+def test_terminal_counter_counts_an_order_once_when_it_closes() -> None:
+    metrics = InMemoryMetrics()
+    hook = order_event_hook(metrics)
+    request = OrderRequest(
+        client_order_id="C1",
+        symbol=SYM,
+        side=OrderSide.BUY,
+        quantity="1",
+        limit_price="1",
+    )
+    state = _submitting(
+        new_order(SubmitIntent(client_order_id="C1", ts=DAY, request=request))
+    )
+    canceled = Canceled(client_order_id="C1", ts=DAY)
+    closed = apply_event(state, canceled)
+    hook(canceled, closed)
+    fill = Filled(
+        client_order_id="C1",
+        ts=DAY,
+        fill=Fill(
+            client_order_id="C1",
+            fill_id="F1",
+            symbol=SYM,
+            side=OrderSide.BUY,
+            price="1",
+            quantity="1",
+            ts=DAY,
+        ),
+    )
+    late = apply_event(closed, fill)
+    hook(fill, late)
+    assert metrics.count("ismet_orders_terminal_total", status="canceled") == 1
+    assert metrics.count("ismet_orders_terminal_total", status="filled") == 0
+    reopened = Restated(
+        client_order_id="C1", ts=DAY, status=OrderStatus.ACCEPTED, reason="venue"
+    )
+    hook(reopened, apply_event(closed, reopened))
+    hook(canceled, closed)
+    assert metrics.count("ismet_orders_terminal_total", status="canceled") == 2
 
 
 def test_digest_does_not_depend_on_set_ordering(store: BarStore) -> None:

@@ -82,11 +82,19 @@ def http_hook(metrics: Metrics, *, provider: str) -> Hook:
 
 
 def order_event_hook(metrics: Metrics):  # type: ignore[no-untyped-def]
-    """An ``on_event`` hook for :class:`~ismet.execution.OrderManager`."""
+    """An ``on_event`` hook for :class:`~ismet.execution.OrderManager`.
+
+    ``ismet_orders_terminal_total`` counts an order when it closes, not every later
+    report about it, labelled with the status it closed as.
+    """
+    closed: set[str] = set()
 
     def hook(event: OrderEvent, state: OrderState) -> None:
         metrics.counter("ismet_order_events_total", labels={"kind": event.kind})
-        if state.is_terminal:
+        if not state.is_terminal:
+            closed.discard(state.client_order_id)
+        elif state.client_order_id not in closed:
+            closed.add(state.client_order_id)
             metrics.counter(
                 "ismet_orders_terminal_total", labels={"status": state.status.value}
             )

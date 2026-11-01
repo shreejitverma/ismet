@@ -42,7 +42,12 @@ normal operation, so it only orders quotes, and the first quote per symbol after
 reconnect is flagged instead. Repeats are dropped; a lower number is delivered
 flagged ``OUT_OF_ORDER``. Nothing is backfilled, because neither stream can replay
 and ``/api/v3/trades`` only holds recent trades. A consumer that must have every
-trade should act on ``AFTER_GAP``.
+trade should act on ``AFTER_GAP``. ``IsmetClient`` takes its gap policy from those
+flags, because this adapter declares ``gates_streams``.
+
+Outages. Reconnects never stop by default, since a long-lived stream should survive a
+network outage. Each one is logged at WARNING; pass ``ws_on_state`` to watch them, or
+``ws_max_reconnects`` to fail instead. Only data frames count as progress.
 
 Vendor quirks:
 
@@ -58,9 +63,10 @@ Vendor quirks:
   :class:`~ismet.errors.AuthError` by the transport's mapping even though this
   adapter sends no credentials.
 - HTTP 418 is an IP ban for continuing after 429s. It is raised as
-  :class:`~ismet.errors.RateLimited` and never retried. A 429 whose ``Retry-After``
-  exceeds the retry policy's cap is not retried either, because retrying before it
-  elapses is what earns the ban.
+  :class:`~ismet.errors.RateLimited` and never retried, and requests are refused
+  locally until the ban ends, because sending more lengthens it. A 429 whose
+  ``Retry-After`` exceeds the retry policy's cap is not retried either, because
+  retrying before it elapses is what earns the ban.
 - ``serverShutdown`` frames are logged; the close that follows triggers the
   reconnect. A connection is valid for 24 hours and then dropped, handled the same
   way.
@@ -103,6 +109,7 @@ from ismet.transport.ratelimit import RateLimiter, RateLimitSpec
 from ismet.transport.ws import (
     DEFAULT_WS_BACKOFF,
     BackpressurePolicy,
+    OnState,
     WebSocketTransport,
 )
 
@@ -122,6 +129,7 @@ DEFAULT_TIMEOUT = 30.0
 _MS_PER_SECOND = 1000
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _BANNED_UNTIL = re.compile(r"banned until (\d+)")
+_SHORTEST_BAN_SECONDS = 120.0
 
 _WEIGHT = "weight"
 _WS_CONNECT = "ws_connect"
@@ -187,6 +195,7 @@ class BinanceProvider(Provider):
     """Quotes, books, bars, streams and instruments from Binance Spot."""
 
     name: ClassVar[str] = "binance"
+    gates_streams: ClassVar[bool] = True
     venues: ClassVar[frozenset[str]] = frozenset({BINANCE_VENUE})
 
     def __init__(
@@ -203,6 +212,7 @@ class BinanceProvider(Provider):
         ws_max_reconnects: int | None = None,
         ws_queue_size: int = 10_000,
         ws_backpressure: BackpressurePolicy = BackpressurePolicy.BLOCK,
+        ws_on_state: OnState | None = None,
         clock: Clock = SYSTEM_CLOCK,
         http_transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
@@ -218,6 +228,7 @@ class BinanceProvider(Provider):
         self._ws_max_reconnects = ws_max_reconnects
         self._ws_queue_size = ws_queue_size
         self._ws_backpressure = ws_backpressure
+        self._ws_on_state = ws_on_state
         self._limiter = _WeightLimiter(clock)
         self._http = HttpTransport(
             rest_url,
@@ -233,6 +244,7 @@ class BinanceProvider(Provider):
         self._all_symbols: list[Mapping[str, Any]] | None = None
         self._all_symbols_at = 0.0
         self._streams: set[WebSocketTransport] = set()
+        self._banned_until = 0.0
 
     @classmethod
     def from_settings(cls, settings: ProviderSettings) -> BinanceProvider:
@@ -262,6 +274,12 @@ class BinanceProvider(Provider):
         return symbol.ticker
 
     async def _get(self, path: str, params: Mapping[str, Any], rate_key: str) -> Any:
+        remaining = self._banned_until - self.clock.monotonic()
+        if remaining > 0:
+            raise RateLimited(
+                f"binance has banned this IP for another {remaining:.0f}s; not sending",
+                retry_after=remaining,
+            )
         try:
             return await self._http.get_json(path, params=params, rate_key=rate_key)
         except VenueError as exc:
@@ -272,6 +290,9 @@ class BinanceProvider(Provider):
                 int(found.group(1)) / _MS_PER_SECOND - self.clock.now().timestamp()
                 if found
                 else None
+            )
+            self._banned_until = self.clock.monotonic() + (
+                _SHORTEST_BAN_SECONDS if retry_after is None else retry_after
             )
             raise RateLimited(
                 f"binance has banned this IP: {exc}", retry_after=retry_after
@@ -436,11 +457,13 @@ class BinanceProvider(Provider):
         ws = WebSocketTransport(
             self._ws_url,
             on_connect=on_connect,
+            on_state=self._ws_on_state,
             backoff=self._ws_backoff,
             max_reconnects=self._ws_max_reconnects,
             queue_size=self._ws_queue_size,
             backpressure=self._ws_backpressure,
             decode=decode,
+            is_data=lambda item: number_field in item[2],
         )
         gate = StreamGate(contiguous=contiguous)
         seen_generation = 1

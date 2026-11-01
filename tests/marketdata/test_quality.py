@@ -12,12 +12,12 @@ from ismet.marketdata import (
     QualityMonitor,
     SequenceGuard,
 )
-from ismet.models import QualityFlag, Quote, Symbol, Trade
+from ismet.models import Bar, Interval, QualityFlag, Quote, Symbol, Trade
 
 D = Decimal
 TS = datetime(2026, 3, 9, 15, 0, tzinfo=timezone.utc)
-SYM = Symbol(venue="XSIM", ticker="ACME")
-OTHER = Symbol(venue="XSIM", ticker="OTHER")
+SYM = Symbol(venue="ZSIM", ticker="ACME")
+OTHER = Symbol(venue="ZSIM", ticker="OTHER")
 
 
 def trade(sequence: int | None, symbol: Symbol = SYM, price: str = "10") -> Trade:
@@ -124,3 +124,87 @@ def test_monitor_compares_sources() -> None:
     far = monitor.compare_sources(SYM, D(100), D(110))
     assert far is not None and far.issue is Issue.SOURCE_DIVERGENCE
     assert monitor.compare_sources(SYM, D(1), D(0)) is not None
+
+
+# The first bucket opens at TS, and the oracle is its length: M1 closes 60s later.
+
+
+def bar(interval: Interval, received: datetime) -> Bar:
+    return Bar(
+        symbol=SYM,
+        exchange_ts=TS,
+        received_ts=received,
+        interval=interval,
+        open="10",
+        high="10",
+        low="10",
+        close="10",
+        volume="1",
+    )
+
+
+def test_a_bar_is_as_old_as_its_close_not_its_open() -> None:
+    monitor = QualityMonitor()
+    just_closed = bar(Interval.M1, TS + timedelta(seconds=61))
+    assert monitor.observe(just_closed) == []
+    late = bar(Interval.M1, TS + timedelta(seconds=91))
+    assert [i.issue for i in monitor.observe(late)] == [Issue.STALE]
+
+
+def test_a_month_has_no_length_so_its_bar_has_no_staleness_verdict() -> None:
+    bars = bar(Interval.MO1, TS + timedelta(days=400))
+    assert QualityMonitor().observe(bars) == []
+
+
+def test_a_real_move_is_confirmed_by_nearby_prices_that_never_repeat() -> None:
+    monitor = QualityMonitor()
+    assert monitor.observe(trade(1, price="100")) == []
+    issues = [
+        monitor.observe(trade(1, price=p)) for p in ("120.01", "120.03", "119.98")
+    ]
+    assert [[i.issue for i in found] for found in issues] == [[Issue.OUTLIER]] * 3
+    assert monitor.observe(trade(1, price="120.10")) == []
+
+
+def test_scattered_bad_ticks_never_become_the_level() -> None:
+    monitor = QualityMonitor()
+    monitor.observe(trade(1, price="100"))
+    for price in ("1000", "5000", "20", "900", "4000", "30"):
+        assert [i.issue for i in monitor.observe(trade(1, price=price))] == [
+            Issue.OUTLIER
+        ]
+    assert monitor.observe(trade(1, price="100.5")) == []
+
+
+def test_a_one_sided_quote_is_still_checked_for_an_outlier() -> None:
+    monitor = QualityMonitor()
+    monitor.observe(trade(1, price="100"))
+    one_sided = Quote(symbol=SYM, exchange_ts=TS, received_ts=TS, bid="1000")
+    assert [i.issue for i in monitor.observe(one_sided)] == [Issue.OUTLIER]
+
+
+def flagged(sequence: int, *flags: QualityFlag) -> Trade:
+    return trade(sequence).model_copy(update={"quality": frozenset(flags)})
+
+
+def test_a_gated_guard_reads_the_flags_and_never_a_jump() -> None:
+    guard = SequenceGuard(GapPolicy.RAISE, gated=True)
+    first, jumped = trade(100), trade(900)
+    assert guard.admit(first) is first
+    assert guard.admit(jumped) is jumped
+    assert guard.stats.gaps == 0
+    with pytest.raises(SequenceGap) as caught:
+        guard.admit(flagged(1000, QualityFlag.AFTER_GAP))
+    assert (caught.value.expected, caught.value.received) == (901, 1000)
+    assert guard.stats.gaps == 1
+
+
+def test_a_gated_guard_counts_what_the_adapter_flagged_and_drops_nothing() -> None:
+    seen: list[int] = []
+    guard = SequenceGuard(on_gap=lambda _, o: seen.append(o.sequence), gated=True)
+    assert guard.admit(flagged(5, QualityFlag.AFTER_GAP)) is not None
+    assert guard.admit(flagged(3, QualityFlag.OUT_OF_ORDER)) is not None
+    assert guard.admit(trade(5)) is not None
+    assert seen == [5]
+    assert guard.stats.out_of_order == 1
+    assert guard.stats.delivered == 3

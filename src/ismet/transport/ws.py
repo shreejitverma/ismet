@@ -4,9 +4,12 @@ The transport owns a background task that keeps a connection alive. Incoming
 messages are decoded (floats as ``Decimal``) and placed on a bounded queue
 that :meth:`WebSocketTransport.messages` drains. When the connection drops the
 task backs off, reconnects, and calls ``on_connect`` again so the provider can
-re-authenticate and resubscribe. ``max_reconnects`` bounds consecutive attempts
-that deliver no message, however the connection ended; it resets once a message
-arrives. A retryable :class:`TransportError` raised by ``on_connect`` (for
+re-authenticate and resubscribe. Every reconnect is logged, so an outage is visible
+even to a consumer blocked in ``messages``, and ``on_state`` reports each state.
+``max_reconnects`` bounds consecutive attempts that deliver no data, however the
+connection ended; it resets once a data message arrives, and ``is_data`` says which
+messages count, so a server that acknowledges and closes still reaches the bound. A
+retryable :class:`TransportError` raised by ``on_connect`` (for
 example a send on a socket that just dropped) counts as one more attempt; any
 other error outside the socket layer (decoding, a non-retryable error from
 ``on_connect``) is terminal: the transport moves to ``FAILED`` and surfaces it
@@ -30,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from decimal import Decimal
@@ -41,6 +45,8 @@ from websockets.asyncio.client import ClientConnection, connect
 
 from ismet.errors import AuthError, IsmetError, TransportError
 from ismet.transport.backoff import ExponentialBackoff
+
+logger = logging.getLogger("ismet.transport.ws")
 
 DEFAULT_WS_BACKOFF = ExponentialBackoff(base=0.5, maximum=30.0)
 
@@ -201,6 +207,7 @@ class WebSocketTransport:
         queue_size: int = 10_000,
         backpressure: BackpressurePolicy = BackpressurePolicy.BLOCK,
         decode: Callable[[str | bytes], Any] | None = None,
+        is_data: Callable[[Any], bool] | None = None,
         connect_kwargs: dict[str, Any] | None = None,
     ) -> None:
         self.url = url
@@ -214,6 +221,7 @@ class WebSocketTransport:
         self._heartbeat_timeout = heartbeat_timeout
         self._policy = backpressure
         self._decode = decode or (lambda raw: json.loads(raw, parse_float=Decimal))
+        self._is_data = is_data
         self._connect_kwargs = connect_kwargs or {}
         self._queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=queue_size)
         self._conn: ClientConnection | None = None
@@ -226,7 +234,10 @@ class WebSocketTransport:
     def _set_state(self, state: ConnectionState) -> None:
         self.state = state
         if self._on_state is not None:
-            self._on_state(state)
+            try:
+                self._on_state(state)
+            except Exception:
+                logger.exception("on_state hook failed")
 
     async def __aenter__(self) -> WebSocketTransport:
         await self.start()
@@ -394,9 +405,11 @@ class WebSocketTransport:
                     self._set_state(ConnectionState.CONNECTED)
                     self._connected.set()
                     async for raw in conn:
-                        attempt = 0
                         self.stats.received += 1
-                        await self._put(self._decode(raw))
+                        item = self._decode(raw)
+                        if self._is_data is None or self._is_data(item):
+                            attempt = 0
+                        await self._put(item)
             except asyncio.CancelledError:
                 raise
             except websockets.exceptions.InvalidURI as exc:
@@ -447,6 +460,12 @@ class WebSocketTransport:
             if fatal is not None:
                 self._fail(fatal)
                 break
+            logger.warning(
+                "websocket %s lost (%s); reconnect attempt %d",
+                self.url,
+                reason,
+                attempt,
+            )
             await asyncio.sleep(self._backoff.delay(attempt - 1))
         self._enqueue(_CLOSED, force=True)
 
@@ -455,6 +474,7 @@ __all__ = [
     "DEFAULT_WS_BACKOFF",
     "BackpressurePolicy",
     "ConnectionState",
+    "OnState",
     "SequenceObservation",
     "SequenceOutcome",
     "SequenceTracker",

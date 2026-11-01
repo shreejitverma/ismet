@@ -16,7 +16,7 @@ from decimal import Decimal
 from enum import Enum
 
 from ismet.errors import SequenceGap
-from ismet.models import MarketEvent, Quote, Symbol, Trade
+from ismet.models import Bar, MarketEvent, Quote, Symbol, Trade
 from ismet.models.decimals import absolute, mul, ratio, sub
 from ismet.models.types import QualityFlag
 from ismet.transport.ws import SequenceObservation, SequenceOutcome, SequenceTracker
@@ -53,6 +53,12 @@ class SequenceGuard:
     Duplicates are dropped and counted. A late event that a gap reported missing is
     delivered with :attr:`QualityFlag.OUT_OF_ORDER`. Events after a gap carry
     :attr:`QualityFlag.AFTER_GAP`.
+
+    A jump in ``sequence`` means a loss only on a feed where the number rises by one
+    per event, and many venue feeds show a subset of a wider sequence. With ``gated``
+    the adapter has already applied its venue's own rule, so this guard only acts on
+    the flags the adapter set and never reads a jump as a gap. Such a gap reports
+    ``missing`` as 0, because the count is the adapter's and is in its log.
     """
 
     def __init__(
@@ -60,14 +66,19 @@ class SequenceGuard:
         policy: GapPolicy = GapPolicy.REPORT,
         *,
         on_gap: GapHandler | None = None,
+        gated: bool = False,
     ) -> None:
         self.policy = policy
+        self._gated = gated
+        self._last_gated: dict[Symbol, int] = {}
         self.stats = StreamStats()
         self._on_gap = on_gap
         self._trackers: dict[Symbol, SequenceTracker] = {}
 
     def admit(self, event: MarketEvent) -> MarketEvent | None:
         """Return the event to deliver, or ``None`` to drop a duplicate."""
+        if self._gated:
+            return self._admit_gated(event)
         if event.sequence is None:
             self.stats.delivered += 1
             return event
@@ -90,13 +101,32 @@ class SequenceGuard:
             return event
         return event.model_copy(update={"quality": event.quality | {flag}})
 
+    def _admit_gated(self, event: MarketEvent) -> MarketEvent:
+        number = event.sequence
+        if QualityFlag.OUT_OF_ORDER in event.quality:
+            self.stats.out_of_order += 1
+        if number is not None:
+            if QualityFlag.AFTER_GAP in event.quality:
+                self.stats.gaps += 1
+                last = self._last_gated.get(event.symbol)
+                expected = number if last is None else last + 1
+                self._report_gap(
+                    event.symbol,
+                    SequenceObservation(SequenceOutcome.GAP, number, expected),
+                )
+            self._last_gated[event.symbol] = max(
+                number, self._last_gated.get(event.symbol, number)
+            )
+        self.stats.delivered += 1
+        return event
+
     def _report_gap(self, symbol: Symbol, observed: SequenceObservation) -> None:
         logger.warning(
             "sequence gap on %s: expected %s, got %s (%s missing)",
             symbol,
             observed.expected,
             observed.sequence,
-            observed.missing,
+            observed.missing or "unknown number",
         )
         if self._on_gap is not None:
             self._on_gap(symbol, observed)
@@ -136,7 +166,10 @@ class QualityThresholds:
     outlier_bps: Decimal = Decimal(1000)
     divergence_bps: Decimal = Decimal(100)
     outlier_confirmations: int = 3
-    """Repeats of an outlying price needed before it becomes the new level."""
+    """Consecutive outlying prices needed before the latest becomes the new level."""
+    confirmation_band_bps: Decimal = Decimal(100)
+    """How far one outlying price may be from the one before it and still confirm it.
+    A real move keeps trading near its new level, and bad ticks scatter."""
 
 
 @dataclass
@@ -149,11 +182,27 @@ class QualityMonitor:
     _candidate: dict[Symbol, tuple[Decimal, int]] = field(default_factory=dict)
 
     @staticmethod
+    def _age(event: MarketEvent) -> timedelta | None:
+        """How old the event's information is on arrival, ``None`` if unknowable.
+
+        A bar's ``exchange_ts`` is its open, so its information is current up to its
+        close. A closed bar's age counts from there, and a month has no fixed length.
+        """
+        if not isinstance(event, Bar):
+            return event.latency
+        seconds = event.interval.nominal_seconds
+        if seconds is None:
+            return None
+        return event.latency - timedelta(seconds=seconds)
+
+    @staticmethod
     def _price_of(event: MarketEvent) -> Decimal | None:
         if isinstance(event, Trade):
             return event.price
         if isinstance(event, Quote):
-            return event.mid if event.mid is not None else event.last
+            for price in (event.mid, event.last, event.bid, event.ask):
+                if price is not None:
+                    return price
         return None
 
     def observe(self, event: MarketEvent) -> list[QualityIssue]:
@@ -162,12 +211,13 @@ class QualityMonitor:
         symbol = event.symbol
         limits = self.thresholds
         self._last_seen[symbol] = event.received_ts
-        if event.latency > limits.max_age:
+        age = self._age(event)
+        if age is not None and age > limits.max_age:
             issues.append(
                 QualityIssue(
                     symbol,
                     Issue.STALE,
-                    f"event is {event.latency.total_seconds():.1f}s old on arrival",
+                    f"event is {age.total_seconds():.1f}s old on arrival",
                 )
             )
         if event.clock_skew > limits.max_clock_skew:
@@ -202,9 +252,14 @@ class QualityMonitor:
 
     def _confirmed(self, symbol: Symbol, price: Decimal) -> bool:
         held, count = self._candidate.get(symbol, (price, 0))
-        count = count + 1 if held == price else 1
+        count = count + 1 if self._near(price, held) else 1
         self._candidate[symbol] = (price, count)
         return count >= self.thresholds.outlier_confirmations
+
+    def _near(self, price: Decimal, held: Decimal) -> bool:
+        if held == 0:
+            return price == 0
+        return _bps_between(price, held) <= self.thresholds.confirmation_band_bps
 
     def stale_symbols(
         self, now: datetime, *, expected: Iterable[Symbol] = ()

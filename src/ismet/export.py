@@ -17,17 +17,28 @@ from pydantic import BaseModel
 from ismet.errors import ConfigError
 from ismet.models import Bar
 
-_DROPPED = {"symbol", "source", "quality"}
+_DROPPED = {"symbol"}
 
 
 def to_records(items: Iterable[BaseModel]) -> list[dict[str, Any]]:
-    """Flat dictionaries, one per model, with ``symbol`` and ``venue`` as strings."""
+    """Flat dictionaries, one per model, with ``symbol`` and ``venue`` as strings.
+
+    ``quality`` is its flags sorted and comma-joined, empty when clean. ``source`` is
+    the provider's name and ``timeliness`` what it contracts to, so a flagged or delayed
+    row stays visibly so.
+    """
     rows: list[dict[str, Any]] = []
     for item in items:
         row = {k: v for k, v in item.model_dump().items() if k not in _DROPPED}
         symbol = getattr(item, "symbol", None)
         if symbol is not None:
             row = {"ticker": symbol.ticker, "venue": symbol.venue, **row}
+        if "quality" in row:
+            row["quality"] = ",".join(sorted(flag.value for flag in row["quality"]))
+        if "source" in row:
+            source = getattr(item, "source", None)
+            row["source"] = None if source is None else source.provider
+            row["timeliness"] = None if source is None else source.timeliness.value
         rows.append(row)
     return rows
 

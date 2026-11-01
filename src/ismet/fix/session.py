@@ -46,7 +46,8 @@ scrubbed of the configured secrets before it is logged or raised.
 
 Not implemented: NextExpectedMsgSeqNum(789) resynchronization, FIXT per-message
 ApplVerID, encryption (EncryptMethod is always 0; pass ``ssl`` for TLS), and scheduled
-session times. A daily reset is done with ``reset_on_logon`` or
+session times. A daily reset is done with ``reset_on_logon``, which resets once per
+:attr:`FixSessionConfig.session_period` and not on a reconnect within it, or with
 :meth:`FixStore.reset_sequences`.
 """
 
@@ -97,7 +98,8 @@ APPL_VER_FIX50SP2 = "9"
 
 ADMIN_TYPES = frozenset({"0", "1", "2", "3", "4", "5", "A"})
 
-_SEQUENCE_NUMBER = re.compile(r"^[1-9][0-9]{0,17}$")
+# The FIX int datatype allows leading zeros: "00023" means 23.
+_SEQUENCE_NUMBER = re.compile(r"^(?=[0-9]{1,18}$)0*[1-9][0-9]*$")
 
 _SYNC_RETRY_SECONDS = 1.0
 
@@ -174,6 +176,15 @@ class SessionListener(Protocol):
         """
         ...
 
+    async def on_possible_message_loss(
+        self, first_seq: int, last_seq: int | None, reason: str
+    ) -> None:
+        """The peer moved its numbers past messages never read here, which it may not
+        resend, and they could have been fills. ``last_seq`` is ``None`` if unknown.
+        Return only once that is durably recorded and surfaced.
+        """
+        ...
+
     def on_sequence_reset(self) -> None:
         """Numbers restart at 1, so an older number no longer names the same message."""
         ...
@@ -185,14 +196,26 @@ class SessionListener(Protocol):
     def on_session_failed(self, error: Exception) -> None: ...
 
 
+def _utc_date(now: datetime) -> str:
+    return now.date().isoformat()
+
+
 @dataclass(frozen=True)
 class FixSessionConfig:
     """One FIX session. ``repr`` cannot show ``password``, which is a ``SecretStr``.
 
     ``stale_resend_after`` gap-fills application messages older than this many seconds
-    instead of resending them, which "Message Recovery" allows for aged orders. The
-    default ``None`` resends everything and leaves the venue to apply its own staleness
-    rules, using PossDupFlag, OrigSendingTime, and TransactTime.
+    instead of resending them, which "Message Recovery" allows for aged orders, and they
+    are dropped from the store at start. ``None`` resends everything and leaves the
+    venue to apply its own staleness rules, using PossDupFlag, OrigSendingTime, and
+    TransactTime.
+
+    ``reset_on_logon`` sends ResetSeqNumFlag on the first connection of each
+    ``session_period``, a label computed from the current UTC time, by default the UTC
+    date. Its confirmation is recorded in the store, so a reconnect later in the period
+    keeps the numbers and can recover what it missed by ResendRequest. Orders that were
+    open across the reset are checked by the order manager's reconciliation, through
+    CumQty.
     """
 
     host: str
@@ -206,7 +229,7 @@ class FixSessionConfig:
     password: SecretStr | None = None
     logon_fields: tuple[tuple[int, str | SecretStr], ...] = ()
     reset_on_logon: bool = False
-    sync_on_logon: bool = True
+    session_period: Callable[[datetime], str] = _utc_date
     ssl: ssl_module.SSLContext | None = None
     connect_timeout: float = 10.0
     logon_timeout: float = 10.0
@@ -214,7 +237,7 @@ class FixSessionConfig:
     termination_wait: float = 2.0
     write_timeout: float = 10.0
     max_sending_time_skew: float | None = 120.0
-    stale_resend_after: float | None = None
+    stale_resend_after: float | None = 60.0
     max_body_length: int = DEFAULT_MAX_BODY_LENGTH
     resend_timeout: float | None = None
     max_resend_requests: int = 3
@@ -299,6 +322,7 @@ class FixSession:
         self._resend_target: int | None = None
         self._resend_requested_at = 0.0
         self._resend_requests = 0
+        self._reset_awaiting_confirmation: str | None = None
         self.connections = 0
 
     @staticmethod
@@ -366,6 +390,10 @@ class FixSession:
             max_workers=1, thread_name_prefix="ismet-fix-store"
         )
         self._next_in = await self.run_store(self.store.next_inbound)
+        limit = self.config.stale_resend_after
+        if limit is not None:
+            cutoff = format_utc_timestamp(self._clock.now() - timedelta(seconds=limit))
+            await self.run_store(lambda: self.store.prune_messages_sent_before(cutoff))
         self._set_state(SessionState.DISCONNECTED)
         self._runner = asyncio.create_task(
             self._run(), name=f"ismet-fix-{self.config.session_id}"
@@ -718,17 +746,13 @@ class FixSession:
         fields.append((58, text))
         await self._send_admin("3", fields)
 
-    async def _send_logon(self) -> None:
+    def _logon_fields(self, *, reset: bool) -> list[tuple[int, FieldValue]]:
         cfg = self.config
         fields: list[tuple[int, FieldValue]] = [
             (98, 0),
             (108, cfg.heartbeat_interval),
         ]
-        if cfg.reset_on_logon:
-            await self.run_store(self.store.reset_sequences)
-            self._next_in = 1
-            if self.listener is not None:
-                self.listener.on_sequence_reset()
+        if reset:
             fields.append((141, "Y"))
         if cfg.username is not None:
             fields.append((553, cfg.username))
@@ -737,8 +761,28 @@ class FixSession:
         if cfg.default_appl_ver_id is not None:
             fields.append((1137, cfg.default_appl_ver_id))
         fields.extend(cfg.logon_fields)
-        self._set_state(SessionState.LOGON_SENT)
-        await self._send_admin("A", fields)
+        return fields
+
+    async def _send_logon(self) -> None:
+        cfg = self.config
+        self._reset_awaiting_confirmation = None
+        async with self._send_lock:
+            if cfg.reset_on_logon:
+                period = cfg.session_period(self._clock.now())
+                if period != await self.run_store(self.store.reset_period):
+                    await self._reset_numbers()
+                    self._reset_awaiting_confirmation = period
+            self._set_state(SessionState.LOGON_SENT)
+            reset = self._reset_awaiting_confirmation is not None
+            await self._send_admin_locked("A", self._logon_fields(reset=reset))
+
+    async def _reset_numbers(self) -> None:
+        """Both numbers back to 1. The caller holds the send lock."""
+        await self.run_store(self.store.reset_sequences)
+        self._next_in = 1
+        self._resend_target = None
+        if self.listener is not None:
+            self.listener.on_sequence_reset()
 
     async def _begin_logout(self, text: str) -> None:
         self._deadline = self._clock.monotonic() + self.config.logout_timeout
@@ -762,9 +806,13 @@ class FixSession:
         value = to if to is not None else self._next_in + 1
         await self.run_store(lambda: self.store.set_next_inbound(value))
         self._next_in = value
-        if self._resend_target is not None and self._state is SessionState.SYNCING:
+        if self._resend_target is not None:
             # Catching up is progress, however long the history is.
-            self._deadline = self._clock.monotonic() + self.config.logon_timeout
+            now = self._clock.monotonic()
+            self._resend_requested_at = now
+            self._resend_requests = min(self._resend_requests, 1)
+            if self._state is SessionState.SYNCING:
+                self._deadline = now + self.config.logon_timeout
         if self._resend_target is not None and self._next_in > self._resend_target:
             self._resend_target = None
             self._resend_requests = 0
@@ -796,6 +844,7 @@ class FixSession:
         if message.get(49) != cfg.target_comp_id or message.get(56) != (
             cfg.sender_comp_id
         ):
+            await self._discard(message, seq, "CompID problem")
             await self.send_reject(seq, REJECT_COMP_ID, "CompID problem")
             if seq == expected:
                 await self._advance()
@@ -990,11 +1039,11 @@ class FixSession:
         self._set_state(SessionState.SYNCING)
 
     async def _after_logon(self) -> None:
-        if self.config.sync_on_logon:
-            await self._send_sync_request()
-        else:
-            self._synced = True
-        self._maybe_ready()
+        period = self._reset_awaiting_confirmation
+        if period is not None:
+            self._reset_awaiting_confirmation = None
+            await self.run_store(lambda: self.store.set_reset_period(period))
+        await self._send_sync_request()
 
     def _maybe_ready(self) -> None:
         if (
@@ -1012,29 +1061,40 @@ class FixSession:
                 seq, REJECT_VALUE_INCORRECT, "ResetSeqNumFlag Logon must be 1", tag=34
             )
             await self._terminate("ResetSeqNumFlag Logon with MsgSeqNum other than 1")
-        if self.config.reset_on_logon and self._state is SessionState.LOGON_SENT:
+        if (
+            self._reset_awaiting_confirmation is not None
+            and self._state is SessionState.LOGON_SENT
+        ):
             await self._advance(2)
             self._on_logon_confirmed(message)
         else:
-            # "Logon": the receiver must obey a reset, and it answers in kind at 1.
-            await self.run_store(self.store.reset_sequences)
-            self._next_in = 1
-            self._resend_target = None
-            if self.listener is not None:
-                self.listener.on_sequence_reset()
-            await self._advance(2)
-            logger.warning("FIX peer reset the sequence numbers at Logon")
-            await self._send_admin(
-                "A",
-                [
-                    (98, 0),
-                    (108, self.config.heartbeat_interval),
-                    (141, "Y"),
-                ],
-            )
-            if self._state is SessionState.LOGON_SENT:
-                self._on_logon_confirmed(message)
+            await self._obey_peer_reset(message)
         await self._after_logon()
+
+    async def _obey_peer_reset(self, message: FixMessage) -> None:
+        """ "Logon": the receiver must obey a reset, and it answers in kind at 1.
+
+        Application messages stop first, so none can precede our Logon or be numbered
+        under the old counters. Whatever was not yet read can no longer be requested.
+        """
+        logger.warning("FIX peer reset the sequence numbers at Logon")
+        unread_from = self._next_in
+        if self._state in (
+            SessionState.LOGON_SENT,
+            SessionState.READY,
+            SessionState.SYNCING,
+        ):
+            self._on_logon_confirmed(message)
+        self._synced = False
+        self._sync_ids = set()
+        if unread_from > 1 and self.listener is not None:
+            await self.listener.on_possible_message_loss(
+                unread_from, None, "peer reset the sequence numbers at Logon"
+            )
+        async with self._send_lock:
+            await self._reset_numbers()
+            await self._advance(2)
+            await self._send_admin_locked("A", self._logon_fields(reset=True))
 
     async def _on_heartbeat(self, message: FixMessage) -> None:
         if message.get(112) in self._sync_ids:
@@ -1091,6 +1151,10 @@ class FixSession:
             logger.warning("FIX SequenceReset-Reset to the number already expected")
             return
         logger.warning("FIX SequenceReset-Reset moves inbound to %d", new_seq)
+        if self.listener is not None:
+            await self.listener.on_possible_message_loss(
+                self._next_in, new_seq - 1, "SequenceReset-Reset skipped these numbers"
+            )
         await self._advance(new_seq)
 
     async def _on_resend_request(self, message: FixMessage, seq: int) -> None:

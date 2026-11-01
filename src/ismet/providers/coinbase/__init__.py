@@ -19,7 +19,9 @@ Timestamps. ``time`` on ``/book`` and on feed frames has up to nanosecond digits
 kept in ``exchange_ts_ns``. REST market data is served through a CDN: responses said
 ``cache-control: public, max-age=2`` with ``cf-cache-status: HIT``, so ``/book`` can
 be about 2 seconds old on arrival. ``time`` tells the truth about that, and
-``latency`` shows it. It also means ``sequence`` can go backwards between REST calls:
+``latency`` shows it. Candles have no such time and ``max-age=300``, so
+:meth:`CoinbaseProvider.bars` judges them by when the copy was made, ``Date`` minus
+``Age``. It also means ``sequence`` can go backwards between REST calls:
 measured live, a ``/book?level=2`` response carried a lower sequence than the
 ``level=1`` response fetched just before it. Use the feed for anything fresher.
 
@@ -34,6 +36,12 @@ cascades, so nothing can show loss there, and the first quote per product after 
 reconnect is flagged. Repeats are dropped; a lower number is delivered flagged
 ``OUT_OF_ORDER``. Nothing is backfilled, though the docs suggest REST for it: this
 adapter reports the gap and a consumer that needs every trade should act on it.
+``IsmetClient`` takes its gap policy from those flags, because this adapter declares
+``gates_streams``.
+
+Outages. Reconnects never stop by default, since a long-lived stream should survive a
+network outage. Each one is logged at WARNING; pass ``ws_on_state`` to watch them, or
+``ws_max_reconnects`` to fail instead. Only data frames count as progress.
 
 Vendor quirks:
 
@@ -56,7 +64,8 @@ Vendor quirks:
   :attr:`VenueError.code` is ``None`` and ``payload`` has the text. A rejected feed
   subscription sends ``{"type": "error"}`` and then an empty ``subscriptions``.
 - Unknown product ids in the feed are rejected, unlike Binance, so no reference data
-  request is needed before connecting.
+  request is needed before connecting. A quote asset is only registered once the venue
+  has answered for the product, so a mistyped ticker adds no currency.
 """
 
 from __future__ import annotations
@@ -92,6 +101,7 @@ from ismet.transport.ratelimit import RateLimiter, RateLimitSpec
 from ismet.transport.ws import (
     DEFAULT_WS_BACKOFF,
     BackpressurePolicy,
+    OnState,
     WebSocketTransport,
 )
 
@@ -128,10 +138,19 @@ def _iso(seconds: int) -> str:
     return (_EPOCH + seconds * _ONE_SECOND).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _outdated(
+    as_of: datetime, received: datetime, last_open: int, granularity: int
+) -> bool:
+    """Whether a bucket in the window has closed since this copy was made."""
+    closed_by_now = (received - _EPOCH) // timedelta(seconds=granularity) * granularity
+    return as_of < _EPOCH + min(last_open + granularity, closed_by_now) * _ONE_SECOND
+
+
 class CoinbaseProvider(Provider):
     """Quotes, books, bars, streams and instruments from Coinbase Exchange."""
 
     name: ClassVar[str] = "coinbase"
+    gates_streams: ClassVar[bool] = True
     venues: ClassVar[frozenset[str]] = frozenset({COINBASE_VENUE})
 
     def __init__(
@@ -148,6 +167,7 @@ class CoinbaseProvider(Provider):
         ws_max_reconnects: int | None = None,
         ws_queue_size: int = 10_000,
         ws_backpressure: BackpressurePolicy = BackpressurePolicy.BLOCK,
+        ws_on_state: OnState | None = None,
         clock: Clock = SYSTEM_CLOCK,
         http_transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
@@ -163,6 +183,7 @@ class CoinbaseProvider(Provider):
         self._ws_max_reconnects = ws_max_reconnects
         self._ws_queue_size = ws_queue_size
         self._ws_backpressure = ws_backpressure
+        self._ws_on_state = ws_on_state
         self._limiter = RateLimiter(dict(RATE_LIMITS), clock=clock)
         self._http = HttpTransport(
             rest_url,
@@ -252,6 +273,12 @@ class CoinbaseProvider(Provider):
         two buckets and silently lose one. An empty window is normal, as Coinbase
         publishes no candle without trades, so every window is requested. A range
         that would exceed ``MAX_BARS`` raises before any request.
+
+        Responses come through a CDN and can be minutes old, so a bucket counts as
+        closed only by the time the copy was made. A copy too old to show every bucket
+        that has closed by now cannot tell a missing bucket from one with no trades, so
+        its bars carry :attr:`QualityFlag.STALE`, and the same request can be repeated
+        once the copy expires.
         """
         ticker = self._native(symbol)
         check_range(start, end)
@@ -261,7 +288,6 @@ class CoinbaseProvider(Provider):
         count = (end - start) // timedelta(seconds=granularity)
         if count > MAX_BARS:
             raise ValidationError(f"range would produce {count} bars (max {MAX_BARS})")
-        currency = normalize.quote_currency_of(ticker)
         cursor = _ceil_seconds(start, granularity)
         final = _ceil_seconds(end, granularity) - granularity
         path = self._path(ticker, "candles")
@@ -270,17 +296,27 @@ class CoinbaseProvider(Provider):
             window_end = min(
                 cursor + (self._candles_per_request - 1) * granularity, final
             )
-            rows = await self._get(
+            response = await self._http.request(
+                "GET",
                 path,
-                {
+                params={
                     "granularity": granularity,
                     "start": _iso(cursor),
                     "end": _iso(window_end),
                 },
+                rate_key=_PUBLIC,
             )
+            received = self.clock.now()
+            as_of = normalize.copy_made_at(response.headers, received)
             bars.extend(
                 normalize.bars_from_candles(
-                    rows, symbol, interval, self.clock.now(), currency
+                    response.json(),
+                    symbol,
+                    interval,
+                    received,
+                    normalize.quote_currency_of(ticker),
+                    as_of=as_of,
+                    outdated=_outdated(as_of, received, window_end, granularity),
                 )
             )
             cursor = window_end + granularity
@@ -323,7 +359,7 @@ class CoinbaseProvider(Provider):
         by_ticker = {self._native(symbol): symbol for symbol in symbols}
         if not by_ticker:
             raise ValidationError("at least one symbol is required")
-        currencies = {t: normalize.quote_currency_of(t) for t in by_ticker}
+        currencies: dict[str, str | None] = {}
         request = {
             "type": "subscribe",
             "product_ids": list(by_ticker),
@@ -343,11 +379,13 @@ class CoinbaseProvider(Provider):
         ws = WebSocketTransport(
             self._ws_url,
             on_connect=on_connect,
+            on_state=self._ws_on_state,
             backoff=self._ws_backoff,
             max_reconnects=self._ws_max_reconnects,
             queue_size=self._ws_queue_size,
             backpressure=self._ws_backpressure,
             decode=decode,
+            is_data=lambda item: item[2].get("type") in data_types,
         )
         gate = StreamGate(contiguous=contiguous)
         seen_generation = 1
@@ -372,6 +410,8 @@ class CoinbaseProvider(Provider):
                 if kind == "last_match" and gate.is_fresh(ticker):
                     gate.seed(ticker, frame[number_field])
                     continue
+                if ticker not in currencies:
+                    currencies[ticker] = normalize.quote_currency_of(ticker)
                 event = parse(frame, symbol, received, currencies[ticker])
                 admitted = gate.admit(ticker, frame[number_field], event)
                 if admitted is not None:

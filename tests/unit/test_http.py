@@ -8,6 +8,7 @@ import pytest
 from pydantic import SecretStr
 
 from ismet.errors import (
+    AmbiguousOutcome,
     AuthError,
     CircuitOpen,
     RateLimited,
@@ -369,3 +370,29 @@ def test_map_response_error_variants() -> None:
     r = map_response_error(302, b"", {"location": "/login"})
     assert isinstance(r, TransportError) and not r.retryable and r.status == 302
     assert "/login" in str(r)
+
+
+async def test_a_failing_hook_never_replaces_the_result_of_a_request() -> None:
+    def broken(info: object) -> None:
+        raise OSError("metrics backend is down")
+
+    seen: list[object] = []
+
+    def ok(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": 1})
+
+    t = make(ok, hooks=[broken, seen.append])
+    assert await t.get_json("/x") == {"ok": 1}
+    assert len(seen) == 1
+
+
+async def test_a_failing_hook_keeps_the_ambiguous_outcome_of_an_order() -> None:
+    def broken(info: object) -> None:
+        raise OSError("metrics backend is down")
+
+    def lost(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("no answer", request=request)
+
+    t = make(lost, hooks=[broken])
+    with pytest.raises(AmbiguousOutcome):
+        await t.request("POST", "/order", json_body={"q": 1}, idempotent=False)

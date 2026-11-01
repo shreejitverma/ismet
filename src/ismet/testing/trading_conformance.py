@@ -23,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 
 from ismet.capabilities import AccountCapability, Capability, TradingCapability
-from ismet.errors import ConfigError, IsmetError, VenueError
+from ismet.errors import ConfigError, DuplicateOrderId, IsmetError, VenueError
 from ismet.models.orders import (
     Environment,
     Fill,
@@ -45,8 +45,15 @@ async def run_trading_conformance(
     timeout: float = 15.0,
     make_marketable_order: Callable[[str], OrderRequest] | None = None,
     attempts: Callable[[str], int] | None = None,
+    unknown_status_error: type[Exception] | None = None,
 ) -> ConformanceReport:
-    """Exercise the order-entry contract and return a report."""
+    """Exercise the order-entry contract and return a report.
+
+    ``unknown_status_error`` declares a documented exception to the rule that a status
+    query for an order the venue does not have returns ``None``. It is for a provider
+    whose ``None`` would falsely say the venue has no such order, because the only
+    record it can consult is local.
+    """
     if provider.environment is Environment.LIVE:
         raise ConfigError(
             f"provider {provider.name!r} is LIVE; trading conformance sends orders and "
@@ -117,11 +124,16 @@ async def run_trading_conformance(
                 )
             )
 
-    ok, missing = await step(
-        "status_of_unknown_order",
-        venue.order_status(f"{id_prefix}-never-sent", symbol),
-    )
-    if ok:
+    try:
+        missing = await asyncio.wait_for(
+            venue.order_status(f"{id_prefix}-never-sent", symbol), timeout
+        )
+    except Exception as exc:
+        declared = unknown_status_error is not None and isinstance(
+            exc, unknown_status_error
+        )
+        add(Check(_CAP, "status_of_unknown_order", declared, type(exc).__name__))
+    else:
         add(Check(_CAP, "status_none_when_not_found", missing is None))
 
     ok, listed = await step("open_orders", venue.open_orders(symbol))
@@ -180,7 +192,7 @@ async def _check_duplicate_refused(
     """A repeated client order id must not create a second order."""
     try:
         await venue.place_order(request)
-    except VenueError as exc:
+    except DuplicateOrderId as exc:
         report.checks.append(
             Check(_CAP, "duplicate_client_id_refused", True, str(exc.code))
         )
@@ -190,7 +202,7 @@ async def _check_duplicate_refused(
                 _CAP,
                 "duplicate_client_id_refused",
                 False,
-                f"expected VenueError, got {type(exc).__name__}",
+                f"expected DuplicateOrderId, got {type(exc).__name__}",
             )
         )
     else:
@@ -297,6 +309,7 @@ async def _first_event_for(stream: Any, client_order_id: str) -> None:
         aclose = getattr(stream, "aclose", None)
         if aclose is not None:
             await aclose()
+    raise ConfigError("the execution stream ended before reporting the order")
 
 
 __all__ = ["run_trading_conformance"]

@@ -17,7 +17,7 @@ from ismet.fix.message import (
     decode,
     encode,
 )
-from ismet.fix.provider import FixDialect, FixProvider, FixTags, ReportQuarantinedError
+from ismet.fix.provider import FixDialect, FixProvider, ReportQuarantinedError
 from ismet.fix.session import (
     APPL_VER_FIX50SP2,
     FixSession,
@@ -42,7 +42,6 @@ __all__ = [
     "FixStore",
     "FixStoreError",
     "FixStreamParser",
-    "FixTags",
     "GarbledFrame",
     "GarbledMessageError",
     "LogonRejectedError",
