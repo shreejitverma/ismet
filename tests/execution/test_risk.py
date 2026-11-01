@@ -248,6 +248,21 @@ def test_restricted_list_matches_full_symbol_or_ticker() -> None:
     rejected_by("restricted", ctx(), config(restricted_symbols=frozenset({"ACME"})))
 
 
+@pytest.mark.parametrize("entry", ["BRKb", "brkb", "BRKB", "BRKb@XNYS", "brkb@xnys"])
+def test_restricted_list_matches_a_mixed_case_ticker(entry: str) -> None:
+    symbol = Symbol(venue="XNYS", ticker="BRKb")
+    rejected_by(
+        "restricted",
+        ctx(request(symbol=symbol)),
+        config(restricted_symbols=frozenset({entry})),
+    )
+
+
+def test_restricted_list_does_not_refuse_another_ticker() -> None:
+    decision = RiskEngine(config(restricted_symbols=frozenset({"BRKb"}))).check(ctx())
+    assert decision.approved, decision
+
+
 def test_stale_reference_refuses_the_order() -> None:
     stale = QUOTE.model_copy(update={"exchange_ts": NOW - timedelta(seconds=6)})
     assert "old" in rejected_by("stale_data", ctx(reference=stale))

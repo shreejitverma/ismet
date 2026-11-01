@@ -10,7 +10,7 @@ Rules callers depend on that are easy to miss in the API reference.
 - A gross limit never uses a broker's average price. Marks come from reference quotes no older than `max_reference_age_seconds`, or from the latest fill, so a quote outage refuses new risk while orders that only reduce a position still pass.
 - A zero price is no price for a notional limit, whether it comes from the order or the quote.
 - An instrument with a listing or delisting date needs a calendar, because the date is judged at the venue, not in UTC.
-- `restricted_symbols` entries are normalized, so `AAPL@xnas` and `aapl` both match.
+- `restricted_symbols` entries match regardless of case, so `AAPL@xnas` and `aapl` both match, and `BRKb` also restricts a ticker spelled `BRKB`.
 - `cancel_all` sends cancels concurrently, at most 32 at a time, so one slow answer does not hold back the rest of a kill sweep.
 
 ## Journal

@@ -96,9 +96,14 @@ class RiskConfig(BaseModel):
     @field_validator("restricted_symbols")
     @classmethod
     def _normalized_restrictions(cls, value: frozenset[str]) -> frozenset[str]:
-        """An entry spelled unlike a symbol would silently restrict nothing."""
+        """An entry spelled unlike a symbol would silently restrict nothing.
+
+        Tickers are case-sensitive, but an operator's spelling of one is not a reason to
+        trade it, so entries and orders are compared in upper case. Two tickers differing
+        only in case are restricted together.
+        """
         return frozenset(
-            str(Symbol.parse(entry)) if "@" in entry else entry.strip().upper()
+            (str(Symbol.parse(entry)) if "@" in entry else entry.strip()).upper()
             for entry in value
         )
 
@@ -286,8 +291,8 @@ def check_session(ctx: RiskContext, config: RiskConfig) -> RiskDecision:
 def check_restricted(ctx: RiskContext, config: RiskConfig) -> RiskDecision:
     symbol = ctx.request.symbol
     if (
-        str(symbol) in config.restricted_symbols
-        or symbol.ticker in config.restricted_symbols
+        str(symbol).upper() in config.restricted_symbols
+        or symbol.ticker.upper() in config.restricted_symbols
     ):
         return _reject("restricted", f"{symbol} is on the restricted list")
     return APPROVED

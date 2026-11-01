@@ -362,6 +362,94 @@ def test_kill_requires_flags_and_action_and_existing_journal(
     assert not (tmp_path / "none.db").exists()
 
 
+@pytest.mark.parametrize(
+    ("reason", "operator"), [("r", ""), ("r", "   "), ("", "ops"), ("  ", "ops")]
+)
+def test_kill_release_refuses_a_blank_name_or_reason(
+    capsys, tmp_path: Path, reason: str, operator: str
+) -> None:  # type: ignore[no-untyped-def]
+    path = str(tmp_path / "j.db")
+    who = ("--reason", "fat finger", "--operator", "ops")
+    run(capsys, "kill", "engage", "--journal", path, "--create", *who)
+    code, out = run(
+        capsys,
+        "kill",
+        "release",
+        "--journal",
+        path,
+        "--reason",
+        reason,
+        "--operator",
+        operator,
+    )
+    assert code == 2 and "is blank" in out
+    code, out = run(capsys, "kill", "status", "--journal", path)
+    assert code == 0 and "kill: engaged" in out
+    journal = SqliteJournal(path)
+    kinds = [r.kind for r in journal.records()]
+    journal.close()
+    assert kinds == [RecordKind.KILL_ENGAGED]
+
+
+def test_kill_status_stays_engaged_after_a_nameless_release_row(
+    capsys, tmp_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    path = str(tmp_path / "j.db")
+    who = ("--reason", "fat finger", "--operator", "ops")
+    run(capsys, "kill", "engage", "--journal", path, "--create", *who)
+    journal = SqliteJournal(path)
+    journal.append(RecordKind.KILL_RELEASED, '{"reason": "r", "operator": " "}')
+    journal.close()
+    code, out = run(capsys, "kill", "status", "--journal", path)
+    assert code == 0 and "kill: engaged" in out and "reason: fat finger" in out
+
+
+def test_a_halt_is_not_refused_for_want_of_a_name(capsys, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    path = str(tmp_path / "j.db")
+    code, out = run(
+        capsys,
+        "kill",
+        "engage",
+        "--journal",
+        path,
+        "--create",
+        "--reason",
+        "",
+        "--operator",
+        "",
+    )
+    assert code == 0 and "kill: engaged" in out
+
+
+@pytest.mark.parametrize(
+    ("reason", "operator"), [("split", ""), ("split", " "), ("", "ops"), (" ", "ops")]
+)
+def test_position_adjust_refuses_a_blank_name_or_reason(
+    capsys, tmp_path: Path, reason: str, operator: str
+) -> None:  # type: ignore[no-untyped-def]
+    path = str(tmp_path / "j.db")
+    SqliteJournal(path).close()
+    code, out = run(
+        capsys,
+        "position",
+        "adjust",
+        "ACME@XNYS",
+        "--journal",
+        path,
+        "--delta",
+        "10",
+        "--reason",
+        reason,
+        "--operator",
+        operator,
+    )
+    assert code == 2 and "is blank" in out
+    journal = SqliteJournal(path)
+    records = list(journal.records())
+    journal.close()
+    assert records == []
+
+
 def _journal_with_order(path: Path) -> None:
     journal = SqliteJournal(path)
     request = OrderRequest(

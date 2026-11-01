@@ -68,6 +68,7 @@ from ismet.execution.journal import (
     KillState,
     RecordKind,
     chain_contains,
+    names_operator,
 )
 from ismet.execution.reconcile import BreakKind, ReconBreak, ReconReport
 from ismet.execution.risk import RiskConfig, RiskContext, RiskEngine
@@ -773,7 +774,7 @@ class OrderManager:
 
     async def release_kill(self, reason: str, *, operator: str) -> KillState:
         """Allow new orders again. Requires a named operator; journalled."""
-        if not operator:
+        if not operator.strip():
             raise ValidationError("releasing the kill switch requires an operator")
         record = await self._append(
             RecordKind.KILL_RELEASED, {"reason": reason, "operator": operator}
@@ -788,8 +789,9 @@ class OrderManager:
 
         A read can race a local engage, and a local engage may not have reached the
         journal yet. In both cases the journal looks "not engaged", and believing it
-        would silently switch the kill switch off. A release from elsewhere must name an
-        operator and sit on an intact chain: anyone can insert a row in a SQLite file.
+        would silently switch the kill switch off. A release from elsewhere must sit on
+        an intact chain: anyone can insert a row in a SQLite file. The journal has already
+        ignored one naming no operator.
         """
         if self._kill_unrecorded is not None or durable.seq <= self._kill.seq:
             return
@@ -797,9 +799,6 @@ class OrderManager:
             self._kill = durable
             return
         if self._kill.engaged:
-            if not durable.operator:
-                logger.critical("ignoring a kill switch release with no operator")
-                return
             result = await self._call_journal(self._journal.verify)
             if not result.ok:
                 logger.critical(
@@ -1350,7 +1349,7 @@ class OrderManager:
         ``POSITION_MISMATCH`` with an outside cause is cleared. Journalled, and also
         accepted from another process through ``ismet position adjust``.
         """
-        if not operator or not reason:
+        if not operator.strip() or not reason.strip():
             raise ValidationError(
                 "adjusting a position requires an operator and reason"
             )
@@ -1371,7 +1370,7 @@ class OrderManager:
 
     def _apply_adjustment(self, record: JournalRecord) -> None:
         detail = json.loads(record.payload)
-        if self._baseline is None or not detail.get("operator"):
+        if self._baseline is None or not names_operator(detail):
             logger.critical("ignoring position adjustment at record %s", record.seq)
             return
         symbol = Symbol.parse(detail["symbol"])
@@ -1410,7 +1409,7 @@ class OrderManager:
 
     async def update_risk_config(self, config: RiskConfig, *, operator: str) -> None:
         """Replace risk limits, recording the change durably first."""
-        if not operator:
+        if not operator.strip():
             raise ValidationError("changing risk limits requires an operator")
         await self._append(
             RecordKind.CONFIG_CHANGE,

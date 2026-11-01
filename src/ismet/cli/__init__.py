@@ -582,9 +582,21 @@ def _journal(args: argparse.Namespace) -> int:
         journal.close()
 
 
+def _require_named(args: argparse.Namespace, help_text: str) -> None:
+    """An unset shell variable must not pass for an operator's name or reason."""
+    for flag in ("reason", "operator"):
+        if not getattr(args, flag).strip():
+            raise _UsageError(
+                f"--{flag} is blank; was the variable holding it set?", help_text
+            )
+
+
 def _kill(args: argparse.Namespace) -> int:
     if args.action is None:
         raise _UsageError("kill needs an action", "ismet kill --help")
+    # Engaging is exempt: a missing name must never stop a halt.
+    if args.action == "release":
+        _require_named(args, "ismet kill --help")
     creating = (
         args.action == "engage" and args.create and not Path(args.journal).exists()
     )
@@ -635,6 +647,7 @@ def _kill(args: argparse.Namespace) -> int:
 def _position(args: argparse.Namespace) -> int:
     if args.action is None:
         raise _UsageError("position needs an action", "ismet position --help")
+    _require_named(args, "ismet position --help")
     symbol = Symbol.parse(args.symbol)
     try:
         delta = Decimal(args.delta)

@@ -74,6 +74,20 @@ def test_kill_state_tracks_the_latest_record(journal) -> None:  # type: ignore[n
     assert not journal.kill_state().engaged
 
 
+@pytest.mark.parametrize("operator", ["", "   ", None, 7])
+def test_a_release_naming_no_operator_leaves_the_kill_engaged(  # type: ignore[no-untyped-def]
+    journal, operator
+) -> None:
+    journal.append(
+        RecordKind.KILL_ENGAGED, json.dumps({"reason": "halt", "operator": "ops"})
+    )
+    journal.append(
+        RecordKind.KILL_RELEASED, json.dumps({"reason": "x", "operator": operator})
+    )
+    state = journal.kill_state()
+    assert state.engaged and state.reason == "halt" and state.operator == "ops"
+
+
 def test_export_writes_one_json_object_per_record(journal) -> None:  # type: ignore[no-untyped-def]
     journal.append(RecordKind.ANOMALY, '{"a":1}', client_order_id="C1", ts=TS)
     out = io.StringIO()

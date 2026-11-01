@@ -164,22 +164,32 @@ def _verify_chain(rows: Iterable[_RawRow]) -> VerifyResult:
     return VerifyResult(True, count, prev)
 
 
-def _kill_state_of(seq: int, kind: str, payload: str) -> KillState:
-    detail = json.loads(payload)
-    return KillState(
-        kind == RecordKind.KILL_ENGAGED.value,
-        detail.get("reason", ""),
-        detail.get("operator", ""),
-        seq,
-        bool(detail.get("cancel_open", False)),
-    )
+def names_operator(detail: dict[str, object]) -> bool:
+    """Whether a journalled operator action says who did it."""
+    operator = detail.get("operator")
+    return isinstance(operator, str) and bool(operator.strip())
 
 
-def _kill_state_from(records: Iterator[JournalRecord]) -> KillState:
+def _kill_state_from(rows: Iterable[tuple[int, str, str]]) -> KillState:
+    """The kill state of ``(seq, kind, payload)`` rows, oldest first.
+
+    A release naming no operator is ignored, so it leaves the switch as it was: every
+    reader, including a process starting up, must agree that the halt still holds.
+    """
     state = KillState(False)
-    for record in records:
-        if record.kind in (RecordKind.KILL_ENGAGED, RecordKind.KILL_RELEASED):
-            state = _kill_state_of(record.seq, record.kind.value, record.payload)
+    for seq, kind, payload in rows:
+        detail = json.loads(payload)
+        engaged = kind == RecordKind.KILL_ENGAGED.value
+        if not engaged and not names_operator(detail):
+            logger.critical("ignoring a kill switch release with no operator: %s", seq)
+            continue
+        state = KillState(
+            engaged,
+            detail.get("reason", ""),
+            detail.get("operator", ""),
+            seq,
+            bool(detail.get("cancel_open", False)),
+        )
     return state
 
 
@@ -222,7 +232,11 @@ class MemoryJournal:
         return iter(self._records[after_seq:])
 
     def kill_state(self) -> KillState:
-        return _kill_state_from(iter(self._records))
+        return _kill_state_from(
+            (r.seq, r.kind.value, r.payload)
+            for r in self._records
+            if r.kind in (RecordKind.KILL_ENGAGED, RecordKind.KILL_RELEASED)
+        )
 
     def verify(self) -> VerifyResult:
         return _verify_chain(
@@ -409,15 +423,13 @@ class SqliteJournal:
     def kill_state(self) -> KillState:
         with self._lock:
             try:
-                row = self._conn.execute(
+                rows = self._conn.execute(
                     "SELECT seq, kind, payload FROM journal WHERE kind IN "
-                    "('kill_engaged', 'kill_released') ORDER BY seq DESC LIMIT 1"
-                ).fetchone()
+                    "('kill_engaged', 'kill_released') ORDER BY seq"
+                ).fetchall()
             except sqlite3.Error as exc:
                 raise JournalError(f"journal read failed: {exc}") from exc
-        if row is None:
-            return KillState(False)
-        return _kill_state_of(row[0], row[1], row[2])
+        return _kill_state_from(rows)
 
     def verify(self) -> VerifyResult:
         """Check the chain, then that nothing newer than the anchor has been removed.
@@ -538,5 +550,6 @@ __all__ = [
     "VerifyResult",
     "chain_contains",
     "export_jsonl",
+    "names_operator",
     "verify_jsonl",
 ]

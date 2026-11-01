@@ -676,7 +676,7 @@ class FixProvider(Provider):
 
         Durable, and the operator is recorded. Returns how many rows were released.
         """
-        if not operator:
+        if not operator.strip():
             raise ValidationError("releasing the FIX quarantine requires an operator")
         at = self.clock.now().isoformat()
         return await self._read_durable(

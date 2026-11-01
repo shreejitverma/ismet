@@ -24,6 +24,7 @@ from ismet.errors import (
 )
 from ismet.execution import (
     BreakKind,
+    Journal,
     MemoryJournal,
     OrderManager,
     RecordKind,
@@ -829,14 +830,17 @@ async def test_gross_exposure_keeps_the_multiplier_after_a_restart(
     await venue.drain()
     await first.submit(order("GR1", price="10.01", quantity="30"))
     await first.wait_for("GR1", lambda o: o.is_terminal, 2)
-    before = first._gross_notional()
+    assert first._gross_notional() == D("15015.00")
     await first.abort()
     journal.close()
 
     second, journal = build()
     await second.start()
     try:
-        assert second._gross_notional() == before == D("15015.00")
+        # Marks are not trusted across a restart, so gross is unknown until a quote.
+        assert second._gross_notional() is None
+        # With the multiplier of 50, the position and these 200 lots come to about
+        # 115000, over the limit. Without it they come to about 2300 and would pass.
         with pytest.raises(RiskRejected):
             await second.submit(order("GR2", price="9.50", quantity="200"))
     finally:
@@ -1669,6 +1673,58 @@ async def test_release_naming_no_operator_is_not_adopted(
     other.close()
     with pytest.raises(KillSwitchEngaged):
         await oms.submit(order("TR10", price="9.50"))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"reason": "x"}',
+        '{"reason": "x", "operator": ""}',
+        '{"reason": "x", "operator": "   "}',
+        '{"reason": "x", "operator": null}',
+    ],
+)
+async def test_release_naming_no_operator_does_not_undo_the_kill_on_restart(
+    make_manager: Factory, venue: SimVenue, journal: Journal, payload: str
+) -> None:
+    journal.append(RecordKind.KILL_ENGAGED, '{"reason": "halt", "operator": "ops"}')
+    journal.append(RecordKind.KILL_RELEASED, payload)
+    assert journal.kill_state().engaged and journal.kill_state().reason == "halt"
+    oms = make_manager()
+    await oms.start()
+    try:
+        await venue.drain()
+        with pytest.raises(KillSwitchEngaged):
+            await oms.submit(order("TR10B", price="9.50"))
+        assert venue.attempts["TR10B"] == 0
+    finally:
+        await oms.abort()
+
+
+async def test_a_named_release_after_a_nameless_one_still_clears_the_kill(
+    make_manager: Factory, venue: SimVenue, journal: Journal
+) -> None:
+    journal.append(RecordKind.KILL_ENGAGED, '{"reason": "halt", "operator": "ops"}')
+    journal.append(RecordKind.KILL_RELEASED, '{"reason": "x", "operator": " "}')
+    journal.append(RecordKind.KILL_RELEASED, '{"reason": "ok", "operator": "pat"}')
+    oms = make_manager()
+    await oms.start()
+    try:
+        await venue.drain()
+        await oms.submit(order("TR10C", price="9.50"))
+        assert venue.attempts["TR10C"] == 1
+    finally:
+        await oms.abort()
+
+
+async def test_a_blank_operator_cannot_release_the_kill_through_the_api(
+    oms: OrderManager, venue: SimVenue
+) -> None:
+    await venue.drain()
+    await oms.engage_kill("halt", operator="ops", cancel_open=False)
+    with pytest.raises(ValidationError):
+        await oms.release_kill("y", operator="   ")
+    assert oms.kill_state.engaged
 
 
 async def test_keep_orders_kill_leaves_open_orders_working_across_polls(

@@ -811,15 +811,16 @@ async def test_the_cli_clears_a_position_break_in_a_running_process(
     journal.close()
 
 
+@pytest.mark.parametrize("named", [{}, {"operator": ""}, {"operator": "   "}])
 async def test_a_forged_position_adjustment_with_no_operator_is_ignored(
-    venue: SimVenue, clock: ManualClock
+    venue: SimVenue, clock: ManualClock, named: dict[str, str]
 ) -> None:
     journal = MemoryJournal()
     oms = manager(venue, journal, clock)
     await oms.start()
     journal.append(
         RecordKind.POSITION_ADJUSTED,
-        json.dumps({"symbol": str(ACME), "delta": "5"}),
+        json.dumps({"symbol": str(ACME), "delta": "5", **named}),
     )
     await oms.reconcile()
     assert oms.net_position(ACME) == 0

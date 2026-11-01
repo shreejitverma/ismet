@@ -25,6 +25,7 @@ If the order manager is down, cancel at the venue directly, then reconcile on re
    A running order manager adopts it on its next reconciliation, after verifying the hash chain, and ignores one with no operator.
    In code, `OrderManager.adjust_position` does the same.
 4. Release under your own name: `ismet kill release --journal "$JOURNAL" --reason "<why>" --operator "<you>"`.
+   A blank `--reason` or `--operator` is a usage error, and every reader ignores a journalled release that names no operator.
 
 A release does not clear a cause that is still there: an unexplained position difference halts again within one reconciliation.
 
