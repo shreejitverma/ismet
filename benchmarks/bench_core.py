@@ -220,17 +220,12 @@ def main() -> int:
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         results.update(bench_journal(Path(tmp)))
         results.update(asyncio.run(bench_submit(Path(tmp))))
-    print(
-        f"{platform.platform()} {platform.processor()} python {platform.python_version()}"
-    )
-    print(
-        f"{'operation':34} {'n':>7} {'p50 us':>10} {'p99 us':>10} {'p99.9 us':>10} {'max us':>10}"
-    )
+    print(platform.platform(), platform.processor(), platform.python_version())
+    header = ("p50 us", "p99 us", "p99.9 us", "max us")
+    print(f"{'operation':34} {'n':>7}", *(f"{title:>10}" for title in header))
     for name, row in results.items():
-        print(
-            f"{name:34} {row['n']:>7} {row['p50_us']:>10} {row['p99_us']:>10} "
-            f"{row['p999_us']:>10} {row['max_us']:>10}"
-        )
+        cells = [row[key] for key in ("p50_us", "p99_us", "p999_us", "max_us")]
+        print(f"{name:34} {row['n']:>7}", *(f"{cell:>10}" for cell in cells))
     if args.json:
         args.json.write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
     if args.check:

@@ -828,3 +828,47 @@ async def test_position_index_agrees_with_a_full_recount_after_any_history(
         o.client_order_id for o in oms.orders.values() if o.is_open
     }
     assert oms.open_orders(ACME) == oms.open_orders()
+
+
+async def test_kill_switch_stays_engaged_when_the_journal_cannot_record_it(
+    venue: SimVenue, clock: ManualClock
+) -> None:
+    journal = FailingJournal()
+    oms = OrderManager(
+        venue,
+        journal,
+        RiskEngine(permissive_config()),
+        clock=clock,
+        kill_poll_interval=0.001,
+    )
+    await oms.start()
+    try:
+        journal.fail_after = 0  # reads still work and report "not engaged"
+        await oms.engage_kill("disk is failing", cancel_open=False)
+        await asyncio.sleep(0.02)  # let the poll read the journal many times
+        assert oms.kill_state.engaged
+        with pytest.raises(KillSwitchEngaged):
+            await oms.submit(order("KJ1", price="9.50"))
+        assert venue.attempts["KJ1"] == 0
+    finally:
+        await oms.abort()
+
+
+async def test_a_stale_journal_read_cannot_undo_a_local_engage(
+    oms: OrderManager, journal: SqliteJournal
+) -> None:
+    before = journal.kill_state()
+    await oms.engage_kill("halt", cancel_open=False)
+    oms._merge_kill(before)
+    assert oms.kill_state.engaged
+
+
+async def test_a_newer_release_from_another_process_is_adopted(
+    oms: OrderManager, journal_path: Path
+) -> None:
+    await oms.engage_kill("halt", cancel_open=False)
+    other = SqliteJournal(journal_path)
+    other.append(RecordKind.KILL_RELEASED, '{"reason": "ok", "operator": "ops"}')
+    other.close()
+    await oms.submit(order("KR2", price="9.50"))
+    assert not oms.kill_state.engaged

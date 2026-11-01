@@ -57,7 +57,7 @@ from ismet.errors import (
     ValidationError,
     VenueError,
 )
-from ismet.execution.journal import Journal, KillState, RecordKind
+from ismet.execution.journal import Journal, JournalRecord, KillState, RecordKind
 from ismet.execution.reconcile import BreakKind, ReconBreak, ReconReport
 from ismet.execution.risk import RiskContext, RiskEngine
 from ismet.execution.state import OrderState, apply_event, new_order
@@ -283,10 +283,10 @@ class OrderManager:
         *,
         client_order_id: str | None = None,
         unique_intent: bool = False,
-    ) -> None:
+    ) -> JournalRecord:
         text = payload if isinstance(payload, str) else json.dumps(payload, default=str)
         ts = self._clock.now()
-        await self._call_journal(
+        return await self._call_journal(
             lambda: self._journal.append(
                 kind,
                 text,
@@ -504,10 +504,11 @@ class OrderManager:
         self._kill = KillState(True, reason, operator, self._kill.seq, cancel_open)
         logger.critical("kill switch engaged by %s: %s", operator, reason)
         try:
-            await self._append(
+            record = await self._append(
                 RecordKind.KILL_ENGAGED,
                 {"reason": reason, "operator": operator, "cancel_open": cancel_open},
             )
+            self._kill = KillState(True, reason, operator, record.seq, cancel_open)
         except IsmetError as exc:
             self._journal_failed = str(exc)
             logger.critical("kill switch could not be journalled: %s", exc)
@@ -519,17 +520,25 @@ class OrderManager:
         """Allow new orders again. Requires a named operator; journalled."""
         if not operator:
             raise ValidationError("releasing the kill switch requires an operator")
-        await self._append(
+        record = await self._append(
             RecordKind.KILL_RELEASED, {"reason": reason, "operator": operator}
         )
-        self._kill = KillState(False, reason, operator, self._kill.seq)
+        self._kill = KillState(False, reason, operator, record.seq)
         logger.warning("kill switch released by %s: %s", operator, reason)
         return self._kill
 
-    async def _check_kill(self) -> None:
-        durable = await self._call_journal(self._journal.kill_state)
-        if durable.seq != self._kill.seq or durable.engaged:
+    def _merge_kill(self, durable: KillState) -> None:
+        """Adopt a kill state read from the journal only if it is newer than ours.
+
+        A read can race a local engage, and a local engage may have failed to reach
+        the journal at all. In both cases the journal looks "not engaged", and
+        believing it would silently switch the kill switch off.
+        """
+        if durable.seq > self._kill.seq:
             self._kill = durable
+
+    async def _check_kill(self) -> None:
+        self._merge_kill(await self._call_journal(self._journal.kill_state))
         if self._kill.engaged:
             raise KillSwitchEngaged(self._kill.reason)
         if self._journal_failed is not None:
@@ -539,7 +548,7 @@ class OrderManager:
         while True:
             await asyncio.sleep(self._kill_poll_interval)
             try:
-                self._kill = await self._call_journal(self._journal.kill_state)
+                self._merge_kill(await self._call_journal(self._journal.kill_state))
                 if self._kill.engaged and self._kill.cancel_open and self.open_orders():
                     await self.cancel_all()
             except asyncio.CancelledError:
@@ -703,7 +712,15 @@ class OrderManager:
             SendStarted(client_order_id=cid, ts=self._clock.now()), durable=True
         )
         self._pass("after_send_started", cid)
+        # In flight until the outcome is recorded, so reconcile cannot race the result.
         self._in_flight.add(cid)
+        try:
+            return await self._place(request)
+        finally:
+            self._in_flight.discard(cid)
+
+    async def _place(self, request: OrderRequest) -> OrderState:
+        cid = request.client_order_id
         try:
             ack = await self._venue.place_order(request)
         except AmbiguousOutcome as exc:
@@ -723,8 +740,6 @@ class OrderManager:
             # An adapter bug says nothing about delivery, so assume it may have sent.
             logger.exception("place_order failed unexpectedly for %s", cid)
             return await self._mark_unknown(cid, f"{type(exc).__name__}: {exc}")
-        finally:
-            self._in_flight.discard(cid)
         self._pass("after_venue_accept", cid)
         return await self._record(
             Acknowledged(
@@ -917,7 +932,10 @@ class OrderManager:
         while True:
             await asyncio.sleep(interval)
             elapsed += interval
-            has_unknown = any(o.status in _RESOLVE for o in self._open.values())
+            has_unknown = any(
+                o.status in _RESOLVE and o.client_order_id not in self._in_flight
+                for o in self._open.values()
+            )
             if has_unknown or elapsed >= self._reconcile_interval:
                 elapsed = 0.0
                 try:

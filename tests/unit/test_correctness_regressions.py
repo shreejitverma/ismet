@@ -12,7 +12,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 from pydantic import BaseModel, ValidationError
 
-from ismet.errors import AmbiguousOutcome, TransportError
+from ismet.errors import AmbiguousOutcome, RateLimited, TransportError
 from ismet.models import (
     AssetClass,
     Bar,
@@ -410,6 +410,19 @@ async def test_explicit_retry_policy_cannot_force_a_resend_of_a_post() -> None:
     async with HttpTransport("https://v", transport=transport) as t:
         with pytest.raises(AmbiguousOutcome):
             await t.request("POST", "/orders", retry_policy=FAST)
+    assert calls == ["POST"]
+
+
+async def test_rate_limited_post_is_not_resent_even_by_a_permissive_policy() -> None:
+    calls, transport = counting(lambda _: httpx.Response(429, text="slow down"))
+    always = RetryPolicy(
+        max_attempts=3,
+        backoff=ExponentialBackoff(base=0, jitter=False),
+        should_retry=lambda _: True,
+    )
+    async with HttpTransport("https://v", transport=transport) as t:
+        with pytest.raises(RateLimited):
+            await t.request("POST", "/orders", retry_policy=always)
     assert calls == ["POST"]
 
 
