@@ -56,9 +56,9 @@ def test_float_rejected_at_model_boundary() -> None:
         M(price=1.5)  # type: ignore[arg-type]
 
 
-def test_price_must_be_positive_and_quantity_non_negative() -> None:
-    with pytest.raises(ValidationError, match="> 0"):
-        M(price="0")
+def test_price_may_be_zero_or_negative_and_quantity_non_negative() -> None:
+    assert M(price="0").price == Decimal(0)
+    assert M(price="-37.63").price == Decimal("-37.63")
     assert M(qty="0").qty == Decimal(0)
     with pytest.raises(ValidationError, match=">= 0"):
         M(qty="-1")
@@ -91,6 +91,10 @@ def test_currency_and_mic_validation() -> None:
 
 def test_interval_seconds() -> None:
     assert Interval.M1.seconds == 60
-    assert Interval.D1.seconds == 86400
+    assert Interval.D1.seconds is None
+    assert Interval.D1.is_session_based
+    assert Interval.D1.nominal_seconds == 86400
+    assert Interval.W1.nominal_seconds == 604800
+    assert Interval.MO1.nominal_seconds is None
     assert Interval.MO1.seconds is None
     assert Interval("1h") is Interval.H1

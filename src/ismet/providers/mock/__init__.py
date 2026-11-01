@@ -229,7 +229,7 @@ class MockProvider(Provider):
             raise ValidationError("start and end must be timezone-aware")
         if start >= end:
             raise ValidationError("start must be before end")
-        seconds = interval.seconds
+        seconds = interval.nominal_seconds
         if seconds is None:
             raise ValidationError(f"interval {interval.value} is not supported")
         count = int((end - start).total_seconds() // seconds)

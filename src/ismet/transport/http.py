@@ -9,6 +9,14 @@ Every provider REST call goes through :class:`HttpTransport.request`, which:
 5. retries per the :class:`RetryPolicy` for retryable failures,
 6. invokes hooks with latency and outcome.
 
+Retries depend on whether a repeat is safe. ``GET``, ``HEAD``, and ``OPTIONS``
+are retried under the policy. Any other method is sent exactly once unless the
+caller passes ``idempotent=True``, which it may do only when the venue contract
+makes a repeat harmless. A failure that may have reached the server (read timeout,
+broken connection, 5xx) on a non-idempotent request raises
+:class:`~ismet.errors.AmbiguousOutcome`; a failure that cannot have reached it
+(connect failure, pool timeout) raises a plain :class:`~ismet.errors.TransportError`.
+
 Response bodies are decoded with ``parse_float=Decimal`` so vendor floats never
 touch a Python ``float``.
 """
@@ -24,11 +32,21 @@ from typing import Any
 import httpx
 from pydantic import SecretStr
 
-from ismet.errors import AuthError, IsmetError, RateLimited, TransportError, VenueError
-from ismet.transport.backoff import DEFAULT_RETRY, RetryPolicy, retry
+from ismet.errors import (
+    AmbiguousOutcome,
+    AuthError,
+    IsmetError,
+    RateLimited,
+    TransportError,
+    VenueError,
+)
+from ismet.transport.backoff import DEFAULT_RETRY, NO_RETRY, RetryPolicy, retry
 from ismet.transport.circuit import CircuitBreaker
 from ismet.transport.clock import SYSTEM_CLOCK, Clock
 from ismet.transport.ratelimit import RateLimiter
+
+IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+_NOT_SENT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 
 
 def loads_decimal(data: bytes | str) -> Any:
@@ -234,10 +252,19 @@ class HttpTransport:
         headers: Mapping[str, str] | None = None,
         rate_key: str | None = None,
         retry_policy: RetryPolicy | None = None,
+        idempotent: bool | None = None,
     ) -> Response:
-        """Send one logical request, with retries, and return the response."""
+        """Send one logical request and return the response.
+
+        ``idempotent`` defaults from the method. When false, the request is sent
+        once regardless of ``retry_policy``, and a possibly-delivered failure
+        raises :class:`~ismet.errors.AmbiguousOutcome`.
+        """
         await self.open()
-        policy = retry_policy or self.retry_policy
+        safe = (
+            method.upper() in IDEMPOTENT_METHODS if idempotent is None else idempotent
+        )
+        policy = (retry_policy or self.retry_policy) if safe else NO_RETRY
         attempt = 0
 
         async def once() -> Response:
@@ -245,12 +272,12 @@ class HttpTransport:
             attempt += 1
             if self.breaker is None:
                 return await self._send(
-                    method, path, params, json_body, headers, rate_key, attempt
+                    method, path, params, json_body, headers, rate_key, attempt, safe
                 )
             self.breaker.check()
             try:
                 return await self._send(
-                    method, path, params, json_body, headers, rate_key, attempt
+                    method, path, params, json_body, headers, rate_key, attempt, safe
                 )
             finally:
                 self.breaker.release_probe()
@@ -266,6 +293,7 @@ class HttpTransport:
         headers: Mapping[str, str] | None,
         rate_key: str | None,
         attempt: int,
+        safe: bool,
     ) -> Response:
         if self.rate_limiter is not None:
             await self.rate_limiter.acquire(rate_key)
@@ -275,25 +303,42 @@ class HttpTransport:
             raw = await self._client.request(
                 method, path, params=params, json=json_body, headers=headers
             )
-        except httpx.TimeoutException as exc:
-            latency = self._clock.monotonic() - started
-            err = TransportError(f"timeout: {exc}", retryable=True)
-            self._fail(method, path, attempt, latency, err)
-            raise err from exc
         except httpx.HTTPError as exc:
             latency = self._clock.monotonic() - started
-            err = TransportError(f"transport failure: {exc}", retryable=True)
+            err = self._network_error(exc, method, path, safe)
             self._fail(method, path, attempt, latency, err)
             raise err from exc
         latency = self._clock.monotonic() - started
         if not 200 <= raw.status_code < 300:
             mapped = map_response_error(raw.status_code, raw.content, raw.headers)
+            if not safe and raw.status_code >= 500:
+                mapped = AmbiguousOutcome(
+                    f"{method} {path} returned HTTP {raw.status_code}; the venue "
+                    "may have processed it",
+                    status=raw.status_code,
+                )
             self._fail(method, path, attempt, latency, mapped, raw.status_code)
             raise mapped
         if self.breaker is not None:
             self.breaker.record_success()
         self._emit(RequestInfo(method, path, attempt, latency, raw.status_code))
         return Response(raw.status_code, dict(raw.headers), raw.content, latency)
+
+    @staticmethod
+    def _network_error(
+        exc: httpx.HTTPError, method: str, path: str, safe: bool
+    ) -> TransportError:
+        kind = (
+            "timeout"
+            if isinstance(exc, httpx.TimeoutException)
+            else "transport failure"
+        )
+        if safe or isinstance(exc, _NOT_SENT_ERRORS):
+            return TransportError(f"{kind}: {exc}", retryable=safe)
+        return AmbiguousOutcome(
+            f"{method} {path} failed after it may have been sent ({kind}: {exc}); "
+            "query the venue before acting"
+        )
 
     def _fail(
         self,
@@ -329,6 +374,7 @@ class HttpTransport:
         params: Mapping[str, Any] | None = None,
         headers: Mapping[str, str] | None = None,
         rate_key: str | None = None,
+        idempotent: bool | None = None,
     ) -> Any:
         response = await self.request(
             "POST",
@@ -337,11 +383,13 @@ class HttpTransport:
             json_body=body,
             headers=headers,
             rate_key=rate_key,
+            idempotent=idempotent,
         )
         return response.json()
 
 
 __all__ = [
+    "IDEMPOTENT_METHODS",
     "BearerAuth",
     "HeaderAuth",
     "Hook",

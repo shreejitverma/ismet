@@ -53,6 +53,19 @@ class TransportError(IsmetError):
         super().__init__(message)
 
 
+class AmbiguousOutcome(TransportError):
+    """A state-changing request may or may not have reached the venue.
+
+    Raised when a non-idempotent request fails after it may have been sent: a
+    read timeout, a dropped connection, or a 5xx. The only correct response is to
+    query the venue for what happened. Resending can create a duplicate order, so
+    this error is never retried.
+    """
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message, retryable=False, status=status)
+
+
 class CircuitOpen(TransportError):
     """The circuit breaker is open; the call was not attempted."""
 
@@ -102,13 +115,64 @@ class VenueError(IsmetError):
         super().__init__(message)
 
 
+class SequenceGap(IsmetError):
+    """A stream skipped sequence numbers and the caller asked to treat it as fatal."""
+
+    def __init__(self, key: object, expected: int, received: int) -> None:
+        self.key = key
+        self.expected = expected
+        self.received = received
+        super().__init__(f"sequence gap on {key}: expected {expected}, got {received}")
+
+
+class CalendarOutOfRange(IsmetError):
+    """A calendar query fell outside the dates the calendar's data covers.
+
+    Raised instead of assuming a date outside the sourced data is a normal day.
+    """
+
+
+class RiskRejected(IsmetError):
+    """A pre-trade risk check refused an order. It was not sent."""
+
+    def __init__(self, check: str, reason: str) -> None:
+        self.check = check
+        self.reason = reason
+        super().__init__(f"risk check {check!r} rejected the order: {reason}")
+
+
+class KillSwitchEngaged(RiskRejected):
+    """The kill switch is engaged, so no new order can be sent."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__("kill_switch", reason)
+
+
+class OrderStateError(IsmetError):
+    """An order event contradicts the order's recorded state or quantities."""
+
+
+class JournalError(IsmetError):
+    """The durable order journal failed or failed verification.
+
+    Execution stops on this error: an order that cannot be journalled is not sent.
+    """
+
+
 __all__ = [
+    "AmbiguousOutcome",
     "AuthError",
+    "CalendarOutOfRange",
     "CircuitOpen",
     "ConfigError",
     "IsmetError",
+    "JournalError",
+    "KillSwitchEngaged",
     "NotSupported",
+    "OrderStateError",
     "RateLimited",
+    "RiskRejected",
+    "SequenceGap",
     "TransportError",
     "ValidationError",
     "VenueError",

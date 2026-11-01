@@ -89,24 +89,74 @@ OnConnect = Callable[["WebSocketTransport"], Awaitable[None]]
 OnState = Callable[[ConnectionState], None]
 
 
+class SequenceOutcome(str, Enum):
+    """How a sequence number relates to what was already seen."""
+
+    FIRST = "first"
+    IN_ORDER = "in_order"
+    GAP = "gap"
+    DUPLICATE = "duplicate"
+    OUT_OF_ORDER = "out_of_order"
+
+
+@dataclass(frozen=True)
+class SequenceObservation:
+    """Result of observing one sequence number.
+
+    ``missing`` is how many values were skipped on a gap, otherwise zero.
+    ``expected`` is the value that would have continued the sequence.
+    """
+
+    outcome: SequenceOutcome
+    sequence: int
+    expected: int | None
+    missing: int = 0
+
+
 class SequenceTracker:
-    """Detect gaps in a monotonically increasing sequence number."""
+    """Classify a stream of sequence numbers for one feed or symbol.
+
+    A value equal to the last is a duplicate. A value below the last is out of
+    order: it may be a late delivery of something counted as missing, so it is
+    reported separately and never lowers the high-water mark.
+    """
 
     def __init__(self) -> None:
         self.last: int | None = None
         self.gaps = 0
+        self.missing = 0
+        self.duplicates = 0
+        self.out_of_order = 0
+
+    def classify(self, sequence: int) -> SequenceObservation:
+        """Record ``sequence`` and return how it relates to the prior ones."""
+        last = self.last
+        if last is None:
+            self.last = sequence
+            return SequenceObservation(SequenceOutcome.FIRST, sequence, None)
+        expected = last + 1
+        if sequence == expected:
+            self.last = sequence
+            return SequenceObservation(SequenceOutcome.IN_ORDER, sequence, expected)
+        if sequence == last:
+            self.duplicates += 1
+            return SequenceObservation(SequenceOutcome.DUPLICATE, sequence, expected)
+        if sequence < last:
+            self.out_of_order += 1
+            return SequenceObservation(SequenceOutcome.OUT_OF_ORDER, sequence, expected)
+        missing = sequence - expected
+        self.last = sequence
+        self.gaps += 1
+        self.missing += missing
+        return SequenceObservation(SequenceOutcome.GAP, sequence, expected, missing)
 
     def observe(self, sequence: int) -> int:
         """Record ``sequence``; return the number of skipped values (0 if none)."""
-        if self.last is None:
-            self.last = sequence
-            return 0
-        gap = sequence - self.last - 1
-        self.last = max(self.last, sequence)
-        if gap > 0:
-            self.gaps += 1
-            return gap
-        return 0
+        return self.classify(sequence).missing
+
+    def reset(self) -> None:
+        """Forget the position, for a venue that restarts sequences on reconnect."""
+        self.last = None
 
 
 class WebSocketTransport:
@@ -379,6 +429,8 @@ __all__ = [
     "DEFAULT_WS_BACKOFF",
     "BackpressurePolicy",
     "ConnectionState",
+    "SequenceObservation",
+    "SequenceOutcome",
     "SequenceTracker",
     "WebSocketTransport",
     "WsStats",

@@ -4,26 +4,30 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ismet.models.types import VenueCode
+from ismet.models.types import Cusip, Figi, Isin, Sedol, VenueCode
 
 
 class Symbol(BaseModel):
     """Identity of an instrument on one venue.
 
     The pair ``(venue, ticker)`` is the primary key. Global identifiers are
-    optional and carried through when a provider supplies them. ``vendor_codes``
-    holds provider-specific handles keyed by provider name, so a provider can
+    optional and checksum-validated when present. ``vendor_codes`` holds
+    provider-specific handles keyed by provider name, so a provider can
     round-trip its own identifier without polluting the public key.
+
+    Equality and hashing use the primary key only: the same listing described
+    with and without an ISIN is the same symbol. Use :meth:`same_identifiers` to
+    detect two sources disagreeing about a listing's identifiers.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid", str_strip_whitespace=True)
 
     venue: VenueCode
     ticker: str = Field(min_length=1)
-    isin: str | None = None
-    figi: str | None = None
-    cusip: str | None = None
-    sedol: str | None = None
+    isin: Isin | None = None
+    figi: Figi | None = None
+    cusip: Cusip | None = None
+    sedol: Sedol | None = None
     vendor_codes: dict[str, str] = Field(default_factory=dict)
 
     def __str__(self) -> str:
@@ -31,6 +35,19 @@ class Symbol(BaseModel):
 
     def __hash__(self) -> int:
         return hash(self.key)
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Symbol):
+            return NotImplemented
+        return self.key == other.key
+
+    def same_identifiers(self, other: Symbol) -> bool:
+        """Whether no global identifier conflicts between the two descriptions."""
+        for name in ("isin", "figi", "cusip", "sedol"):
+            mine, theirs = getattr(self, name), getattr(other, name)
+            if mine is not None and theirs is not None and mine != theirs:
+                return False
+        return True
 
     @property
     def key(self) -> tuple[str, str]:

@@ -24,10 +24,13 @@ from ismet.capabilities import (
     StreamingCapability,
 )
 from ismet.errors import NotSupported
-from ismet.models import Bar, Instrument, Interval, MarketEvent, Symbol
+from ismet.models import Bar, BookState, Instrument, Interval, MarketEvent, Symbol
 from ismet.providers import Provider
 
 T = TypeVar("T")
+
+MAX_PLAUSIBLE_CLOCK_SKEW = timedelta(seconds=5)
+"""A venue clock this far ahead points at a broken timestamp, not ordinary skew."""
 
 
 @dataclass(frozen=True)
@@ -67,8 +70,8 @@ def _event_invariants(event: MarketEvent, instrument: Instrument | None) -> list
     problems: list[str] = []
     if event.exchange_ts.tzinfo is None or event.received_ts.tzinfo is None:
         problems.append("naive timestamp")
-    if event.exchange_ts > event.received_ts:
-        problems.append("exchange_ts after received_ts")
+    if event.clock_skew > MAX_PLAUSIBLE_CLOCK_SKEW:
+        problems.append(f"exchange_ts ahead of received_ts by {event.clock_skew}")
     if instrument is not None:
         for name in ("bid", "ask", "last", "price", "open", "high", "low", "close"):
             value = getattr(event, name, None)
@@ -175,7 +178,7 @@ async def run_conformance(
         )
         if quote is not None:
             problems = _event_invariants(quote, instrument)
-            if quote.bid is None and quote.ask is None and quote.last is None:
+            if quote.book_state is BookState.EMPTY and quote.last is None:
                 problems.append("quote has no bid, ask, or last")
             add(
                 Check(
