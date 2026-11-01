@@ -79,7 +79,7 @@ from urllib.parse import quote as url_quote
 import httpx
 
 from ismet.config import ProviderSettings
-from ismet.errors import ValidationError
+from ismet.errors import TransportError, ValidationError
 from ismet.models import (
     Bar,
     Instrument,
@@ -92,7 +92,7 @@ from ismet.models import (
 from ismet.models import Trade as TradeEvent
 from ismet.normalize import coinbase as normalize
 from ismet.normalize._common import StreamGate, check_range, merge_bars, search_rank
-from ismet.providers.base import Provider
+from ismet.providers.base import Provider, max_reconnects_option
 from ismet.transport.backoff import DEFAULT_RETRY, ExponentialBackoff, RetryPolicy
 from ismet.transport.circuit import CircuitBreaker
 from ismet.transport.clock import SYSTEM_CLOCK, Clock
@@ -201,10 +201,14 @@ class CoinbaseProvider(Provider):
 
     @classmethod
     def from_settings(cls, settings: ProviderSettings) -> CoinbaseProvider:
-        """Options: ``rest_url``, ``ws_url``. Credentials are not used."""
+        """Options: ``rest_url``, ``ws_url``, ``ws_max_reconnects``. No credentials.
+
+        With no ``ws_max_reconnects``, a stream in an outage keeps reconnecting.
+        """
         return cls(
             rest_url=settings.option("rest_url", REST_URL),
             ws_url=settings.option("ws_url", WS_URL),
+            ws_max_reconnects=max_reconnects_option(settings),
         )
 
     async def open(self) -> None:
@@ -278,7 +282,9 @@ class CoinbaseProvider(Provider):
         closed only by the time the copy was made. A copy too old to show every bucket
         that has closed by now cannot tell a missing bucket from one with no trades, so
         its bars carry :attr:`QualityFlag.STALE`, and the same request can be repeated
-        once the copy expires.
+        once the copy expires. Such a copy with no bars for a window has nothing to
+        carry the flag, and would read as no trades, so it raises a retryable
+        :class:`~ismet.errors.TransportError` instead.
         """
         ticker = self._native(symbol)
         check_range(start, end)
@@ -308,17 +314,24 @@ class CoinbaseProvider(Provider):
             )
             received = self.clock.now()
             as_of = normalize.copy_made_at(response.headers, received)
-            bars.extend(
-                normalize.bars_from_candles(
-                    response.json(),
-                    symbol,
-                    interval,
-                    received,
-                    normalize.quote_currency_of(ticker),
-                    as_of=as_of,
-                    outdated=_outdated(as_of, received, window_end, granularity),
-                )
+            outdated = _outdated(as_of, received, window_end, granularity)
+            page = normalize.bars_from_candles(
+                response.json(),
+                symbol,
+                interval,
+                received,
+                normalize.quote_currency_of(ticker),
+                as_of=as_of,
+                outdated=outdated,
             )
+            if outdated and not page:
+                raise TransportError(
+                    f"coinbase served a copy made at {as_of.isoformat()}, which "
+                    f"predates the window from {_iso(cursor)} to {_iso(window_end)}; "
+                    "repeat the request once the copy expires",
+                    retryable=True,
+                )
+            bars.extend(page)
             cursor = window_end + granularity
         return merge_bars(bars, start, end)
 

@@ -251,6 +251,25 @@ def test_cancel_rejected_returns_to_the_status_the_fills_imply() -> None:
     )
 
 
+def test_cancel_refused_during_a_replace_keeps_the_replace_pending() -> None:
+    # Worked by hand: 100 working, a replace to 150 asked, then a cancel asked and
+    # refused as "already pending". The replace is still open at the venue, so 150
+    # may go live: the state must keep judging exposure at 150 until it is answered.
+    pending = apply_event(
+        in_status(S.ACCEPTED), ReplaceRequested(**BASE, quantity="150")
+    )
+    asked = apply_event(pending, CancelRequested(**BASE))
+    after = apply_event(asked, CancelRejected(**BASE, reason="order already pending"))
+    assert after.status is S.PENDING_REPLACE
+    assert after.pending_quantity == 150 and after.leaves_quantity == 150
+    assert not after.anomalies
+    filled_within = apply_event(after, fill("F1", "120"))
+    assert not any("overfill" in a for a in filled_within.anomalies)
+    assert apply_event(after, Replaced(**BASE)).quantity == 150
+    refused = apply_event(after, ReplaceRejected(**BASE, reason="no"))
+    assert refused.status is S.ACCEPTED and refused.leaves_quantity == 100
+
+
 def test_bust_reverses_a_fill_and_asks_the_venue_after_a_full_fill() -> None:
     state = apply_event(in_status(S.ACCEPTED), fill("F1", "100"))
     assert state.status is S.FILLED

@@ -12,6 +12,9 @@ at once, which lets the suite check how fills are reported.
 ``attempts(client_order_id)``, if given, reports how many requests actually reached the
 venue or its test double, which is the only way to catch an adapter that resends
 internally.
+``arm_ambiguous_outcome()``, if given, makes the next ``place_order`` lose its answer
+after the venue or its test double may have accepted the order, so the suite can check
+that the adapter reports :class:`~ismet.errors.AmbiguousOutcome` rather than a refusal.
 """
 
 from __future__ import annotations
@@ -23,7 +26,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 
 from ismet.capabilities import AccountCapability, Capability, TradingCapability
-from ismet.errors import ConfigError, DuplicateOrderId, IsmetError, VenueError
+from ismet.errors import (
+    AmbiguousOutcome,
+    ConfigError,
+    DuplicateOrderId,
+    IsmetError,
+    VenueError,
+)
 from ismet.models.orders import (
     Environment,
     Fill,
@@ -46,6 +55,7 @@ async def run_trading_conformance(
     make_marketable_order: Callable[[str], OrderRequest] | None = None,
     attempts: Callable[[str], int] | None = None,
     unknown_status_error: type[Exception] | None = None,
+    arm_ambiguous_outcome: Callable[[], None] | None = None,
 ) -> ConformanceReport:
     """Exercise the order-entry contract and return a report.
 
@@ -53,6 +63,10 @@ async def run_trading_conformance(
     query for an order the venue does not have returns ``None``. It is for a provider
     whose ``None`` would falsely say the venue has no such order, because the only
     record it can consult is local.
+
+    Queries are made both with and without a symbol, because the order manager's fill
+    sweep asks for every symbol at once, and an adapter answering that with nothing
+    would hide a fill on a closed order.
     """
     if provider.environment is Environment.LIVE:
         raise ConfigError(
@@ -145,6 +159,15 @@ async def run_trading_conformance(
                 any(item.client_order_id == cid for item in listed),
             )
         )
+    ok, listed = await step("open_orders_without_symbol", venue.open_orders())
+    if ok:
+        add(
+            Check(
+                _CAP,
+                "open_orders_lists_order_without_symbol",
+                any(item.client_order_id == cid for item in listed),
+            )
+        )
 
     if attempts is not None:
         count = attempts(cid)
@@ -154,6 +177,10 @@ async def run_trading_conformance(
     if make_marketable_order is not None:
         await _check_fill_reporting(
             venue, make_marketable_order(f"{id_prefix}-3"), report, timeout
+        )
+    if arm_ambiguous_outcome is not None:
+        await _check_ambiguous_outcome(
+            venue, make_passive_order(f"{id_prefix}-4"), arm_ambiguous_outcome, report
         )
 
     ok, _ = await step("cancel_order", venue.cancel_order(cid, symbol))
@@ -211,6 +238,45 @@ async def _check_duplicate_refused(
         )
 
 
+async def _check_ambiguous_outcome(
+    venue: TradingCapability,
+    request: OrderRequest,
+    arm: Callable[[], None],
+    report: ConformanceReport,
+) -> None:
+    """A lost answer must surface as ``AmbiguousOutcome``, never as a refusal.
+
+    The order manager records a refusal as never delivered and closes the order. An
+    adapter that reports a lost answer that way leaves a possibly live order unwatched.
+    """
+    arm()
+    try:
+        await venue.place_order(request)
+    except AmbiguousOutcome:
+        report.checks.append(Check(_CAP, "lost_answer_is_ambiguous_outcome", True))
+    except Exception as exc:
+        report.checks.append(
+            Check(
+                _CAP,
+                "lost_answer_is_ambiguous_outcome",
+                False,
+                f"expected AmbiguousOutcome, got {type(exc).__name__}: {exc}",
+            )
+        )
+    else:
+        report.checks.append(
+            Check(
+                _CAP,
+                "lost_answer_is_ambiguous_outcome",
+                False,
+                "the armed fault did not fire",
+            )
+        )
+    finally:
+        with contextlib.suppress(IsmetError):
+            await venue.cancel_order(request.client_order_id, request.symbol)
+
+
 async def _check_stream_reports(
     venue: TradingCapability,
     make_passive_order: Callable[[str], OrderRequest],
@@ -248,9 +314,10 @@ async def _check_fill_reporting(
     report: ConformanceReport,
     timeout: float,
 ) -> None:
-    """A fill must reach the stream and the query, under one ``fill_id``.
+    """A fill must reach the stream and the query, under one ``fill_id`` and terms.
 
-    Different ids on the two channels would make reconciliation count it twice.
+    Different ids on the two channels would make reconciliation count it twice, and
+    different terms under one id would halt the order manager as a corrected fill.
     """
     stream = venue.stream_executions()
     started = datetime.now(timezone.utc) - timedelta(minutes=5)
@@ -275,7 +342,8 @@ async def _check_fill_reporting(
     except Exception as exc:
         add(Check(_CAP, "fills_since_reports_fill", False, repr(exc)))
         return
-    ids = {f.fill_id for f in fills if f.client_order_id == request.client_order_id}
+    ours = [f for f in fills if f.client_order_id == request.client_order_id]
+    ids = {f.fill_id for f in ours}
     add(Check(_CAP, "fills_since_reports_fill", bool(ids), f"{len(ids)} fills"))
     if ids:
         add(
@@ -286,6 +354,33 @@ async def _check_fill_reporting(
                 f"stream {streamed.fill_id}, query {sorted(ids)}",
             )
         )
+    for queried in ours:
+        if queried.fill_id == streamed.fill_id:
+            add(
+                Check(
+                    _CAP,
+                    "fill_terms_match_across_channels",
+                    _traded(queried) == _traded(streamed),
+                    f"stream {_traded(streamed)}, query {_traded(queried)}",
+                )
+            )
+            break
+    try:
+        everything = await asyncio.wait_for(venue.fills_since(started), timeout)
+    except Exception as exc:
+        add(Check(_CAP, "fills_since_reports_fill_without_symbol", False, repr(exc)))
+        return
+    add(
+        Check(
+            _CAP,
+            "fills_since_reports_fill_without_symbol",
+            any(f.fill_id == streamed.fill_id for f in everything),
+        )
+    )
+
+
+def _traded(fill: Fill) -> tuple[str, str, str, str]:
+    return (str(fill.symbol), fill.side.value, str(fill.price), str(fill.quantity))
 
 
 async def _first_fill_for(stream: Any, client_order_id: str) -> Fill:

@@ -62,22 +62,9 @@ class TestBothStores:
             store.allocate_outbound(message())
         assert [m.seq for m in store.messages(2, 4)] == [2, 3, 4]
 
-    def test_prune_removes_only_older_messages(self, store: FixStore) -> None:
-        store.allocate_outbound(
-            StoredMessage(0, "D", "20260309-14:30:15.122", b"11=A\x01")
-        )
-        store.allocate_outbound(message())
-        assert store.prune_messages_sent_before("20260309-14:30:15.123") == 1
-        assert [m.seq for m in store.messages(1, 10)] == [2]
-        assert store.next_outbound() == 3
-
     def test_inbound_number_moves(self, store: FixStore) -> None:
         store.set_next_inbound(42)
         assert store.next_inbound() == 42
-
-    def test_outbound_number_can_be_set_by_an_operator(self, store: FixStore) -> None:
-        store.set_next_outbound(100)
-        assert store.allocate_outbound() == 100
 
     def test_reset_starts_a_new_session(self, store: FixStore) -> None:
         store.allocate_outbound(message())
@@ -174,15 +161,27 @@ class TestQuarantine:
 
     def test_release_records_the_operator_once(self, store: FixStore) -> None:
         store.quarantine(QuarantinedMessage(5, "8", "c", "r", "t", halted=True))
-        assert store.release_quarantine("alice", "checked", "now") == 1
+        assert store.release_quarantine("alice", "checked", "now", expected=1) == 1
         store.quarantine(QuarantinedMessage(6, "8", "c", "r", "t", halted=True))
-        assert store.release_quarantine("bob", "checked too", "later") == 1
+        assert store.release_quarantine("bob", "checked too", "later", expected=1) == 1
         first, second = store.quarantined()
         assert (first.released_by, first.release_reason) == ("alice", "checked")
         assert first.released_at == "now"
         assert first.halted
         assert second.released_by == "bob"
-        assert store.release_quarantine("carol", "nothing left", "last") == 0
+        assert (
+            store.release_quarantine("carol", "nothing left", "last", expected=0) == 0
+        )
+
+    def test_release_changes_nothing_unless_the_count_matches(
+        self, store: FixStore
+    ) -> None:
+        store.quarantine(QuarantinedMessage(5, "8", "c", "r", "t", halted=True))
+        store.quarantine(QuarantinedMessage(6, "*", "c", "r", "t", halted=True))
+        assert store.release_quarantine("alice", "saw one", "now", expected=1) == 2
+        assert [q.released_by for q in store.quarantined()] == [None, None]
+        assert store.release_quarantine("alice", "saw both", "now", expected=2) == 2
+        assert [q.released_by for q in store.quarantined()] == ["alice", "alice"]
 
     def test_it_survives_a_reset_and_a_reopen(self, tmp_path: Path) -> None:
         path = tmp_path / "fix.db"

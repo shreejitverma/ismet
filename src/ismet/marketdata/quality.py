@@ -16,8 +16,8 @@ from decimal import Decimal
 from enum import Enum
 
 from ismet.errors import SequenceGap
-from ismet.models import Bar, MarketEvent, Quote, Symbol, Trade
-from ismet.models.decimals import absolute, mul, ratio, sub
+from ismet.models import Bar, MarketEvent, OrderBook, Quote, Symbol, Trade
+from ismet.models.decimals import absolute, add, mul, ratio, sub
 from ismet.models.types import QualityFlag
 from ismet.transport.ws import SequenceObservation, SequenceOutcome, SequenceTracker
 
@@ -58,7 +58,8 @@ class SequenceGuard:
     per event, and many venue feeds show a subset of a wider sequence. With ``gated``
     the adapter has already applied its venue's own rule, so this guard only acts on
     the flags the adapter set and never reads a jump as a gap. Such a gap reports
-    ``missing`` as 0, because the count is the adapter's and is in its log.
+    ``missing`` as 0 and ``expected`` as the number received, because the adapter
+    judged the loss by its own numbering, and its log has the count.
     """
 
     def __init__(
@@ -70,7 +71,6 @@ class SequenceGuard:
     ) -> None:
         self.policy = policy
         self._gated = gated
-        self._last_gated: dict[Symbol, int] = {}
         self.stats = StreamStats()
         self._on_gap = on_gap
         self._trackers: dict[Symbol, SequenceTracker] = {}
@@ -105,17 +105,10 @@ class SequenceGuard:
         number = event.sequence
         if QualityFlag.OUT_OF_ORDER in event.quality:
             self.stats.out_of_order += 1
-        if number is not None:
-            if QualityFlag.AFTER_GAP in event.quality:
-                self.stats.gaps += 1
-                last = self._last_gated.get(event.symbol)
-                expected = number if last is None else last + 1
-                self._report_gap(
-                    event.symbol,
-                    SequenceObservation(SequenceOutcome.GAP, number, expected),
-                )
-            self._last_gated[event.symbol] = max(
-                number, self._last_gated.get(event.symbol, number)
+        if number is not None and QualityFlag.AFTER_GAP in event.quality:
+            self.stats.gaps += 1
+            self._report_gap(
+                event.symbol, SequenceObservation(SequenceOutcome.GAP, number, number)
             )
         self.stats.delivered += 1
         return event
@@ -199,11 +192,18 @@ class QualityMonitor:
     def _price_of(event: MarketEvent) -> Decimal | None:
         if isinstance(event, Trade):
             return event.price
+        if isinstance(event, Bar):
+            return event.close
         if isinstance(event, Quote):
-            for price in (event.mid, event.last, event.bid, event.ask):
-                if price is not None:
-                    return price
-        return None
+            prices = (event.mid, event.last, event.bid, event.ask)
+        elif isinstance(event, OrderBook):
+            bid = event.best_bid.price if event.best_bid else None
+            ask = event.best_ask.price if event.best_ask else None
+            mid = ratio(add(bid, ask), Decimal(2)) if bid and ask else None
+            prices = (mid, bid, ask, None)
+        else:
+            return None
+        return next((price for price in prices if price is not None), None)
 
     def observe(self, event: MarketEvent) -> list[QualityIssue]:
         """Record ``event`` and return anything wrong with it."""
@@ -218,6 +218,12 @@ class QualityMonitor:
                     symbol,
                     Issue.STALE,
                     f"event is {age.total_seconds():.1f}s old on arrival",
+                )
+            )
+        elif QualityFlag.STALE in event.flags:
+            issues.append(
+                QualityIssue(
+                    symbol, Issue.STALE, "the source declared this event stale"
                 )
             )
         if event.clock_skew > limits.max_clock_skew:

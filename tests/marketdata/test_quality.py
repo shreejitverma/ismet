@@ -12,7 +12,16 @@ from ismet.marketdata import (
     QualityMonitor,
     SequenceGuard,
 )
-from ismet.models import Bar, Interval, QualityFlag, Quote, Symbol, Trade
+from ismet.models import (
+    Bar,
+    Interval,
+    Level,
+    OrderBook,
+    QualityFlag,
+    Quote,
+    Symbol,
+    Trade,
+)
 
 D = Decimal
 TS = datetime(2026, 3, 9, 15, 0, tzinfo=timezone.utc)
@@ -195,7 +204,9 @@ def test_a_gated_guard_reads_the_flags_and_never_a_jump() -> None:
     assert guard.stats.gaps == 0
     with pytest.raises(SequenceGap) as caught:
         guard.admit(flagged(1000, QualityFlag.AFTER_GAP))
-    assert (caught.value.expected, caught.value.received) == (901, 1000)
+    # The adapter counted the loss by its own numbering, so nothing here can say which
+    # number was expected. A figure derived from the sequence would be invented.
+    assert (caught.value.expected, caught.value.received) == (1000, 1000)
     assert guard.stats.gaps == 1
 
 
@@ -208,3 +219,66 @@ def test_a_gated_guard_counts_what_the_adapter_flagged_and_drops_nothing() -> No
     assert seen == [5]
     assert guard.stats.out_of_order == 1
     assert guard.stats.delivered == 3
+
+
+def _bar(close: str, *flags: QualityFlag, received: datetime = TS) -> Bar:
+    return Bar(
+        symbol=SYM,
+        exchange_ts=TS - timedelta(minutes=1),
+        received_ts=received,
+        interval=Interval.M1,
+        open=close,
+        high=close,
+        low=close,
+        close=close,
+        volume="1",
+        quality=frozenset(flags),
+    )
+
+
+def test_a_bar_close_far_from_the_last_one_is_an_outlier() -> None:
+    monitor = QualityMonitor()
+    assert monitor.observe(_bar("100")) == []
+    assert [i.issue for i in monitor.observe(_bar("1000"))] == [Issue.OUTLIER]
+
+
+def test_a_book_mid_far_from_the_last_price_is_an_outlier() -> None:
+    monitor = QualityMonitor()
+    monitor.observe(trade(1, price="100"))
+    book = OrderBook(
+        symbol=SYM,
+        exchange_ts=TS,
+        received_ts=TS,
+        bids=(Level(price="999", size="1"),),
+        asks=(Level(price="1001", size="1"),),
+    )
+    issues = monitor.observe(book)
+    assert [i.issue for i in issues] == [Issue.OUTLIER]
+    assert "1000" in issues[0].detail
+
+
+def test_a_one_sided_book_and_an_empty_book_are_handled() -> None:
+    monitor = QualityMonitor()
+    monitor.observe(trade(1, price="100"))
+    one_sided = OrderBook(
+        symbol=SYM,
+        exchange_ts=TS,
+        received_ts=TS,
+        asks=(Level(price="1001", size="1"),),
+    )
+    assert [i.issue for i in monitor.observe(one_sided)] == [Issue.OUTLIER]
+    empty = OrderBook(symbol=SYM, exchange_ts=TS, received_ts=TS)
+    assert monitor.observe(empty) == []
+
+
+def test_a_bar_the_adapter_declared_stale_is_reported_stale() -> None:
+    monitor = QualityMonitor()
+    issues = monitor.observe(_bar("100", QualityFlag.STALE))
+    assert [i.issue for i in issues] == [Issue.STALE]
+    assert issues[0].detail == "the source declared this event stale"
+
+
+def test_an_event_both_old_and_declared_stale_is_reported_once() -> None:
+    monitor = QualityMonitor()
+    old = _bar("100", QualityFlag.STALE, received=TS + timedelta(minutes=5))
+    assert [i.issue for i in monitor.observe(old)] == [Issue.STALE]

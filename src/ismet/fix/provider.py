@@ -27,11 +27,14 @@ What FIX does and does not offer, and how this provider handles each:
   uses one of those; if not, override :meth:`FixDialect.is_unknown_order`. A timeout, a
   session Reject, or any other reject raises and never returns ``None``. The one other
   case that cannot be asked is an order with no row in the store: FIX requires Side,
-  which only that row holds. It raises rather than returning ``None``, because a wiped
-  or misconfigured store must not make a live order look dead. This is a declared
-  exception to the trading conformance check ``status_none_when_not_found``. An order
-  whose process died between the order manager's ``send_started`` and this row stays
-  ``UNKNOWN`` until an operator resolves it.
+  which only that row holds. The row is written before the order's bytes, so when the
+  store was already in use before this provider opened it, no row proves the order
+  never left, and the query returns ``None`` without sending anything. That is how an
+  order whose process died between the order manager's ``send_started`` and this row
+  is closed. A store with no history, such as a new empty file, proves nothing, and a
+  wiped or misconfigured store must not make a live order look dead, so the query
+  raises instead. That is a declared exception to the trading conformance check
+  ``status_none_when_not_found``.
 - ``cancel_order`` and ``amend_order`` send F and G under a fresh ClOrdID, as FIX
   requires, with OrigClOrdID naming the last accepted one. The chain is durable, so a
   report under any of its ClOrdIDs maps back to the caller's client order id. They wait
@@ -53,8 +56,10 @@ What FIX does and does not offer, and how this provider handles each:
   durably, its order is restated as ``UNKNOWN``, and the stream raises
   :class:`ReportQuarantinedError`, on every subscribe and across restarts, until an
   operator calls :meth:`FixProvider.release_quarantine`, which is recorded in the store.
-  The order manager then refuses new orders and its reconciliation compares CumQty with
-  the venue. This fails closed: one malformed report stops new orders on this provider.
+  ``place_order`` and ``amend_order`` refuse with the same error meanwhile, so the first
+  order after a restart cannot leave before a stream has read the halt. The order
+  manager then refuses new orders and its reconciliation compares CumQty with the
+  venue. This fails closed: one malformed report stops new orders on this provider.
   A report with only a field defect such as an empty Text is applied and then rejected.
   A SequenceReset-Reset that skips numbers, or a peer's unrequested sequence reset, can
   hide fills the same way and stops the stream the same way.
@@ -77,7 +82,7 @@ import hashlib
 import logging
 import ssl as ssl_module
 from collections import OrderedDict, deque
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -94,7 +99,6 @@ from ismet.errors import (
     AmbiguousOutcome,
     ConfigError,
     DuplicateOrderId,
-    IsmetError,
     TransportError,
     ValidationError,
     VenueError,
@@ -108,6 +112,9 @@ from ismet.fix.message import (
     parse_utc_timestamp,
 )
 from ismet.fix.session import (
+    REJECT_INCORRECT_FORMAT,
+    REJECT_REQUIRED_TAG_MISSING,
+    REJECT_VALUE_INCORRECT,
     ApplicationRejectError,
     FieldValue,
     FixSession,
@@ -156,10 +163,6 @@ logger = logging.getLogger("ismet.fix")
 
 T = TypeVar("T")
 Fields = list[tuple[int, FieldValue]]
-
-_REJECT_REQUIRED_TAG = 1
-_REJECT_BAD_VALUE = 5
-_REJECT_BAD_FORMAT = 6
 
 _HEADER_TAGS = frozenset({34, 43, 49, 50, 52, 56, 57, 97, 115, 116, 122, 128, 129})
 _BACKLOG_LIMIT = 100_000
@@ -402,10 +405,12 @@ class _Sent:
 class FixProvider(Provider):
     """Trading over one FIX session. See the module docstring for the semantics.
 
-    Subclass to name a venue (``name`` and ``venues``) or to pass a :class:`FixDialect`.
-    ``environment`` stays ``LIVE`` unless the caller says otherwise, so the order
-    manager demands ``allow_live`` by default. A store outlives its provider, and the
-    caller closes it, unless it came from :meth:`from_settings`.
+    An order goes out as Symbol(55) with no venue, so the session itself decides where
+    it trades. The provider serves only the venues declared for it, in the ``venues``
+    class attribute of a subclass or the ``venues`` argument, and refuses the rest
+    before the wire. ``environment`` stays ``LIVE`` unless the caller says otherwise,
+    so the order manager demands ``allow_live`` by default. A store outlives its
+    provider, and the caller closes it, unless it came from :meth:`from_settings`.
     """
 
     name: ClassVar[str] = "fix"
@@ -420,10 +425,12 @@ class FixProvider(Provider):
         query_timeout: float = 10.0,
         logon_timeout: float = 30.0,
         environment: Environment = Environment.LIVE,
+        venues: Iterable[str] = (),
         clock: Clock = SYSTEM_CLOCK,
     ) -> None:
         super().__init__(clock=clock)
         self.environment = environment
+        self._venues = type(self).venues | frozenset(v.upper() for v in venues)
         chosen = dialect or FixDialect()
         if config.begin_string == "FIX.4.2":
             # TimeInForce 7 (at the close) was added in FIX 4.3.
@@ -449,22 +456,21 @@ class FixProvider(Provider):
         self._failure: Exception | None = None
         self._request_counter = 0
         self._begin_string = config.begin_string
-        self.dropped_reports = 0
-        """Reports that could not be mapped. Reconciliation is what recovers them."""
+        self._store_in_use = False
 
     @classmethod
     def from_settings(cls, settings: ProviderSettings) -> FixProvider:
         """Build from settings.
 
         Options: ``host``, ``port``, ``begin_string``, ``sender_comp_id``,
-        ``target_comp_id``, ``store_path``, and optionally ``heartbeat_interval``,
-        ``default_appl_ver_id``, ``tls``. Credentials: ``username`` and ``password``, if
-        the venue uses them. ``environment`` may be ``simulated`` or ``paper`` to opt
-        out of LIVE.
+        ``target_comp_id``, ``store_path``, and optionally ``venues``, a list of the
+        MICs this session trades on, ``heartbeat_interval``, ``default_appl_ver_id``,
+        ``tls``. Credentials: ``username`` and ``password``, if the venue uses them.
+        ``environment`` may be ``simulated`` or ``paper`` to opt out of LIVE.
 
         Credentials are refused without ``tls = true``, because Logon would carry them
-        in clear. Set ``allow_plaintext_credentials = true`` when a stunnel or VPN
-        protects the connection.
+        in clear. A connection that a tunnel protects needs a :class:`FixSessionConfig`
+        built directly, which chooses its own ``ssl``.
         """
         missing = [
             key
@@ -485,15 +491,15 @@ class FixProvider(Provider):
         username = settings.credentials.get("username")
         password = settings.credentials.get("password")
         tls = settings.option("tls", False) is True
-        if (
-            (username is not None or password is not None)
-            and not tls
-            and settings.option("allow_plaintext_credentials", False) is not True
-        ):
+        if (username is not None or password is not None) and not tls:
             raise ConfigError(
                 f"provider {settings.name!r} would send credentials in clear; set the "
-                "option tls = true, or allow_plaintext_credentials = true if a tunnel "
-                "protects the connection"
+                "option tls = true"
+            )
+        venues = settings.option("venues", [])
+        if not isinstance(venues, list) or not all(isinstance(v, str) for v in venues):
+            raise ConfigError(
+                f"provider {settings.name!r} option venues must be a list of MICs"
             )
         config = FixSessionConfig(
             host=str(settings.option("host")),
@@ -512,6 +518,7 @@ class FixProvider(Provider):
             config,
             store,
             environment=Environment(settings.option("environment", "live")),
+            venues=venues,
         )
         provider._owns_store = True
         return provider
@@ -520,9 +527,13 @@ class FixProvider(Provider):
     def session(self) -> FixSession:
         return self._session
 
+    def serves(self, venue: str) -> bool:
+        return venue.upper() in self._venues
+
     def __repr__(self) -> str:
         return (
             f"{type(self).__name__}(name={self.name!r}, "
+            f"venues={sorted(self._venues)}, "
             f"session={self._session.config.session_id!r}, "
             f"state={self._session.state.value!r})"
         )
@@ -532,8 +543,22 @@ class FixProvider(Provider):
     async def open(self) -> None:
         """Connect and log on. Raises if the session cannot become ready in time."""
         self._failure = None
+        self._store_in_use = await self._store_call(self._store_has_history)
         await self._session.start()
         await self._session.wait_ready(self._logon_timeout)
+
+    def _store_has_history(self) -> bool:
+        """Whether this session used the store before this provider opened it.
+
+        Every logon consumes an outbound number and a confirmed reset is recorded, so
+        a store with neither has never carried an order.
+        """
+        store = self._store
+        return (
+            store.next_outbound() > 1
+            or store.next_inbound() > 1
+            or store.reset_period() is not None
+        )
 
     async def close(self) -> None:
         """Log out and stop. Open orders stay working at the venue. Idempotent."""
@@ -630,12 +655,11 @@ class FixProvider(Provider):
 
     async def _quarantine(self, message: FixMessage, reason: str) -> None:
         """Record a message that will never be redelivered, and stop if it mattered."""
-        self.dropped_reports += 1
         text = self._session.scrub(reason)
         logger.critical("FIX message type %s quarantined: %s", message.msg_type, text)
         halted = message.msg_type == "8" and not self._is_status(message)
         record = QuarantinedMessage(
-            parse_seq_num(message.get(_TAG_MSG_SEQ_NUM) or "0"),
+            _reference(message.get(_TAG_MSG_SEQ_NUM)) or 0,
             message.msg_type,
             self._session.scrub(repr(message)),
             text,
@@ -669,19 +693,48 @@ class FixProvider(Provider):
 
     async def quarantined(self) -> list[QuarantinedMessage]:
         """Every message that consumed a sequence number without being applied."""
-        return await self._read_durable(self._store.quarantined)
+        return await self._store_call(self._store.quarantined)
 
-    async def release_quarantine(self, *, operator: str, reason: str) -> int:
+    async def _held(self) -> list[QuarantinedMessage]:
+        """The halting rows no operator has released."""
+        return [
+            q
+            for q in await self._store_call(self._store.quarantined)
+            if q.halted and q.released_by is None
+        ]
+
+    async def _refuse_while_halted(self) -> None:
+        """New exposure waits for the operator, whether or not a stream has said so."""
+        held = await self._held()
+        if held:
+            raise ReportQuarantinedError(
+                f"{len(held)} quarantined FIX messages await release: {held[0].reason}"
+            )
+
+    async def release_quarantine(
+        self, *, operator: str, reason: str, expected: int
+    ) -> int:
         """An operator has dealt with the quarantine, so the stream may run again.
 
-        Durable, and the operator is recorded. Returns how many rows were released.
+        ``expected`` is how many unreleased rows the operator saw in
+        :meth:`quarantined`. The release is refused, and nothing changes, if the count
+        differs, because a row that arrived meanwhile was never checked. Durable, and
+        the operator is recorded. Returns how many rows were released.
         """
         if not operator.strip():
             raise ValidationError("releasing the FIX quarantine requires an operator")
         at = self.clock.now().isoformat()
-        return await self._read_durable(
-            lambda: self._store.release_quarantine(operator, reason, at)
+        found = await self._store_call(
+            lambda: self._store.release_quarantine(
+                operator, reason, at, expected=expected
+            )
         )
+        if found != expected:
+            raise ValidationError(
+                f"{found} unreleased quarantined FIX messages, not {expected}; read "
+                "quarantined() again and check each before releasing"
+            )
+        return found
 
     async def _on_other_message(self, message: FixMessage) -> None:
         msg_type = message.msg_type
@@ -723,10 +776,32 @@ class FixProvider(Provider):
     # Store helpers
 
     async def _load(self, client_order_id: str) -> _Record | None:
-        payload = await self._session.run_store(
-            lambda: self._store.get_order(client_order_id)
+        """The order's row, from inside the session's own handling of a message."""
+        return _record_of(
+            await self._session.run_store(
+                lambda: self._store.get_order(client_order_id)
+            )
         )
-        return None if payload is None else _Record.model_validate_json(payload)
+
+    async def _lookup(self, client_order_id: str) -> _Record | None:
+        """The order's row, for a caller's request."""
+        return _record_of(
+            await self._store_call(lambda: self._store.get_order(client_order_id))
+        )
+
+    async def _store_call(self, fn: Callable[[], T]) -> T:
+        """A store call for a caller's request. Works with the session stopped too.
+
+        A failed store is a non-retryable :class:`TransportError`: nothing is sent or
+        answered until it reads and writes again.
+        """
+        try:
+            try:
+                return await self._session.run_store(fn)
+            except SessionDownError:
+                return fn()
+        except FixStoreError as exc:
+            raise TransportError(f"FIX store failed: {exc}", retryable=False) from exc
 
     async def _save(self, record: _Record) -> None:
         payload = record.model_dump_json()
@@ -758,7 +833,7 @@ class FixProvider(Provider):
             return parse_decimal(raw, tag)
         except FieldFormatError as exc:
             raise ApplicationRejectError(
-                _REJECT_BAD_FORMAT, f"tag {tag} is not a decimal", tag
+                REJECT_INCORRECT_FORMAT, f"tag {tag} is not a decimal", tag
             ) from exc
 
     def _transact_time(self, message: FixMessage) -> datetime:
@@ -769,7 +844,7 @@ class FixProvider(Provider):
             return parse_utc_timestamp(raw, _TAG_TRANSACT_TIME)
         except FieldFormatError as exc:
             raise ApplicationRejectError(
-                _REJECT_BAD_FORMAT,
+                REJECT_INCORRECT_FORMAT,
                 "TransactTime is not a timestamp",
                 _TAG_TRANSACT_TIME,
             ) from exc
@@ -780,9 +855,9 @@ class FixProvider(Provider):
 
     def _require(self, message: FixMessage, tag: int) -> str:
         value = message.get(tag)
-        if value is None:
+        if not value:  # absent, or present with no value
             raise ApplicationRejectError(
-                _REJECT_REQUIRED_TAG, f"required tag {tag} is missing", tag
+                REJECT_REQUIRED_TAG_MISSING, f"required tag {tag} is missing", tag
             )
         return value
 
@@ -990,7 +1065,7 @@ class FixProvider(Provider):
                 )
                 if status is None:
                     raise ApplicationRejectError(
-                        _REJECT_BAD_VALUE, "unknown OrdStatus", _TAG_ORD_STATUS
+                        REJECT_VALUE_INCORRECT, "unknown OrdStatus", _TAG_ORD_STATUS
                     )
                 return [
                     Restated(
@@ -1003,8 +1078,17 @@ class FixProvider(Provider):
                 ]
         except pydantic.ValidationError as exc:
             raise ApplicationRejectError(
-                _REJECT_BAD_VALUE, "report fails validation"
+                REJECT_VALUE_INCORRECT, "report fails validation"
             ) from exc
+        quantity = self._decimal(message, _TAG_LAST_QTY)
+        if quantity is not None and quantity != 0:
+            # Nothing above books it, and committing the ExecID as seen would make the
+            # venue's readable redelivery look like a repeat.
+            raise ApplicationRejectError(
+                REJECT_VALUE_INCORRECT,
+                f"ExecType {exec_type} with LastQty {quantity} cannot be applied",
+                _TAG_EXEC_TYPE,
+            )
         if exec_type not in ("A", "6", "E", "7", "9", "B"):
             logger.warning("FIX ExecType %s has no order event", exec_type)
         return []
@@ -1053,21 +1137,21 @@ class FixProvider(Provider):
         quantity = self._decimal(message, _TAG_LAST_QTY)
         if quantity is None:
             raise ApplicationRejectError(
-                _REJECT_REQUIRED_TAG, "LastQty missing on a fill", _TAG_LAST_QTY
+                REJECT_REQUIRED_TAG_MISSING, "LastQty missing on a fill", _TAG_LAST_QTY
             )
         if quantity == 0:
             return None
         price = self._decimal(message, _TAG_LAST_PX)
         if price is None:
             raise ApplicationRejectError(
-                _REJECT_REQUIRED_TAG, "LastPx missing on a fill", _TAG_LAST_PX
+                REJECT_REQUIRED_TAG_MISSING, "LastPx missing on a fill", _TAG_LAST_PX
             )
         side = self.dialect.side_of(message.get(_TAG_SIDE, "") or "")
         if side is None and record is not None:
             side = record.side
         if side is None:
             raise ApplicationRejectError(
-                _REJECT_BAD_VALUE, "Side has no direction", _TAG_SIDE
+                REJECT_VALUE_INCORRECT, "Side has no direction", _TAG_SIDE
             )
         symbol = self._symbol_of(record)
         fee: Decimal | None = None
@@ -1095,7 +1179,7 @@ class FixProvider(Provider):
     def _symbol_of(self, record: _Record | None) -> Symbol:
         if record is None:
             raise ApplicationRejectError(
-                _REJECT_BAD_VALUE,
+                REJECT_VALUE_INCORRECT,
                 "report on an order this session never sent",
                 _TAG_CLIENT_ORDER_ID,
             )
@@ -1186,7 +1270,7 @@ class FixProvider(Provider):
                     TransportError(f"FIX status report is malformed: {detail}")
                 )
             raise ApplicationRejectError(
-                _REJECT_BAD_VALUE, "status report is malformed"
+                REJECT_VALUE_INCORRECT, "status report is malformed"
             ) from exc
         if record is not None:
             updated = record.model_copy(
@@ -1210,25 +1294,25 @@ class FixProvider(Provider):
         status = self._status_from(code, record)
         if status is None:
             raise ApplicationRejectError(
-                _REJECT_BAD_VALUE, "unknown OrdStatus", _TAG_ORD_STATUS
+                REJECT_VALUE_INCORRECT, "unknown OrdStatus", _TAG_ORD_STATUS
             )
         quantity = self._decimal(message, _TAG_ORDER_QTY)
         if quantity is None or quantity <= 0:
             if record is None:
                 raise ApplicationRejectError(
-                    _REJECT_REQUIRED_TAG, "OrderQty missing", _TAG_ORDER_QTY
+                    REJECT_REQUIRED_TAG_MISSING, "OrderQty missing", _TAG_ORDER_QTY
                 )
             quantity = record.quantity
         filled = self._decimal(message, _TAG_CUM_QTY)
         if filled is None:
             raise ApplicationRejectError(
-                _REJECT_REQUIRED_TAG, "CumQty missing", _TAG_CUM_QTY
+                REJECT_REQUIRED_TAG_MISSING, "CumQty missing", _TAG_CUM_QTY
             )
         side = self.dialect.side_of(message.get(_TAG_SIDE) or "")
         if side is None:
             if record is None:
                 raise ApplicationRejectError(
-                    _REJECT_BAD_VALUE, "Side has no direction", _TAG_SIDE
+                    REJECT_VALUE_INCORRECT, "Side has no direction", _TAG_SIDE
                 )
             side = record.side
         price = self._limit_price_of(message, record)
@@ -1257,7 +1341,6 @@ class FixProvider(Provider):
         root = await self._resolve(wire_id, message.get(_TAG_ORIG_CLIENT_ORDER_ID))
         if root is None:
             logger.error("FIX OrderCancelReject for an unknown ClOrdID")
-            self.dropped_reports += 1
             return
         replace = message.get(_TAG_CXL_REJ_RESPONSE_TO) == "2"
         self._publish_reject(
@@ -1289,7 +1372,6 @@ class FixProvider(Provider):
             )
             if root is None or kind is None:
                 logger.error("FIX BusinessMessageReject matches no request: %s", text)
-                self.dropped_reports += 1
                 return
             sent = _Sent(kind, root, ref_id or root)
         self._reject_sent(pending, sent, text, code)
@@ -1393,8 +1475,10 @@ class FixProvider(Provider):
     def _check_supported(self, request: OrderRequest) -> None:
         dialect = self.dialect
         problem: str | None = None
-        if self.venues and not self.serves(request.symbol.venue):
-            problem = f"venue {request.symbol.venue}, which FIX cannot route to"
+        if not self.serves(request.symbol.venue):
+            problem = (
+                f"venue {request.symbol.venue}, which this provider does not serve"
+            )
         elif request.order_type not in dialect.ord_type_codes:
             problem = f"order type {request.order_type.value}"
         elif request.time_in_force not in dialect.tif_codes:
@@ -1466,11 +1550,7 @@ class FixProvider(Provider):
         cid = request.client_order_id
         self._check_supported(request)
         self._require_session()
-        if await self._load_or_transport_error(cid) is not None:
-            raise DuplicateOrderId(
-                f"client order id {cid} was already sent on this session; not resent",
-                code="DUPLICATE_CLIENT_ORDER_ID",
-            )
+        await self._refuse_while_halted()
         record = _Record(
             client_order_id=cid,
             symbol=request.symbol,
@@ -1497,12 +1577,16 @@ class FixProvider(Provider):
             self._store.put_order(cid, payload)
             self._store.link_wire_id(cid, cid)
 
-        try:
-            await self._session.run_store(remember)
-        except FixStoreError as exc:
-            raise TransportError(
-                f"FIX store failed, order not sent: {exc}", retryable=False
-            ) from exc
+        # The duplicate check and the row are one step under the lock, so two callers
+        # racing on one id cannot both pass the check.
+        async with self._records_lock:
+            if await self._lookup(cid) is not None:
+                raise DuplicateOrderId(
+                    f"client order id {cid} was already sent on this session; "
+                    "not resent",
+                    code="DUPLICATE_CLIENT_ORDER_ID",
+                )
+            await self._store_call(remember)
         pending = self._new_pending(_Kind.NEW, cid, cid, cid)
         try:
             result = await asyncio.wait_for(
@@ -1526,16 +1610,10 @@ class FixProvider(Provider):
         assert isinstance(result, OrderAck)
         return result
 
-    async def _load_or_transport_error(self, client_order_id: str) -> _Record | None:
-        try:
-            return await self._load(client_order_id)
-        except FixStoreError as exc:
-            raise TransportError(f"FIX store failed: {exc}", retryable=False) from exc
-
     async def _next_wire_id(self, client_order_id: str) -> tuple[_Record, str]:
         """Take the order's next ClOrdID, atomically with respect to its reports."""
         async with self._records_lock:
-            record = await self._load_or_transport_error(client_order_id)
+            record = await self._lookup(client_order_id)
             if record is None:
                 raise VenueError(
                     _no_record_text(client_order_id), code="NO_LOCAL_RECORD"
@@ -1551,12 +1629,7 @@ class FixProvider(Provider):
                 )
                 self._store.link_wire_id(wire_id, client_order_id)
 
-            try:
-                await self._session.run_store(remember)
-            except FixStoreError as exc:
-                raise TransportError(
-                    f"FIX store failed, change not sent: {exc}", retryable=False
-                ) from exc
+            await self._store_call(remember)
         return updated, wire_id
 
     async def _request_change(
@@ -1606,6 +1679,7 @@ class FixProvider(Provider):
     ) -> None:
         """Send OrderCancelReplaceRequest(G) and wait for the first answer."""
         self._require_session()
+        await self._refuse_while_halted()  # a replacement can raise exposure
         record, wire_id = await self._next_wire_id(client_order_id)
         fields: Fields = [
             (_TAG_ORIG_CLIENT_ORDER_ID, record.wire_id),
@@ -1626,8 +1700,15 @@ class FixProvider(Provider):
         self, client_order_id: str, symbol: Symbol
     ) -> VenueOrderSnapshot | None:
         """Ask the venue about an order. See the module docstring for ``None``."""
-        record = await self._load_or_transport_error(client_order_id)
+        record = await self._lookup(client_order_id)
         if record is None:
+            if self._store_in_use:
+                logger.warning(
+                    "FIX has no row for %s in a store that was in use, so it was "
+                    "never sent",
+                    client_order_id,
+                )
+                return None
             raise TransportError(_no_record_text(client_order_id), retryable=False)
         self._require_session()
         self._request_counter += 1
@@ -1660,7 +1741,7 @@ class FixProvider(Provider):
         self, symbol: Symbol | None = None
     ) -> list[VenueOrderSnapshot]:
         """Working orders from the local record. See the module docstring."""
-        payloads = await self._store_read(self._store.open_orders)
+        payloads = await self._store_call(self._store.open_orders)
         snapshots: list[VenueOrderSnapshot] = []
         for payload in payloads:
             record = _Record.model_validate_json(payload)
@@ -1691,7 +1772,7 @@ class FixProvider(Provider):
         A fill counts if either the venue's time or our receipt time is at or after
         ``since``, so a venue clock behind ours cannot hide a recovered fill.
         """
-        executions = await self._store_read(
+        executions = await self._store_call(
             partial(self._store.fills_since, _epoch_us(since))
         )
         fills: list[Fill] = []
@@ -1703,22 +1784,6 @@ class FixProvider(Provider):
                 fills.append(fill)
         fills.sort(key=lambda f: f.ts)
         return fills
-
-    async def _store_read(self, fn: Callable[[], T]) -> T:
-        try:
-            return await self._session.run_store(fn)
-        except IsmetError as exc:
-            raise TransportError(f"FIX store read failed: {exc}") from exc
-
-    async def _read_durable(self, fn: Callable[[], T]) -> T:
-        """A store call that also works before the session starts or after it stops."""
-        try:
-            try:
-                return await self._session.run_store(fn)
-            except SessionDownError:
-                return fn()
-        except IsmetError as exc:
-            raise TransportError(f"FIX store read failed: {exc}") from exc
 
     def _replayed_bust(self, execution: StoredExecution) -> FillBusted:
         return FillBusted(
@@ -1742,17 +1807,8 @@ class FixProvider(Provider):
         while self._backlog:
             queue.put_nowait(self._backlog.popleft())
         try:
-            held = [
-                q
-                for q in await self._read_durable(self._store.quarantined)
-                if q.halted and q.released_by is None
-            ]
-            if held:
-                raise ReportQuarantinedError(
-                    f"{len(held)} quarantined FIX messages await release: "
-                    f"{held[0].reason}"
-                )
-            for execution in await self._read_durable(self._store.busted_executions):
+            await self._refuse_while_halted()
+            for execution in await self._store_call(self._store.busted_executions):
                 queue.put_nowait(self._replayed_bust(execution))
             if self._failure is not None:
                 queue.put_nowait(self._failure)
@@ -1777,6 +1833,10 @@ def _reference(text: str | None) -> int | None:
         return parse_seq_num(text)
     except FieldFormatError:
         return None
+
+
+def _record_of(payload: str | None) -> _Record | None:
+    return None if payload is None else _Record.model_validate_json(payload)
 
 
 def _no_record_text(client_order_id: str) -> str:

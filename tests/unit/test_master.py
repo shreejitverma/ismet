@@ -256,7 +256,31 @@ def test_regular_and_special_dividends_on_one_day_both_apply() -> None:
     regular = CorporateAction(ActionKind.CASH_DIVIDEND, date(2026, 3, 2), amount=D(1))
     special = CorporateAction(ActionKind.CASH_DIVIDEND, date(2026, 3, 2), amount=D(4))
     adjusted = adjust_bars(bars, [regular, special], include_dividends=True)[0]
-    assert adjusted.close == D("100") * D("0.99") * D("0.96")
+    # The ratio method on the day's total: (100 - 5) / 100 of the close.
+    assert adjusted.close == D("95")
+
+
+def test_same_day_dividends_above_the_close_together_are_refused() -> None:
+    """60 and 50 pass one at a time, but 110 cannot come off a close of 100."""
+    bars = [bar(date(2026, 2, 27), "100")]
+    ex_date = date(2026, 3, 2)
+    actions = [
+        CorporateAction(ActionKind.CASH_DIVIDEND, ex_date, amount=D(60)),
+        CorporateAction(ActionKind.CASH_DIVIDEND, ex_date, amount=D(50)),
+    ]
+    with pytest.raises(ValidationError, match="110"):
+        adjust_bars(bars, actions, include_dividends=True)
+
+
+def test_dividends_on_different_days_each_use_their_own_close() -> None:
+    bars = [bar(date(2026, 2, 27), "100"), bar(date(2026, 3, 2), "50")]
+    actions = [
+        CorporateAction(ActionKind.CASH_DIVIDEND, date(2026, 3, 2), amount=D(10)),
+        CorporateAction(ActionKind.CASH_DIVIDEND, date(2026, 3, 3), amount=D(5)),
+    ]
+    adjusted = adjust_bars(bars, actions, include_dividends=True)
+    # 100 * (90 / 100) * (45 / 50) and 50 * (45 / 50).
+    assert [b.close for b in adjusted] == [D("81"), D("45")]
 
 
 def test_a_narrowing_correction_retracts_the_open_ended_range() -> None:
@@ -307,3 +331,66 @@ def test_open_ended_listings_that_tie_are_refused_not_decided_by_insertion() -> 
     book.add(Listing("OLD", other, date(2000, 1, 3)))
     with pytest.raises(ValidationError, match="conflict"):
         book.symbol_on("OLD", date(2005, 6, 1))
+
+
+def test_a_restated_ex_date_is_retracted_with_a_neutral_correction() -> None:
+    """A 2-for-1 split first recorded ex 03-02, then restated as ex 03-09."""
+    closes = [bar(date(2026, 2, 27), "100")]
+    recorded = CorporateAction(ActionKind.SPLIT, date(2026, 3, 2), ratio=D(2))
+    learned = datetime(2026, 3, 5, tzinfo=UTC)
+    restated = CorporateAction(
+        ActionKind.SPLIT, date(2026, 3, 9), ratio=D(2), known_from=learned
+    )
+    retraction = CorporateAction(
+        ActionKind.SPLIT, date(2026, 3, 2), ratio=D(1), known_from=learned
+    )
+    assert adjust_bars(closes, [recorded, restated, retraction])[0].close == D("50")
+    believed_then = datetime(2026, 3, 4, tzinfo=UTC)
+    assert adjust_bars(
+        closes, [recorded, restated, retraction], known_at=believed_then
+    )[0].close == D("50")
+
+
+def test_a_cash_dividend_is_retracted_with_a_neutral_price_factor() -> None:
+    closes = [bar(date(2026, 2, 27), "100")]
+    ex_date = date(2026, 3, 2)
+    paid = CorporateAction(ActionKind.CASH_DIVIDEND, ex_date, amount=D(10))
+    retraction = CorporateAction(
+        ActionKind.CASH_DIVIDEND,
+        ex_date,
+        amount=D(0),
+        price_factor=D(1),
+        known_from=datetime(2026, 3, 5, tzinfo=UTC),
+    )
+    adjusted = adjust_bars(closes, [paid, retraction], include_dividends=True)
+    assert adjusted[0].close == D("100")
+
+
+def test_a_listing_recorded_with_the_wrong_start_can_be_retracted() -> None:
+    book = SecurityMaster()
+    ticker = Symbol(venue="XNYS", ticker="ABC")
+    book.add(Listing("A", ticker, date(2020, 1, 2)))
+    learned = datetime(2021, 6, 1, tzinfo=UTC)
+    book.add(Listing("A", ticker, date(2020, 3, 2), known_from=learned))
+    book.retract(ticker, date(2020, 1, 2), known_from=learned)
+    assert book.resolve(ticker, date(2020, 2, 3)) is None
+    assert book.symbol_on("A", date(2020, 2, 3)) is None
+    assert book.universe("XNYS", date(2020, 2, 3)) == []
+    assert book.resolve(ticker, date(2020, 4, 1)) == "A"
+    before = datetime(2021, 1, 1, tzinfo=UTC)
+    assert book.resolve(ticker, date(2020, 2, 3), known_at=before) == "A"
+
+
+def test_history_follows_corrections_and_knowledge_time() -> None:
+    book = SecurityMaster()
+    ticker = Symbol(venue="XNYS", ticker="ABC")
+    wrong = Listing("WRONG", ticker, date(2020, 1, 2))
+    book.add(wrong)
+    learned = datetime(2021, 6, 1, tzinfo=UTC)
+    right = Listing("RIGHT", ticker, date(2020, 1, 2), known_from=learned)
+    book.add(right)
+    assert book.history("WRONG") == []
+    assert book.history("RIGHT") == [right]
+    before = datetime(2021, 1, 1, tzinfo=UTC)
+    assert book.history("WRONG", known_at=before) == [wrong]
+    assert book.history("RIGHT", known_at=before) == []

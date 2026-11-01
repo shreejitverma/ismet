@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
+import shutil
 import sqlite3
+import subprocess
+import sys
+import textwrap
 from datetime import datetime, timezone
 from decimal import Decimal
 from importlib.metadata import EntryPoint
@@ -31,7 +36,7 @@ TS = datetime(2026, 3, 9, 15, 0, tzinfo=timezone.utc)
 
 @pytest.fixture(autouse=True)
 def isolated_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    for name in list(__import__("os").environ):
+    for name in list(os.environ):
         if name.startswith("ISMET_"):
             monkeypatch.delenv(name)
     monkeypatch.setenv("ISMET_CONFIG_FILE", str(tmp_path / "absent.toml"))
@@ -132,19 +137,8 @@ def _toon_block(lines: list[tuple[int, str]], at: int, depth: int) -> tuple[dict
                 text = lines[at][1]
                 if not text.startswith("- "):
                     raise ValueError(f"list item needs a hyphen: {text!r}")
-                first = _HEADER.fullmatch(text[2:])
-                if first is not None and first["key"] is not None:
-                    nested = [(depth + 2, text[2:])]
-                    end = at + 1
-                    while end < len(lines) and lines[end][0] >= depth + 2:
-                        nested.append(lines[end])
-                        end += 1
-                    item, _ = _toon_block(nested, 0, depth + 2)
-                    rows.append(item)
-                    at = end
-                else:
-                    rows.append(_toon_scalar(text[2:]))
-                    at += 1
+                rows.append(_toon_scalar(text[2:]))
+                at += 1
         if len(rows) != count:
             raise ValueError(f"{key} declares {count} items, has {len(rows)}")
         result[key] = rows
@@ -588,7 +582,6 @@ def test_toon_round_trips_through_a_spec_decoder() -> None:
         "empty": {},
         "rows": [{"a": "x,y", "b": 2}, {"a": "z", "b": 3}],
         "words": ["one two", "three: four", "-five"],
-        "mixed": [1, "two", {"three": 3, "four": [4]}],
         "none": [],
         "odd key": 1,
     }
@@ -600,13 +593,12 @@ def test_toon_round_trips_through_a_spec_decoder() -> None:
     assert decoded["nested"] == {"inner": {"x": 1}} and decoded["empty"] == {}
     assert decoded["rows"] == [{"a": "x,y", "b": 2}, {"a": "z", "b": 3}]
     assert decoded["words"] == value["words"]
-    assert decoded["mixed"] == [1, "two", {"three": 3, "four": [4]}]
     assert decoded["none"] == [] and decoded["odd key"] == 1
 
 
-def test_the_old_list_form_is_rejected_by_the_decoder() -> None:
-    with pytest.raises(ValueError, match="hyphen"):
-        decode_toon("items[2]:\n  p\n  q")
+def test_a_list_holding_structures_is_refused_rather_than_flattened() -> None:
+    with pytest.raises(TypeError, match="scalars or uniform rows"):
+        encode({"mixed": [1, {"nested": 2}]})
 
 
 @pytest.mark.parametrize(
@@ -739,3 +731,158 @@ def test_a_naive_time_is_refused_as_the_sync_client_refuses_it(
         "2026-03-10",
     )
     assert code == 1 and "timezone-aware" in out
+
+
+def _triggers(path: Path) -> set[str]:
+    conn = sqlite3.connect(path)
+    found = {
+        row[0]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='trigger'")
+    }
+    conn.close()
+    return found
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ("journal", "verify", "{}"),
+        ("journal", "orders", "{}", "--all"),
+        ("kill", "status", "--journal", "{}"),
+    ],
+)
+def test_read_commands_leave_tampering_evidence_where_it_is(
+    capsys, tmp_path: Path, command: tuple[str, ...]
+) -> None:  # type: ignore[no-untyped-def]
+    path = tmp_path / "j.db"
+    _journal_with_order(path)
+    conn = sqlite3.connect(path)
+    conn.execute("DROP TRIGGER journal_no_update")
+    conn.commit()
+    conn.close()
+    assert "journal_no_update" not in _triggers(path)
+    code, _ = run(capsys, *(word.format(path) for word in command))
+    assert code == 0
+    assert "journal_no_update" not in _triggers(path)
+
+
+def test_journal_export_also_leaves_the_journal_as_it_found_it(
+    capsys, tmp_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    path = tmp_path / "j.db"
+    _journal_with_order(path)
+    conn = sqlite3.connect(path)
+    conn.execute("DROP TRIGGER journal_no_update")
+    conn.commit()
+    conn.close()
+    code, _ = run(capsys, "journal", "export", str(path), "--out", str(tmp_path / "o"))
+    assert code == 0 and "journal_no_update" not in _triggers(path)
+
+
+def test_a_corrupted_kind_with_an_expected_head_still_names_the_bad_record(
+    capsys, tmp_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    path = tmp_path / "j.db"
+    _journal_with_order(path)
+    journal = SqliteJournal(path)
+    head = journal.head_hash()
+    journal.close()
+    conn = sqlite3.connect(path)
+    conn.execute("DROP TRIGGER journal_no_update")
+    conn.execute("UPDATE journal SET kind = 'nonsense' WHERE seq = 1")
+    conn.commit()
+    conn.close()
+    code, out = run(capsys, "journal", "verify", str(path), "--expect-head", head)
+    assert code == 1 and "ok: false" in out and "first_bad_seq: 1" in out
+
+
+read_only_directories_work = os.name != "nt" and os.geteuid() != 0
+
+
+@pytest.fixture
+def read_only_copy(tmp_path: Path):  # type: ignore[no-untyped-def]
+    if not read_only_directories_work:
+        pytest.skip("needs a directory this user cannot write")
+    audit = tmp_path / "audit"
+    audit.mkdir()
+    yield audit
+    audit.chmod(0o755)
+
+
+def test_an_audit_copy_in_a_read_only_directory_can_be_verified(
+    capsys, tmp_path: Path, read_only_copy: Path
+) -> None:  # type: ignore[no-untyped-def]
+    path = tmp_path / "j.db"
+    _journal_with_order(path)
+    copied = read_only_copy / "j.db"
+    shutil.copy(path, copied)
+    read_only_copy.chmod(0o555)
+    code, out = run(capsys, "journal", "verify", str(copied))
+    assert code == 0 and "ok: true" in out and "records: 2" in out
+
+
+def test_an_unreadable_journal_is_not_called_something_else(
+    capsys, tmp_path: Path, read_only_copy: Path
+) -> None:  # type: ignore[no-untyped-def]
+    """A copy with an unmerged WAL cannot be read here, and that is what it must say."""
+    path = tmp_path / "j.db"
+    journal = SqliteJournal(path)
+    journal.append(RecordKind.KILL_ENGAGED, '{"reason": "r", "operator": "o"}')
+    copied = read_only_copy / "j.db"
+    shutil.copy(path, copied)
+    shutil.copy(path.with_name("j.db-wal"), read_only_copy / "j.db-wal")
+    journal.close()
+    read_only_copy.chmod(0o555)
+    code, out = run(capsys, "journal", "verify", str(copied))
+    assert code == 1
+    assert "not an ismet journal" not in out and "cannot read journal" in out
+
+
+def test_files_that_are_not_journals_are_still_called_that(
+    capsys, tmp_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    text = tmp_path / "notes.txt"
+    text.write_text("this is not a database, not by a long way " * 50)
+    code, out = run(capsys, "journal", "verify", str(text))
+    assert code == 1 and "not an ismet journal" in out
+    other = tmp_path / "other.db"
+    conn = sqlite3.connect(other)
+    conn.execute("CREATE TABLE something (x)")
+    conn.commit()
+    conn.close()
+    code, out = run(capsys, "kill", "status", "--journal", str(other))
+    assert code == 1 and "not an ismet journal" in out
+
+
+def test_a_journal_left_by_a_killed_process_can_be_read(capsys, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    """After a crash the record is only in the WAL, and this is when people look."""
+    path = tmp_path / "j.db"
+    crash = textwrap.dedent(
+        f"""
+        import os
+        from ismet.execution import RecordKind, SqliteJournal
+        journal = SqliteJournal({str(path)!r})
+        journal.append(RecordKind.KILL_ENGAGED, '{{"reason": "r", "operator": "o"}}')
+        os._exit(0)
+        """
+    )
+    subprocess.run([sys.executable, "-c", crash], check=True)
+    assert path.with_name("j.db-wal").stat().st_size > 0
+    code, out = run(capsys, "journal", "verify", str(path))
+    assert code == 0 and "ok: true" in out and "records: 1" in out
+    code, out = run(capsys, "kill", "status", "--journal", str(path))
+    assert code == 0 and "kill: engaged" in out
+
+
+def test_a_journal_held_open_by_a_running_process_can_be_read(
+    capsys, tmp_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    path = tmp_path / "j.db"
+    journal = SqliteJournal(path)
+    journal.append(RecordKind.KILL_ENGAGED, '{"reason": "r", "operator": "o"}')
+    code, out = run(capsys, "kill", "status", "--journal", str(path))
+    assert code == 0 and "kill: engaged" in out
+    journal.append(RecordKind.KILL_RELEASED, '{"reason": "r", "operator": "o"}')
+    code, out = run(capsys, "kill", "status", "--journal", str(path))
+    assert code == 0 and "kill: not engaged" in out
+    journal.close()

@@ -96,7 +96,7 @@ from ismet.models import (
 from ismet.models import Trade as TradeEvent
 from ismet.normalize import binance as normalize
 from ismet.normalize._common import StreamGate, check_range, merge_bars, search_rank
-from ismet.providers.base import Provider
+from ismet.providers.base import Provider, max_reconnects_option
 from ismet.transport.backoff import (
     ExponentialBackoff,
     RetryPolicy,
@@ -104,7 +104,7 @@ from ismet.transport.backoff import (
 )
 from ismet.transport.circuit import CircuitBreaker
 from ismet.transport.clock import SYSTEM_CLOCK, Clock
-from ismet.transport.http import Hook, HttpTransport, loads_decimal
+from ismet.transport.http import Hook, HttpTransport, Response, loads_decimal
 from ismet.transport.ratelimit import RateLimiter, RateLimitSpec
 from ismet.transport.ws import (
     DEFAULT_WS_BACKOFF,
@@ -248,10 +248,14 @@ class BinanceProvider(Provider):
 
     @classmethod
     def from_settings(cls, settings: ProviderSettings) -> BinanceProvider:
-        """Options: ``rest_url``, ``ws_url``. Credentials are not used."""
+        """Options: ``rest_url``, ``ws_url``, ``ws_max_reconnects``. No credentials.
+
+        With no ``ws_max_reconnects``, a stream in an outage keeps reconnecting.
+        """
         return cls(
             rest_url=settings.option("rest_url", REST_URL),
             ws_url=settings.option("ws_url", WS_URL),
+            ws_max_reconnects=max_reconnects_option(settings),
         )
 
     async def open(self) -> None:
@@ -274,6 +278,11 @@ class BinanceProvider(Provider):
         return symbol.ticker
 
     async def _get(self, path: str, params: Mapping[str, Any], rate_key: str) -> Any:
+        return (await self._request(path, params, rate_key)).json()
+
+    async def _request(
+        self, path: str, params: Mapping[str, Any], rate_key: str
+    ) -> Response:
         remaining = self._banned_until - self.clock.monotonic()
         if remaining > 0:
             raise RateLimited(
@@ -281,7 +290,9 @@ class BinanceProvider(Provider):
                 retry_after=remaining,
             )
         try:
-            return await self._http.get_json(path, params=params, rate_key=rate_key)
+            return await self._http.request(
+                "GET", path, params=params, rate_key=rate_key
+            )
         except VenueError as exc:
             if exc.status != 418:
                 raise
@@ -355,7 +366,9 @@ class BinanceProvider(Provider):
         ``startTime`` and ``endTime`` are inclusive milliseconds, so the request
         asks up to the last millisecond before ``end``. Pages continue from the
         latest open time until a short page. A range that would exceed
-        ``MAX_BARS`` raises :class:`ValidationError` before any request.
+        ``MAX_BARS`` raises :class:`ValidationError` before any request. A kline counts
+        as closed by the server's ``Date``, so a fast host clock cannot pass off a
+        partial one as final.
         """
         ticker = self._native(symbol)
         check_range(start, end)
@@ -373,7 +386,7 @@ class BinanceProvider(Provider):
         cursor, last = _ceil_ms(start), _ceil_ms(end) - 1
         bars: list[Bar] = []
         while cursor <= last:
-            rows = await self._get(
+            response = await self._request(
                 "/api/v3/klines",
                 {
                     "symbol": ticker,
@@ -384,9 +397,16 @@ class BinanceProvider(Provider):
                 },
                 _KLINES,
             )
+            rows = response.json()
+            received = self.clock.now()
             bars.extend(
                 normalize.bars_from_klines(
-                    rows, symbol, interval, self.clock.now(), currency
+                    rows,
+                    symbol,
+                    interval,
+                    received,
+                    currency,
+                    as_of=normalize.copy_made_at(response.headers, received),
                 )
             )
             if len(rows) < self._klines_per_request:

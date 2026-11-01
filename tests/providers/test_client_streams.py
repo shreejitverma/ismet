@@ -81,16 +81,19 @@ async def test_coinbase_matches_with_a_sparse_sequence_have_no_gaps() -> None:
 
 
 TRADE_FEEDS = [
-    pytest.param(_binance, "binance", "trade", "BTCUSDT@BNCX", id="binance"),
-    pytest.param(_coinbase, "coinbase", "matches", "BTC-USD@ZCBS", id="coinbase"),
+    pytest.param(_binance, "binance", "trade", "t", "BTCUSDT@BNCX", id="binance"),
+    pytest.param(
+        _coinbase, "coinbase", "matches", "sequence", "BTC-USD@ZCBS", id="coinbase"
+    ),
 ]
 
 
-@pytest.mark.parametrize(("build", "vendor", "name", "symbol"), TRADE_FEEDS)
+@pytest.mark.parametrize(("build", "vendor", "name", "field", "symbol"), TRADE_FEEDS)
 async def test_trades_really_lost_across_a_reconnect_follow_the_policy(
-    build: Any, vendor: str, name: str, symbol: str
+    build: Any, vendor: str, name: str, field: str, symbol: str
 ) -> None:
     plan = [slice(0, 5), slice(8, 12)]
+    first_after_the_hole = frames(vendor, name)[8][field]
     async with (
         WsReplayServer([session(vendor, name)], plan=plan) as server,
         IsmetClient([build(server)]) as client,
@@ -107,8 +110,8 @@ async def test_trades_really_lost_across_a_reconnect_follow_the_policy(
             7,
         )
     flagged = [t for t in trades if QualityFlag.AFTER_GAP in t.quality]
-    assert [t.sequence for t in flagged] == gaps
-    assert len(gaps) == 1
+    assert [t.sequence for t in flagged] == [first_after_the_hole]
+    assert gaps == [first_after_the_hole]
 
 
 async def test_the_first_quote_after_a_reconnect_is_the_gap_on_a_sparse_feed() -> None:

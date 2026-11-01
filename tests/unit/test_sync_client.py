@@ -182,3 +182,38 @@ def test_a_stop_that_times_out_still_stops_the_loop(monkeypatch) -> None:  # typ
     thread.join(3)
     assert not thread.is_alive()
     pending.cancel()
+
+
+class _FailsWhileTheConsumerLooks(MockProvider):
+    """A stream that fails only once the test says so, with nothing delivered."""
+
+    def __init__(self, release: threading.Event) -> None:
+        super().__init__()
+        self._release = release
+
+    async def stream_trades(self, symbols):  # type: ignore[no-untyped-def,override]
+        await asyncio.to_thread(self._release.wait, 10)
+        raise TransportError("the feed died", retryable=False)
+        yield  # makes this an async generator
+
+
+def test_a_stream_failing_just_as_the_consumer_checks_still_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The failure lands after the consumer saw no failure, but before it saw an end."""
+    release = threading.Event()
+    consumer = threading.current_thread()
+
+    class Interleaved(threading.Event):
+        def is_set(self) -> bool:
+            if threading.current_thread() is consumer:
+                release.set()
+                self.wait(10)
+            return super().is_set()
+
+    with IsmetSyncClient([_FailsWhileTheConsumerLooks(release)]) as client:
+        monkeypatch.setattr(threading, "Event", Interleaved)
+        stream = client.stream_trades(["ACME@XMOK"])
+        monkeypatch.undo()
+        with pytest.raises(TransportError, match="the feed died"):
+            next(stream)

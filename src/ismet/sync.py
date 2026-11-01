@@ -129,6 +129,11 @@ class IsmetSyncClient:
 
         try:
             asyncio.run_coroutine_threadsafe(cancel_rest(), loop).result(_JOIN_TIMEOUT)
+        except concurrent.futures.TimeoutError as exc:
+            # On Python 3.10 this is not the builtin TimeoutError.
+            raise TimeoutError(
+                f"tasks did not stop within {_JOIN_TIMEOUT}s of closing the client"
+            ) from exc
         finally:
             loop.call_soon_threadsafe(loop.stop)
             thread.join(_JOIN_TIMEOUT)
@@ -280,9 +285,12 @@ class IsmetSyncClient:
                         continue
                     except Empty:
                         pass
+                    # The producer records a failure before it sets finished, so
+                    # reading finished first cannot miss one.
+                    ended = finished.is_set() and queue.empty()
                     if failure:
                         raise failure[0]
-                    if finished.is_set() and queue.empty():
+                    if ended:
                         return
             finally:
                 stop.set()

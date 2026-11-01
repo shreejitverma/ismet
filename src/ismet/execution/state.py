@@ -44,9 +44,12 @@ S = OrderStatus
 
 
 class _Next(Enum):
-    """A target decided by the fill count rather than fixed by the table."""
+    """A target decided by the order's own state rather than fixed by the table."""
 
     WORKING = "working"
+    """The status the fill count implies."""
+    RESUMED = "resumed"
+    """Back to a replace whose outcome is still open, else the fill count's status."""
 
 
 _LIVE_WORKING = (S.ACCEPTED, S.PARTIALLY_FILLED)
@@ -100,7 +103,9 @@ TRANSITIONS: dict[str, dict[OrderStatus, Target]] = {
         S.CANCELED: S.CANCELED,
     },
     "cancel_rejected": {
-        S.PENDING_CANCEL: _Next.WORKING,
+        # A cancel asked during a replace is often refused as "already pending"; the
+        # replace is then still in flight, and its terms may still go live.
+        S.PENDING_CANCEL: _Next.RESUMED,
         S.ACCEPTED: S.ACCEPTED,
         S.PARTIALLY_FILLED: S.PARTIALLY_FILLED,
         S.PENDING_REPLACE: S.PENDING_REPLACE,
@@ -234,10 +239,10 @@ def _apply_fill(state: OrderState, fill: Fill) -> OrderState:
         if known.fill_id == fill.fill_id:
             if known == fill:
                 return state  # the same report delivered twice
-            if _same_execution(known, fill):
+            if same_execution(known, fill):
                 # Details such as fees often arrive later, or on another channel.
                 fills = list(state.fills)
-                fills[index] = _merged(known, fill)
+                fills[index] = merged_fill(known, fill)
                 return replace(state, fills=tuple(fills))
             return _note(state, f"fill {fill.fill_id} re-reported with different terms")
     updated = replace(
@@ -270,12 +275,18 @@ def fill_adds_detail(state: OrderState, fill: Fill) -> bool:
     known = next((f for f in state.fills if f.fill_id == fill.fill_id), None)
     return (
         known is not None
-        and _same_execution(known, fill)
-        and _merged(known, fill) != known
+        and same_execution(known, fill)
+        and merged_fill(known, fill) != known
     )
 
 
-def _same_execution(a: Fill, b: Fill) -> bool:
+def fill_contradicts(state: OrderState, fill: Fill) -> bool:
+    """Whether a report of a known fill disagrees with the record on what traded."""
+    known = next((f for f in state.fills if f.fill_id == fill.fill_id), None)
+    return known is not None and not same_execution(known, fill)
+
+
+def same_execution(a: Fill, b: Fill) -> bool:
     """Whether two reports agree on what traded: the part that moves money."""
     return (a.symbol, a.side, a.price, a.quantity) == (
         b.symbol,
@@ -285,7 +296,7 @@ def _same_execution(a: Fill, b: Fill) -> bool:
     )
 
 
-def _merged(known: Fill, report: Fill) -> Fill:
+def merged_fill(known: Fill, report: Fill) -> Fill:
     """Fill in what ``known`` lacks, without overwriting anything it already has."""
     return known.model_copy(
         update={
@@ -346,8 +357,14 @@ def _transition(
     target = table.get(state.status)
     if target is None:
         return _note(state, f"illegal transition: {kind} in {state.status.value}")
+    if target is _Next.RESUMED and _has_pending_terms(state):
+        return replace(state, status=S.PENDING_REPLACE)
     status = _working_status(state) if isinstance(target, _Next) else target
     return replace(state, status=status)
+
+
+def _has_pending_terms(state: OrderState) -> bool:
+    return state.pending_quantity is not None or state.pending_limit_price is not None
 
 
 def apply_event(state: OrderState, event: OrderEvent) -> OrderState:
@@ -356,9 +373,7 @@ def apply_event(state: OrderState, event: OrderEvent) -> OrderState:
     Requested terms last only while the outcome of the request is open.
     """
     updated = _apply(state, event)
-    if updated.status in (*_PENDING, S.UNKNOWN):
-        return updated
-    if updated.pending_quantity is None and updated.pending_limit_price is None:
+    if updated.status in (*_PENDING, S.UNKNOWN) or not _has_pending_terms(updated):
         return updated
     return replace(updated, pending_quantity=None, pending_limit_price=None)
 
@@ -457,6 +472,7 @@ __all__ = [
     "OrderState",
     "apply_event",
     "fill_adds_detail",
+    "fill_contradicts",
     "new_order",
     "replay",
 ]

@@ -31,16 +31,10 @@ VENUES = (
     "XJSE", "BVMF", "XMEX", "XNZE",
 )  # fmt: skip
 ALIASES = {
-    "XNAS": "XNYS",
-    "XNSE": "XBOM",
-    "XJPX": "XTKS",
-    "XSHE": "XSHG",
-}
-ALIAS_NOTES = {
-    "XNAS": "NYSE and Nasdaq keep the same regular session and holidays",
-    "XNSE": "NSE and BSE publish a common equity trading holiday list",
-    "XJPX": "JPX operates the Tokyo Stock Exchange",
-    "XSHE": "SSE and SZSE keep the same regular session and holidays",
+    "XNAS": "XNYS",  # NYSE and Nasdaq keep the same regular session and holidays
+    "XNSE": "XBOM",  # NSE and BSE publish a common equity trading holiday list
+    "XJPX": "XTKS",  # JPX operates the Tokyo Stock Exchange
+    "XSHE": "XSHG",  # SSE and SZSE keep the same regular session and holidays
 }
 START = pd.Timestamp("2007-01-01")
 OUT = (
@@ -116,7 +110,6 @@ def main() -> None:
         "source": f"exchange_calendars {ec.__version__} (Apache-2.0)",
         "generated": dt.datetime.now(dt.timezone.utc).date().isoformat(),
         "aliases": ALIASES,
-        "alias_notes": ALIAS_NOTES,
         "venues": {name: encode(name) for name in VENUES},
     }
     OUT.parent.mkdir(parents=True, exist_ok=True)

@@ -20,6 +20,7 @@ from ismet.errors import (
     JournalError,
     KillSwitchEngaged,
     RiskRejected,
+    TransportError,
     ValidationError,
 )
 from ismet.execution import (
@@ -33,6 +34,7 @@ from ismet.execution import (
     RiskEngine,
     RiskLimits,
     SqliteJournal,
+    events_of,
     new_order,
 )
 from ismet.marketdata import BookBuilder, BookDelta, Issue, QualityMonitor
@@ -54,13 +56,14 @@ from ismet.models.orders import (
     OrderStatus,
     OrderType,
     ReplaceRequested,
+    Restated,
     ShortSaleMark,
     SubmitIntent,
     TimeInForce,
     TradingRules,
 )
 from ismet.refdata.master import ActionKind, CorporateAction, adjust_bars
-from ismet.testing.simvenue import Fault, SimVenue, sim_instrument
+from ismet.testing.simvenue import SIM_VENUE, Fault, SimVenue, sim_instrument
 from ismet.transport.backoff import ExponentialBackoff
 from ismet.transport.clock import ManualClock
 from ismet.transport.http import HttpTransport
@@ -629,9 +632,15 @@ async def test_an_adapter_bug_in_one_status_query_does_not_disable_reconciliatio
 
 
 async def test_a_dead_execution_stream_stops_new_orders(
-    oms: OrderManager, venue: SimVenue
+    oms: OrderManager, venue: SimVenue, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     await venue.drain()
+
+    def refused():  # type: ignore[no-untyped-def]
+        raise TransportError("simulated: stream endpoint down")
+
+    # Reconnects are jittered from zero, so the stream must stay down to be observed.
+    monkeypatch.setattr(venue, "stream_executions", refused)
     venue.disconnect_stream()
     await until(lambda: not oms.stream_healthy)
     with pytest.raises(RiskRejected) as caught:
@@ -1915,5 +1924,339 @@ async def test_concurrent_submits_cannot_jointly_exceed_a_limit(
         )
         accepted = [r for r in results if not isinstance(r, Exception)]
         assert len(accepted) == 1
+    finally:
+        await oms.abort()
+
+
+# Round two: corrected fills, the first start, and guards no test used to exercise
+
+
+async def test_a_query_reporting_a_known_fill_with_other_terms_halts_once(
+    make_manager: Factory, venue: SimVenue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    anomalies: list[str] = []
+    oms = make_manager(on_anomaly=lambda _, message: anomalies.append(message))
+    await oms.start()
+    try:
+        await venue.drain()
+        await oms.submit(order("TR18", quantity="10", price="9.50"))
+        await venue.drain()
+        venue.trade_through(ACME, "9.50", "10")
+        first = await oms.wait_for("TR18", lambda o: o.is_terminal, 2)
+        assert first.status is S.FILLED and first.average_price == D("9.50")
+        real = venue.fills_since
+
+        async def corrected(
+            since: datetime, symbol: Symbol | None = None
+        ) -> list[Fill]:
+            fills = await real(since, symbol)
+            return [f.model_copy(update={"price": D("9.51")}) for f in fills]
+
+        monkeypatch.setattr(venue, "fills_since", corrected)
+        await oms.reconcile()
+        assert oms.kill_state.engaged
+        assert "different terms" in oms.kill_state.reason
+        assert any("different terms" in a for a in anomalies)
+        state = oms.order("TR18")
+        assert state.filled_quantity == 10 and state.average_price == D("9.50")
+        await oms.release_kill("venue confirmed the correction", operator="pat")
+        await oms.reconcile()
+        assert not oms.kill_state.engaged
+    finally:
+        await oms.abort()
+    restarted = make_manager()
+    await restarted.start()
+    try:
+        assert not restarted.kill_state.engaged
+        await restarted.reconcile()
+        assert not restarted.kill_state.engaged
+    finally:
+        await restarted.abort()
+
+
+async def test_a_first_start_does_not_treat_fills_already_in_the_baseline_as_orphans(
+    make_manager: Factory, venue: SimVenue, clock: ManualClock
+) -> None:
+    # Before ismet ever ran on this account, another terminal traded in it.
+    venue.add_external_order(order("TR19-OLD", quantity="5", price="9.50"))
+    venue.trade_through(ACME, "9.50", "5")
+    clock.advance(60)
+    oms = make_manager()
+    report = await oms.start()
+    try:
+        assert not report.breaks and not oms.kill_state.engaged
+        assert oms.net_position(ACME) == 5
+    finally:
+        await oms.abort()
+    restarted = make_manager()
+    report = await restarted.start()
+    try:
+        assert not report.breaks and not restarted.kill_state.engaged
+        # A fill the venue dates after the baseline is still an orphan.
+        clock.advance(60)
+        venue.add_external_order(order("TR19-NEW", quantity="1", price="9.50"))
+        venue.report_faults.drop_next = 1
+        venue.trade_through(ACME, "9.50", "1")
+        report = await restarted.reconcile()
+        assert BreakKind.ORPHAN_FILL in [b.kind for b in report.breaks]
+        assert restarted.kill_state.engaged
+    finally:
+        await restarted.abort()
+
+
+async def test_an_old_quote_for_a_held_symbol_leaves_gross_exposure_unknown(
+    clock: ManualClock,
+) -> None:
+    other = Symbol(venue=SIM_VENUE, ticker="OTHR")
+    venue = SimVenue(
+        clock=clock,
+        instruments=[sim_instrument("ACME"), sim_instrument("OTHR")],
+        initial_positions={other: D(100)},
+    )
+    venue.set_quote(ACME, "9.99", "10.01")
+    venue.set_quote(other, "4.99", "5.01")
+
+    async def reference(symbol: Symbol) -> Quote:
+        quote = await venue.quote(symbol)
+        if symbol == other:
+            stamp = clock.now() - timedelta(hours=1)
+            return quote.model_copy(update={"exchange_ts": stamp, "received_ts": stamp})
+        return quote
+
+    oms = OrderManager(
+        venue,
+        MemoryJournal(),
+        RiskEngine(
+            permissive_config(default=RiskLimits(max_gross_notional=D(100_000)))
+        ),
+        clock=clock,
+        reference_source=reference,
+        unknown_grace=0.0,
+        reconcile_interval=3600.0,
+        kill_poll_interval=0.01,
+        stream_settle=None,
+    )
+    await oms.start()
+    try:
+        await venue.drain()
+        # 100 OTHR at 5.00 would be 500, far inside the limit, if the quote counted.
+        with pytest.raises(RiskRejected, match="gross exposure unknown"):
+            await oms.submit(order("TR20", quantity="1", price="9.50"))
+        assert venue.attempts["TR20"] == 0
+    finally:
+        await oms.abort()
+
+
+async def test_an_unrecorded_kill_is_not_undone_by_a_newer_release_in_the_journal(
+    venue: SimVenue, clock: ManualClock
+) -> None:
+    class KillWritesFail(MemoryJournal):
+        def append(self, *args: object, **kw: object):  # type: ignore[no-untyped-def]
+            if args[0] is RecordKind.KILL_ENGAGED:
+                raise JournalError("disk full")
+            return super().append(*args, **kw)  # type: ignore[arg-type]
+
+    journal = KillWritesFail()
+    oms = OrderManager(
+        venue,
+        journal,
+        RiskEngine(permissive_config()),
+        clock=clock,
+        kill_poll_interval=0.001,
+        stream_settle=None,
+    )
+    await oms.start()
+    try:
+        await venue.drain()
+        await oms.engage_kill("disk is failing", operator="ops", cancel_open=False)
+        assert oms.kill_state.engaged
+        # Another process releases what it can see, which is no kill at all.
+        journal.append(RecordKind.KILL_RELEASED, '{"reason": "ok", "operator": "pat"}')
+        polls = count_kill_polls(journal)
+        await until(lambda: polls["reads"] >= 5)
+        assert oms.kill_state.engaged
+        with pytest.raises(KillSwitchEngaged) as caught:
+            await oms.submit(order("TR21", price="9.50"))
+        assert caught.value.reason == "disk is failing"
+        assert venue.attempts["TR21"] == 0
+    finally:
+        await oms.abort()
+
+
+async def test_a_status_answer_older_than_a_partial_fill_is_asked_again(
+    oms: OrderManager, venue: SimVenue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await venue.drain()
+    await oms.submit(order("TR22", price="9.50"))
+    await venue.drain()
+    real = venue.order_status
+    calls = {"n": 0}
+
+    async def fills_after_answering(cid: str, symbol: Symbol):  # type: ignore[no-untyped-def]
+        answer = await real(cid, symbol)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            venue.trade_through(ACME, "9.50", "40")
+            await oms.wait_for("TR22", lambda o: o.filled_quantity == 40, 2)
+        return answer
+
+    monkeypatch.setattr(venue, "order_status", fills_after_answering)
+    await oms.reconcile()
+    assert calls["n"] == 2
+    state = oms.order("TR22")
+    assert state.status is S.PARTIALLY_FILLED and state.filled_quantity == 40
+    assert not state.anomalies
+    assert not [e for e in events_of(oms._journal) if isinstance(e, Restated)]
+
+
+async def test_a_cancel_during_the_intent_write_stops_the_send(
+    make_manager: Factory, venue: SimVenue
+) -> None:
+    cancels: list[asyncio.Task[object]] = []
+
+    def cancel_at_checkpoint(name: str, cid: str) -> None:
+        if name == "after_intent":
+            cancels.append(asyncio.create_task(oms.cancel(cid)))
+
+    oms = make_manager(checkpoint=cancel_at_checkpoint)
+    await oms.start()
+    try:
+        await venue.drain()
+        state = await oms.submit(order("TR23", price="9.50"))
+        await asyncio.gather(*cancels)
+        assert state.status is S.REJECTED
+        assert state.reject_code == "CANCELED_BEFORE_SEND"
+        assert venue.attempts["TR23"] == 0
+        assert not oms.order("TR23").anomalies
+    finally:
+        await oms.abort()
+
+
+async def test_an_event_the_journal_missed_is_written_by_the_background_retry(
+    venue: SimVenue, clock: ManualClock
+) -> None:
+    journal = FlakyJournal()
+    oms = OrderManager(
+        venue,
+        journal,
+        RiskEngine(permissive_config()),
+        clock=clock,
+        kill_poll_interval=0.001,
+        reconcile_interval=3600.0,
+        unknown_grace=0.0,
+        stream_settle=None,
+    )
+    await oms.start()
+    try:
+        await venue.drain()
+        await oms.submit(order("TR24", price="9.50"))
+        await venue.drain()
+        journal.failing = True
+        venue.trade_through(ACME, "9.50", "40")
+        await oms.wait_for("TR24", lambda o: o.filled_quantity == 40, 2)
+        assert "fill" not in [e.kind for e in events_of(journal)]
+        journal.failing = False
+        await until(lambda: "fill" in [e.kind for e in events_of(journal)])
+    finally:
+        await oms.abort()
+
+
+async def test_a_sweep_while_events_await_the_journal_does_not_move_the_window(
+    clock: ManualClock,
+) -> None:
+    class NoAccount(SimVenue):
+        positions = None  # type: ignore[assignment]
+        balances = None  # type: ignore[assignment]
+
+    venue = NoAccount(clock=clock, instruments=[sim_instrument("ACME")])
+    venue.set_quote(ACME, "9.99", "10.01")
+    journal = FlakyJournal()
+
+    def build() -> OrderManager:
+        return OrderManager(
+            venue,
+            journal,
+            RiskEngine(permissive_config()),
+            clock=clock,
+            assume_flat=True,
+            kill_poll_interval=3600.0,
+            reconcile_interval=3600.0,
+            unknown_grace=0.0,
+            stream_settle=None,
+            fill_lookback=3600.0,
+        )
+
+    oms = build()
+    await oms.start()
+    await venue.drain()
+    await oms.submit(order("TR25", price="9.50"))
+    await venue.drain()
+    await oms.cancel("TR25")
+    await oms.wait_for("TR25", lambda o: o.is_terminal, 2)
+    # The venue executes it after all, and the journal is down as the fill arrives.
+    venue._orders["TR25"].status = S.ACCEPTED
+    clock.advance(1)
+    journal.failing = True
+    venue.trade_through(ACME, "9.50", "40")
+    await oms.wait_for("TR25", lambda o: o.filled_quantity == 40, 2)
+    journal.failing = False
+    clock.advance(7200)
+    await oms.reconcile()  # the disk is back, but the fill is not on it yet
+    await oms.abort()  # and the process dies before the retry writes it
+    restarted = build()
+    await restarted.start()
+    try:
+        assert restarted.order("TR25").filled_quantity == 40
+        assert restarted.net_position(ACME) == 40
+    finally:
+        await restarted.abort()
+
+
+async def test_a_reconcile_that_raises_refuses_orders_and_keeps_reconciling(
+    make_manager: Factory,
+    venue: SimVenue,
+    journal: Journal,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    oms = make_manager(reconcile_interval=0.01)
+    await oms.start()
+    try:
+        await venue.drain()
+        real_records = journal.records
+        broken = {"on": True}
+
+        def records(*, after_seq: int = 0):  # type: ignore[no-untyped-def]
+            if broken["on"]:
+                raise JournalError("read failed")
+            return real_records(after_seq=after_seq)
+
+        monkeypatch.setattr(journal, "records", records)
+        refusals: list[str] = []
+
+        async def refused_for_reconciliation() -> bool:
+            try:
+                await oms.submit(order(quantity="1", price="9.50"))
+            except RiskRejected as exc:
+                refusals.append(exc.check)
+                return exc.check == "reconciliation"
+            return False
+
+        for _ in range(500):
+            if await refused_for_reconciliation():
+                break
+            await asyncio.sleep(0.001)
+        else:
+            pytest.fail(f"never refused for reconciliation: {refusals[-3:]}")
+        broken["on"] = False
+        for _ in range(500):
+            try:
+                accepted = await oms.submit(order(quantity="1", price="9.50"))
+            except RiskRejected:
+                await asyncio.sleep(0.001)
+                continue
+            assert accepted.status is S.ACCEPTED
+            break
+        else:
+            pytest.fail("reconciliation never recovered")
     finally:
         await oms.abort()

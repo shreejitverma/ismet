@@ -13,7 +13,13 @@ import pytest
 
 from ismet.capabilities import Capability
 from ismet.config import ProviderSettings
-from ismet.errors import RateLimited, TransportError, ValidationError, VenueError
+from ismet.errors import (
+    ConfigError,
+    RateLimited,
+    TransportError,
+    ValidationError,
+    VenueError,
+)
 from ismet.models import Interval, QualityFlag, Symbol
 from ismet.providers.coinbase import (
     RATE_LIMITS,
@@ -171,8 +177,13 @@ async def test_bars_cross_a_real_300_candle_page_boundary() -> None:
     assert second - last == timedelta(minutes=1)
     stamps = [b.exchange_ts for b in bars]
     assert stamps == sorted(set(stamps))
-    assert stamps[0] >= start
-    assert stamps[-1] < end
+    recording = load_exchanges(FIXTURES / "coinbase" / "rest_bars_full_pages.json")
+    recorded = {
+        datetime.fromtimestamp(row[0], UTC)
+        for page in recording
+        for row in json.loads(page.body)
+    }
+    assert set(stamps) == {ts for ts in recorded if start <= ts < end}
     assert any(ts > last for ts in stamps), "the second page must contribute bars"
     assert any(ts <= last for ts in stamps), "the first page must contribute bars"
 
@@ -608,3 +619,74 @@ async def test_closing_the_provider_ends_a_running_stream() -> None:
         await provider.close()
         _ = [q async for q in stream]
     assert provider._streams == set()
+
+
+async def test_a_copy_that_predates_the_window_is_not_an_empty_answer() -> None:
+    """The partial 02:08 row was all this copy held, so it says nothing of 02:08."""
+    opened = datetime(2026, 11, 1, 2, 8, tzinfo=UTC)
+    now = datetime(2026, 11, 1, 2, 10, 1, tzinfo=UTC)
+    row = [int(opened.timestamp()), "1", "2", "1", "1.5", "3"]
+    provider = CoinbaseProvider(
+        http_transport=httpx.MockTransport(
+            lambda _: httpx.Response(
+                200,
+                json=[row],
+                headers={"date": "Sun, 01 Nov 2026 02:10:01 GMT", "age": "82"},
+            )
+        ),
+        retry_policy=NO_RETRY,
+        clock=ManualClock(now),
+    )
+    async with provider:
+        with pytest.raises(TransportError, match="predates") as caught:
+            await provider.bars(BTC, Interval.M1, opened, opened + timedelta(minutes=2))
+    assert caught.value.retryable
+
+
+async def test_an_empty_window_in_a_fresh_copy_is_still_no_trades() -> None:
+    opened = datetime(2026, 11, 1, 2, 8, tzinfo=UTC)
+    now = datetime(2026, 11, 1, 2, 10, 1, tzinfo=UTC)
+    provider = CoinbaseProvider(
+        http_transport=httpx.MockTransport(
+            lambda _: httpx.Response(
+                200, json=[], headers={"date": "Sun, 01 Nov 2026 02:10:01 GMT"}
+            )
+        ),
+        clock=ManualClock(now),
+    )
+    async with provider:
+        assert (
+            await provider.bars(BTC, Interval.M1, opened, opened + timedelta(minutes=2))
+            == []
+        )
+
+
+async def test_a_mistyped_product_registers_no_currency() -> None:
+    mistyped = Symbol(venue="ZCBS", ticker="BTC-QQQQ")
+    provider = CoinbaseProvider(
+        http_transport=httpx.MockTransport(
+            lambda _: httpx.Response(404, json={"message": "NotFound"})
+        ),
+        retry_policy=NO_RETRY,
+    )
+    async with provider:
+        with pytest.raises(VenueError):
+            await provider.quote(mistyped)
+    with pytest.raises(ValueError, match="unknown currency"):
+        validate_currency("QQQQ")
+
+
+async def test_the_reconnect_bound_is_reachable_from_configuration() -> None:
+    settings = ProviderSettings(
+        name="coinbase",
+        options={"ws_url": "ws://127.0.0.1:1", "ws_max_reconnects": 0},
+    )
+    async with CoinbaseProvider.from_settings(settings) as provider:
+        with pytest.raises(TransportError, match="after 0 reconnects"):
+            await take(provider.stream_trades([BTC]), 1)
+
+
+def test_a_reconnect_bound_that_is_not_a_count_is_refused() -> None:
+    settings = ProviderSettings(name="coinbase", options={"ws_max_reconnects": "many"})
+    with pytest.raises(ConfigError, match="ws_max_reconnects"):
+        CoinbaseProvider.from_settings(settings)

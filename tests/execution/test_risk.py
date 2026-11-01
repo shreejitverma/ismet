@@ -335,6 +335,23 @@ def test_reducing_a_position_beyond_the_limit_is_allowed() -> None:
     assert RiskEngine(config()).check(ctx(sell, position=D(3000))).approved
 
 
+def test_closing_either_side_to_flat_is_a_reduction_the_gross_limit_never_blocks() -> (
+    None
+):
+    cfg = config(default=RiskLimits(max_gross_notional=D(1000)))
+    engine = RiskEngine(cfg)
+    buy_to_flat = request(quantity="10", limit_price="100.00")
+    assert engine.check(ctx(buy_to_flat, position=D(-10), gross_notional=None)).approved
+    sell_to_flat = request(side=OrderSide.SELL, quantity="10", limit_price="100.00")
+    assert engine.check(ctx(sell_to_flat, position=D(10), gross_notional=None)).approved
+    through_flat = request(quantity="11", limit_price="100.00")
+    rejected_by(
+        "max_gross_notional",
+        ctx(through_flat, position=D(-10), gross_notional=None),
+        cfg,
+    )
+
+
 def test_gross_limit() -> None:
     cfg = config(default=RiskLimits(max_gross_notional=D(5000)))
     rejected_by("max_gross_notional", ctx(gross_notional=D(4500)), cfg)

@@ -1092,15 +1092,20 @@ class TestLogout:
         session, listener = await make_session()
         await session.stop()
         assert acceptor.of_type("5")[0].get(58) == "session stopping"
+        assert acceptor.logout_text == "session stopping"
+        # The confirming Logout was read, and its number consumed, before stop returned.
+        assert session.next_inbound == acceptor.next_out
         assert listener.downs[-1] == "session stopped"
         assert session.state is SessionState.STOPPED
 
     async def test_stop_does_not_hang_without_a_confirmation(
         self, acceptor: FixAcceptor, make_session: SessionFactory
     ) -> None:
-        session, _ = await make_session(logout_timeout=0.1)
+        session, listener = await make_session(logout_timeout=0.1)
         acceptor.faults.silent = True
         await asyncio.wait_for(session.stop(), 2.0)
+        assert acceptor.of_type("5")[0].get(58) == "session stopping"
+        assert listener.downs[-1] == "session stopped"
         assert session.state is SessionState.STOPPED
 
     async def test_peer_initiates_and_we_confirm(

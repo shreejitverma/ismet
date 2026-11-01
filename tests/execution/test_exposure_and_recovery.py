@@ -601,6 +601,57 @@ async def test_a_held_symbol_with_no_quote_makes_gross_unknown(
         await oms.abort()
 
 
+async def test_a_held_symbol_whose_reference_data_failed_at_start_is_looked_up_again(
+    clock: ManualClock,
+) -> None:
+    venue = gross_venue(clock, OTHR=100)
+    venue.set_quote(OTHER, "4.99", "5.01")
+    outage = {"on": True}
+
+    async def reference_data(symbol: Symbol):  # type: ignore[no-untyped-def]
+        if outage["on"] and symbol == OTHER:
+            raise ConnectionError("reference data unavailable")
+        return await venue.instrument(symbol)
+
+    oms = manager(
+        venue,
+        MemoryJournal(),
+        clock,
+        gross_config("100000"),
+        instrument_source=reference_data,
+    )
+    await oms.start()
+    try:
+        await venue.drain()
+        with pytest.raises(RiskRejected, match="gross exposure unknown"):
+            await oms.submit(order("GR13", quantity="1", price="9.50"))
+        outage["on"] = False
+        # 100 OTHR at the 5.00 mid is 500, plus 9.50 for this order: well inside.
+        state = await oms.submit(order("GR14", quantity="1", price="9.50"))
+        assert state.status is S.ACCEPTED
+    finally:
+        await oms.abort()
+
+
+async def test_an_adjustment_racing_a_reconcile_is_applied_once(
+    venue: SimVenue, clock: ManualClock
+) -> None:
+    oms = manager(venue, MemoryJournal(), clock)
+    await oms.start()
+    try:
+        await venue.drain()
+        venue.add_external_fill(ACME, OrderSide.BUY, D(50))
+        await asyncio.gather(
+            oms.adjust_position(ACME, D(50), operator="pat", reason="transfer in"),
+            oms.reconcile(),
+        )
+        assert oms.net_position(ACME) == 50
+        report = await oms.reconcile()
+        assert not report.breaks and not oms.kill_state.engaged
+    finally:
+        await oms.abort()
+
+
 async def test_gross_is_unknown_while_holdings_are_unknown(
     clock: ManualClock,
 ) -> None:

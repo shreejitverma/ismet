@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from ismet.errors import ConfigError, VenueError
+from ismet.errors import AmbiguousOutcome, ConfigError, TransportError, VenueError
 from ismet.models.orders import (
     Environment,
     OrderAck,
@@ -13,7 +13,7 @@ from ismet.models.orders import (
 )
 from ismet.providers.mock import MockProvider
 from ismet.testing.conformance import assert_conformant
-from ismet.testing.simvenue import SimVenue, sim_instrument
+from ismet.testing.simvenue import Fault, SimVenue, sim_instrument
 from ismet.testing.trading_conformance import run_trading_conformance
 
 from .conftest import ACME, order
@@ -39,6 +39,7 @@ async def run_full(sim: SimVenue, **kw: object):  # type: ignore[no-untyped-def]
         passive,
         make_marketable_order=marketable,
         attempts=lambda cid: sim.attempts[cid],
+        arm_ambiguous_outcome=lambda: sim.faults.append(Fault.LOSE_RESPONSE),
         **kw,  # type: ignore[arg-type]
     )
 
@@ -52,6 +53,10 @@ async def test_simulated_venue_conforms() -> None:
         "duplicate_client_id_refused",
         "status_none_when_not_found",
         "fill_id_matches_across_channels",
+        "fill_terms_match_across_channels",
+        "open_orders_lists_order_without_symbol",
+        "fills_since_reports_fill_without_symbol",
+        "lost_answer_is_ambiguous_outcome",
     } <= names
 
 
@@ -81,12 +86,38 @@ class FillsNotOnStream(SimVenue):
             super()._publish(event)
 
 
+class FillTermsDifferByChannel(SimVenue):
+    async def fills_since(self, since, symbol=None):  # type: ignore[no-untyped-def]
+        fills = await super().fills_since(since, symbol)
+        return [f.model_copy(update={"quantity": f.quantity * 2}) for f in fills]
+
+
+class AnswersOnlyWithASymbol(SimVenue):
+    async def open_orders(self, symbol=None):  # type: ignore[no-untyped-def]
+        return [] if symbol is None else await super().open_orders(symbol)
+
+    async def fills_since(self, since, symbol=None):  # type: ignore[no-untyped-def]
+        return [] if symbol is None else await super().fills_since(since, symbol)
+
+
+class HidesALostAnswer(SimVenue):
+    async def place_order(self, request: OrderRequest) -> OrderAck:
+        try:
+            return await super().place_order(request)
+        except AmbiguousOutcome as exc:
+            raise TransportError(str(exc)) from exc
+
+
 @pytest.mark.parametrize(
     ("broken", "failing_check", "timeout"),
     [
         (RetriesPlaceTwice, "place_sends_exactly_once", 2.0),
         (ForgetsFills, "fills_since_reports_fill", 2.0),
         (FillIdsDifferByChannel, "fill_id_matches_across_channels", 2.0),
+        (FillTermsDifferByChannel, "fill_terms_match_across_channels", 2.0),
+        (AnswersOnlyWithASymbol, "open_orders_lists_order_without_symbol", 2.0),
+        (AnswersOnlyWithASymbol, "fills_since_reports_fill_without_symbol", 2.0),
+        (HidesALostAnswer, "lost_answer_is_ambiguous_outcome", 2.0),
         (FillsNotOnStream, "stream_reports_fill", 0.05),
     ],
 )

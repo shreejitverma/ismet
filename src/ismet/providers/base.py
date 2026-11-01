@@ -6,7 +6,7 @@ from typing import ClassVar
 
 from ismet.capabilities import Capability, capabilities_of
 from ismet.config import ProviderSettings
-from ismet.errors import NotSupported
+from ismet.errors import ConfigError, NotSupported
 from ismet.models.orders import Environment
 from ismet.transport.clock import SYSTEM_CLOCK, Clock
 
@@ -79,4 +79,17 @@ class Provider:
         )
 
 
-__all__ = ["Provider"]
+def max_reconnects_option(settings: ProviderSettings) -> int | None:
+    """The ``ws_max_reconnects`` option: a count of zero or more, ``None`` if unset."""
+    value = settings.option("ws_max_reconnects")
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ConfigError(
+            f"provider {settings.name}: ws_max_reconnects must be a count of zero or "
+            f"more, got {value!r}"
+        )
+    return value
+
+
+__all__ = ["Provider", "max_reconnects_option"]

@@ -76,6 +76,7 @@ from ismet.execution.state import (
     OrderState,
     apply_event,
     fill_adds_detail,
+    fill_contradicts,
     new_order,
 )
 from ismet.models import Instrument, Quote, Symbol
@@ -140,6 +141,17 @@ def _net_quantities(positions: Iterable[Position]) -> dict[Symbol, Decimal]:
             net.get(position.symbol, Decimal(0)), position.quantity
         )
     return net
+
+
+def _fill_terms(fill: Fill) -> tuple[str, str, str, str, str]:
+    """A fill report's identity and what it says traded, as one hashable key."""
+    return (
+        fill.fill_id,
+        str(fill.symbol),
+        fill.side.value,
+        str(fill.price),
+        str(fill.quantity),
+    )
 
 
 def _bundled_calendar(venue: str) -> TradingCalendar | None:
@@ -263,6 +275,8 @@ class OrderManager:
         self._last_sweep: datetime | None = None
         self._durable_sweep: datetime | None = None
         self._reported_orphan_fills: set[str] = set()
+        self._reported_corrections: set[tuple[str, str, str, str, str]] = set()
+        self._sweep_floor: datetime | None = None
         self._adjustments_seen = 0
         self._journalled_config: RiskConfig | None = None
         self._unjournalled: list[OrderEvent] = []
@@ -274,6 +288,7 @@ class OrderManager:
         self._state_lock = asyncio.Lock()
         self._submit_lock = asyncio.Lock()
         self._recon_lock = asyncio.Lock()
+        self._adjust_lock = asyncio.Lock()
         self._changed = asyncio.Condition()
         self._tasks: list[asyncio.Task[None]] = []
         self._started = False
@@ -436,6 +451,8 @@ class OrderManager:
         self._created_at.clear()
         self._baseline = None
         self._reported_orphan_fills.clear()
+        self._reported_corrections.clear()
+        self._sweep_floor = None
         self._adjustments_seen = 0
         self._journalled_config = None
         self._unjournalled.clear()
@@ -466,7 +483,13 @@ class OrderManager:
                     self._store(new_order(event))
                     self._created_at[cid] = event.ts
                 elif cid in self._orders:
-                    self._store(apply_event(self._orders[cid], event))
+                    prior = self._orders[cid]
+                    if isinstance(event, Filled) and fill_contradicts(
+                        prior, event.fill
+                    ):
+                        # Already raised once; a sweep finding it again must not halt.
+                        self._reported_corrections.add(_fill_terms(event.fill))
+                    self._store(apply_event(prior, event))
                 else:
                     raise JournalError(f"event {event.kind} for {cid} has no intent")
             elif record.kind is RecordKind.POSITION_BASELINE:
@@ -474,6 +497,7 @@ class OrderManager:
                     Symbol.parse(key): Decimal(value["quantity"])
                     for key, value in json.loads(record.payload).items()
                 }
+                self._sweep_floor = self._baseline_floor(record.ts)
         self._adjustments_seen = records[-1].seq if records else 0
         self._marks.clear()  # replayed fills are history, not the market now
         self._kill = await self._call_journal(self._journal.kill_state)
@@ -496,7 +520,7 @@ class OrderManager:
         else:
             return
         quantities = _net_quantities(positions)
-        await self._append(
+        record = await self._append(
             RecordKind.POSITION_BASELINE,
             {
                 str(symbol): {"quantity": str(quantity)}
@@ -504,6 +528,23 @@ class OrderManager:
             },
         )
         self._baseline = quantities
+        self._sweep_floor = self._baseline_floor(record.ts)
+
+    def _baseline_floor(self, captured_at: datetime) -> datetime | None:
+        """Where fill queries may start, once a baseline is on record.
+
+        A baseline taken before ismet sent any order already holds every fill dated
+        before it, and none of those can be on an order ismet sent, so reporting them
+        as orphans would halt a first start on an account that traded that day. Only a
+        venue clock behind the local one can date a later fill before the baseline, and
+        such a fill still shows as a position difference.
+        """
+        return None if self._orders else captured_at
+
+    def _fill_window(self, since: datetime) -> datetime:
+        if self._sweep_floor is None:
+            return since
+        return max(since, self._sweep_floor)
 
     # State
 
@@ -790,8 +831,8 @@ class OrderManager:
         A read can race a local engage, and a local engage may not have reached the
         journal yet. In both cases the journal looks "not engaged", and believing it
         would silently switch the kill switch off. A release from elsewhere must sit on
-        an intact chain: anyone can insert a row in a SQLite file. The journal has already
-        ignored one naming no operator.
+        an intact chain: anyone can insert a row in a SQLite file. The journal has
+        already ignored one naming no operator.
         """
         if self._kill_unrecorded is not None or durable.seq <= self._kill.seq:
             return
@@ -949,20 +990,28 @@ class OrderManager:
             self._set_mark(symbol, price)
 
     async def _refresh_marks(self, request: OrderRequest) -> None:
-        """Bring marks up to date, if a gross limit applies to this order."""
+        """Bring marks up to date, if a gross limit applies to this order.
+
+        A held symbol whose reference data is still missing, after a failed lookup at
+        start or a position adjustment, is looked up again here, or its gross exposure
+        stays unknown for good.
+        """
         scopes = self._risk.config.limits_for(request)
         if all(limits.max_gross_notional is None for _, limits in scopes):
             return
         limit = float(self._risk.config.max_reference_age_seconds)
         now = self._clock.monotonic()
+        exposed = self._symbols_with_exposure() - {request.symbol}
         stale = [
             symbol
-            for symbol in self._symbols_with_exposure() - {request.symbol}
+            for symbol in exposed
             if symbol not in self._marks or now - self._marks[symbol][1] > limit
         ]
+        missing = [symbol for symbol in exposed if symbol not in self._instruments]
         quotes = await asyncio.gather(*(self._reference(symbol) for symbol in stale))
         for symbol, quote in zip(stale, quotes, strict=True):
             self._mark_quote(symbol, quote)
+        await asyncio.gather(*(self._instrument(symbol) for symbol in missing))
 
     def _risk_context(
         self,
@@ -1386,26 +1435,31 @@ class OrderManager:
         )
 
     async def _merge_adjustments(self) -> None:
-        """Adopt adjustments journalled since the last look, if the chain is intact."""
-        seen = self._adjustments_seen
-        records = await self._call_journal(
-            lambda: list(self._journal.records(after_seq=seen))
-        )
-        adjustments = [r for r in records if r.kind is RecordKind.POSITION_ADJUSTED]
-        if adjustments:
-            result = await self._call_journal(self._journal.verify)
-            if not result.ok:
-                logger.critical(
-                    "ignoring position adjustments: journal failed verification at "
-                    "record %s: %s",
-                    result.first_bad_seq,
-                    result.detail,
-                )
-                return
-        for record in adjustments:
-            self._apply_adjustment(record)
-        if records:
-            self._adjustments_seen = records[-1].seq
+        """Adopt adjustments journalled since the last look, if the chain is intact.
+
+        One look at a time: a second caller reading the same records during the
+        verification would apply each adjustment twice.
+        """
+        async with self._adjust_lock:
+            seen = self._adjustments_seen
+            records = await self._call_journal(
+                lambda: list(self._journal.records(after_seq=seen))
+            )
+            adjustments = [r for r in records if r.kind is RecordKind.POSITION_ADJUSTED]
+            if adjustments:
+                result = await self._call_journal(self._journal.verify)
+                if not result.ok:
+                    logger.critical(
+                        "ignoring position adjustments: journal failed verification "
+                        "at record %s: %s",
+                        result.first_bad_seq,
+                        result.detail,
+                    )
+                    return
+            for record in adjustments:
+                self._apply_adjustment(record)
+            if records:
+                self._adjustments_seen = records[-1].seq
 
     async def update_risk_config(self, config: RiskConfig, *, operator: str) -> None:
         """Replace risk limits, recording the change durably first."""
@@ -1445,6 +1499,11 @@ class OrderManager:
             event.fill_id in self._orders[cid].busted_fill_ids
         ):
             return  # a venue may repeat a bust, and the record already has it
+        if isinstance(event, Filled) and fill_contradicts(
+            self._orders[cid], event.fill
+        ):
+            # Recorded and halted on below; a sweep finding it again must not halt.
+            self._reported_corrections.add(_fill_terms(event.fill))
         await self._record(event)
 
     async def _consume_stream(self, stream: AsyncIterator[OrderEvent]) -> None:
@@ -1745,8 +1804,9 @@ class OrderManager:
         the journal holds where the window stands so a restart resumes from there.
         """
         began = self._last_sweep if self._last_sweep is not None else report.at
+        since = self._fill_window(began - self._fill_lookback)
         try:
-            fills = await self._venue.fills_since(began - self._fill_lookback)
+            fills = await self._venue.fills_since(since)
         except Exception as exc:
             self._query_failed(report, "fills", exc)
             return
@@ -1768,7 +1828,10 @@ class OrderManager:
         """Record what a venue query knows and this manager does not.
 
         A fill on an unknown order is reported once. It reaches the journal, so an
-        operator's release of the halt it causes is final, even across a restart.
+        operator's release of the halt it causes is final, even across a restart. A
+        known fill reported with other terms is recorded too, which raises the same
+        halting anomaly the stream would, once per fill and set of terms, so the
+        sweeps inside the lookback window do not halt again after a release.
         """
         for fill in fills:
             state = self._orders.get(fill.client_order_id)
@@ -1791,6 +1854,11 @@ class OrderManager:
             if not known or fill_adds_detail(state, fill):
                 await self._record_recovered_fill(fill)
                 report.resolved.append(fill.client_order_id)
+            elif fill_contradicts(state, fill):
+                terms = _fill_terms(fill)
+                if terms not in self._reported_corrections:
+                    self._reported_corrections.add(terms)
+                    await self._record_recovered_fill(fill)
 
     async def _record_recovered_fill(self, fill: Fill) -> None:
         await self._record(
@@ -1956,7 +2024,7 @@ class OrderManager:
         ]
         since = (min(times) if times else report.at) - self._fill_lookback
         try:
-            fills = await self._venue.fills_since(since, symbol)
+            fills = await self._venue.fills_since(self._fill_window(since), symbol)
         except Exception as exc:
             self._query_failed(report, str(symbol), exc)
             return

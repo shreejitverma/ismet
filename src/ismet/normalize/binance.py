@@ -28,6 +28,7 @@ from ismet.models import (
 )
 from ismet.models.types import to_decimal
 from ismet.normalize._common import (
+    copy_made_at,
     datetime_from_ms,
     normalizer,
     register_asset,
@@ -133,11 +134,14 @@ def bars_from_klines(
     interval: Interval,
     received: datetime,
     currency: str | None,
+    *,
+    as_of: datetime,
 ) -> list[Bar]:
     """Closed bars from ``GET /api/v3/klines``, ``exchange_ts`` being the open time.
 
-    A kline still open at ``received`` is dropped: Binance returns it, but its
-    OHLCV is not final and a caller keying on open time would never see it change.
+    A kline still open at ``as_of``, when the response was made, is dropped: Binance
+    returns it, but its OHLCV is not final and a caller keying on open time would never
+    see it change.
     Binance publishes zero-volume klines (``trade_count`` 0) and they are kept.
     Volume is in the base asset. ``vwap`` stays ``None`` rather than being derived
     from quote volume, which would need rounding.
@@ -145,7 +149,7 @@ def bars_from_klines(
     source = venue_source(PROVIDER, FEED_KLINES)
     bars: list[Bar] = []
     for row in rows:
-        if datetime_from_ms(row[6]) >= received:
+        if datetime_from_ms(row[6]) >= as_of:
             continue
         opened = datetime_from_ms(row[0])
         bars.append(
@@ -314,6 +318,7 @@ __all__ = [
     "PROVIDER",
     "bars_from_klines",
     "control_error",
+    "copy_made_at",
     "instrument_from_symbol_info",
     "next_kline_start",
     "order_book_from_depth",

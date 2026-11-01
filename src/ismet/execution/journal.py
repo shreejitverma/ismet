@@ -34,7 +34,7 @@ from enum import Enum
 from pathlib import Path
 from typing import IO, Protocol
 
-from ismet.errors import JournalError
+from ismet.errors import JournalError, ValidationError
 
 logger = logging.getLogger("ismet.execution")
 
@@ -282,6 +282,37 @@ CREATE TRIGGER IF NOT EXISTS journal_no_delete BEFORE DELETE ON journal
 """
 
 
+def _connect_read_only(path: Path) -> sqlite3.Connection:
+    """Read a journal without writing to it, even where nothing can be written.
+
+    SQLite cannot use a WAL database in a directory it cannot write to, as an audit copy
+    may be. With no WAL file to miss, such a file is safe to read as immutable.
+    """
+    uri = path.resolve().as_uri()
+    wal = path.with_name(path.name + "-wal")
+    has_wal = wal.exists() and wal.stat().st_size > 0
+    mode = "mode=ro"
+    if not has_wal and not os.access(path.parent, os.W_OK):
+        mode = "immutable=1"
+    return sqlite3.connect(
+        f"{uri}?{mode}", uri=True, check_same_thread=False, isolation_level=None
+    )
+
+
+def _check_is_journal(connection: sqlite3.Connection, path: Path) -> None:
+    """Only a file that is no database, or has no journal table, is not a journal."""
+    try:
+        row = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'journal'"
+        ).fetchone()
+    except sqlite3.DatabaseError as exc:
+        if "file is not a database" in str(exc):
+            raise ValidationError(f"{path} is not an ismet journal") from exc
+        raise JournalError(f"cannot read journal {path}: {exc}") from exc
+    if row is None:
+        raise ValidationError(f"{path} is not an ismet journal")
+
+
 class SqliteJournal:
     """A journal file safe to share between processes, such as an OMS and the CLI.
 
@@ -311,6 +342,27 @@ class SqliteJournal:
             self._conn.executescript(_SCHEMA)
         except (sqlite3.Error, OSError) as exc:
             raise JournalError(f"cannot open journal {self.path}: {exc}") from exc
+
+    @classmethod
+    def open_read_only(cls, path: str | Path) -> SqliteJournal:
+        """Open for reading only: no schema script, no pragmas.
+
+        Reading must not change the evidence. Recreating a dropped trigger would hide
+        the tampering, so this skips everything opening for writing does.
+        """
+        journal = cls.__new__(cls)
+        journal.path = Path(path)
+        journal._lock = threading.Lock()
+        try:
+            journal._conn = _connect_read_only(journal.path)
+        except sqlite3.Error as exc:
+            raise JournalError(f"cannot read journal {path}: {exc}") from exc
+        try:
+            _check_is_journal(journal._conn, journal.path)
+        except BaseException:
+            journal._conn.close()
+            raise
+        return journal
 
     def append(
         self,

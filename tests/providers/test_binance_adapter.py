@@ -12,9 +12,10 @@ import httpx
 import pytest
 
 from ismet.capabilities import Capability
-from ismet.config import ProviderSettings
+from ismet.config import ProviderSettings, Settings
 from ismet.errors import (
     AuthError,
+    ConfigError,
     RateLimited,
     TransportError,
     ValidationError,
@@ -708,3 +709,101 @@ async def test_a_server_that_only_acknowledges_exhausts_the_reconnect_bound() ->
         with pytest.raises(TransportError, match="after 2 reconnects"):
             await take(provider.stream_quotes([BTC]), 1)
     assert len(server.connections) == 3
+
+
+def _kline(opened: datetime) -> list[object]:
+    close_time = opened + timedelta(seconds=59, milliseconds=999)
+    return [
+        ms(opened),
+        "1",
+        "2",
+        "1",
+        "1.5",
+        "3",
+        ms(close_time),
+        "4",
+        5,
+        "1",
+        "1",
+        "0",
+    ]
+
+
+async def test_a_fast_host_clock_cannot_pass_a_partial_kline_off_as_closed() -> None:
+    """The host clock runs 3s fast, so its 02:09:01 is really 02:08:58.
+
+    By the host clock the 02:08 kline closed at 02:08:59.999, but Binance's own ``Date``
+    says the response was made a second and more before that close.
+    """
+    opened = datetime(2026, 11, 1, 2, 8, tzinfo=timezone.utc)
+    prior = opened - timedelta(minutes=1)
+    info = body("binance", "conformance", "exchangeInfo?symbol=BTCUSDT")
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if "exchangeInfo" in str(request.url):
+            return httpx.Response(200, json=info)
+        return httpx.Response(
+            200,
+            json=[_kline(prior), _kline(opened)],
+            headers={"date": "Sun, 01 Nov 2026 02:08:58 GMT"},
+        )
+
+    provider = BinanceProvider(
+        http_transport=httpx.MockTransport(respond),
+        clock=ManualClock(datetime(2026, 11, 1, 2, 9, 1, tzinfo=timezone.utc)),
+    )
+    async with provider:
+        bars = await provider.bars(
+            BTC, Interval.M1, prior, opened + timedelta(minutes=1)
+        )
+    assert [b.exchange_ts for b in bars] == [prior]
+
+
+async def test_a_ban_on_the_klines_path_is_still_remembered() -> None:
+    calls = 0
+    info = body("binance", "conformance", "exchangeInfo?symbol=BTCUSDT")
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        if "exchangeInfo" in str(request.url):
+            return httpx.Response(200, json=info)
+        calls += 1
+        return httpx.Response(418, json={"code": -1003, "msg": "IP banned"})
+
+    start = datetime(2026, 11, 1, 2, 8, tzinfo=timezone.utc)
+    provider = BinanceProvider(
+        http_transport=httpx.MockTransport(respond),
+        retry_policy=NO_RETRY,
+        clock=ManualClock(start + timedelta(hours=1)),
+    )
+    async with provider:
+        for _ in range(2):
+            with pytest.raises(RateLimited):
+                await provider.bars(BTC, Interval.M1, start, start + timedelta(hours=1))
+    assert calls == 1
+
+
+def _unreachable(**options: object) -> ProviderSettings:
+    return ProviderSettings(
+        name="binance", options={"ws_url": "ws://127.0.0.1:1", **options}
+    )
+
+
+async def test_the_reconnect_bound_is_reachable_from_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ISMET_BINANCE_WS_MAX_RECONNECTS", "0")
+    monkeypatch.setenv("ISMET_BINANCE_WS_URL", "ws://127.0.0.1:1")
+    monkeypatch.setenv("ISMET_PROVIDERS", "binance")
+    settings = Settings.load().for_provider("binance")
+    provider = BinanceProvider.from_settings(settings)
+    provider._currencies["BTCUSDT"] = "USDT"
+    async with provider:
+        with pytest.raises(TransportError, match="after 0 reconnects"):
+            await take(provider.stream_trades([BTC]), 1)
+
+
+@pytest.mark.parametrize("value", [-1, "many", True, 1.5])
+def test_a_reconnect_bound_that_is_not_a_count_is_refused(value: object) -> None:
+    with pytest.raises(ConfigError, match="ws_max_reconnects"):
+        BinanceProvider.from_settings(_unreachable(ws_max_reconnects=value))

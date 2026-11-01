@@ -99,8 +99,8 @@ class RiskConfig(BaseModel):
         """An entry spelled unlike a symbol would silently restrict nothing.
 
         Tickers are case-sensitive, but an operator's spelling of one is not a reason to
-        trade it, so entries and orders are compared in upper case. Two tickers differing
-        only in case are restricted together.
+        trade it, so entries and orders are compared in upper case. Two tickers
+        differing only in case are restricted together.
         """
         return frozenset(
             (str(Symbol.parse(entry)) if "@" in entry else entry.strip()).upper()
@@ -502,7 +502,8 @@ def _reduces_position(ctx: RiskContext) -> bool:
     pending = _sum_leaves(ctx.open_orders, request.symbol, request.side)
     signed = mul(Decimal(request.side.sign), add(pending, request.quantity))
     resulting = add(ctx.position, signed)
-    same_direction = (resulting >= 0) == (ctx.position > 0)
+    # Closing to exactly flat reduces from either side; crossing through flat does not.
+    same_direction = resulting == 0 or (resulting > 0) == (ctx.position > 0)
     return same_direction and absolute(resulting) < absolute(ctx.position)
 
 

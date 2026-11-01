@@ -119,7 +119,7 @@ What happens, and why it matters:
 - **Journal first.** The intent is flushed to disk before the network call.
 - **Send once.** Orders are never retried automatically, because a timeout does not mean the order failed. FIX has one exception the protocol requires: a counterparty's resend request retransmits a stored order with PossDupFlag=Y, only within 60 seconds by default.
 - **Unknown is a state.** A lost response leaves the order `UNKNOWN`, blocks new risk in that symbol, and is resolved by asking the venue by client order id.
-- **Fail closed.** No instrument, no reference price, no calendar answer, unverified positions, a stale quote, a zero price where a notional is needed, or an error inside a check all refuse the order.
+- **Fail closed.** No instrument, no reference price, no calendar answer for an order that must trade now, unverified positions, a stale quote, a zero price where a notional is needed, or an error inside a check all refuse the order.
 - **Gross limits use the market.** A gross limit values held positions at current marks, never cost basis. Each order refreshes marks older than `max_reference_age_seconds`, costing one quote per such symbol, and a failed quote refuses new risk. Exposure across currencies fails the limit closed, because no rate is assumed, and `RiskConfig.limit_currency` refuses orders in any other currency.
 - **Crash safe.** Restart on the same journal to recover: orders that never reached the send are closed, the rest are looked up, and fills made while down are booked. Tested with real `SIGKILL`.
 - **Kill switch.** `ismet kill engage --journal orders.db --reason "..." --operator "..."` stops every process using that journal.
@@ -136,10 +136,10 @@ It is not for colocated, sub-millisecond strategies.
 - **Money is exact.** `Decimal` everywhere, in a private exact context that ignores the ambient decimal settings. Floats are rejected.
 - **Real markets are representable.** Zero and negative prices, locked and crossed books, and clock skew are valid data, flagged rather than rejected.
 - **Identity is validated.** MICs and currencies against ISO snapshots, and ISIN, CUSIP, SEDOL, FIGI, and LEI by check digit.
-- **Calendars refuse to guess.** A date outside a venue's sourced data raises `CalendarOutOfRange`, which also refuses the order.
-- **History is reproducible.** `BarStore` keeps restated bars and reads data as it stood at a past time, and with no `as_of` returns the latest. `SecurityMaster` answers "what did this ticker mean then, and what did we know then". A later record for the same symbol and start date replaces an earlier one from that time on, and a past query still sees what was believed then.
-- **Backfills do not overclaim.** With a calendar, a window stays open until each session in it has a bar, and `BackfillReport` lists `sessions_missing`. A session with truly no trades therefore keeps the report incomplete.
-- **Flags travel with the data.** Exports carry `quality`, `source`, and `timeliness` columns. A Coinbase bar served from a CDN copy too old to show its bucket closed is flagged `STALE`; repeat the request once the copy expires.
+- **Calendars refuse to guess.** A date outside a venue's sourced data raises `CalendarOutOfRange`, which also refuses the order, unless it rests for later: OPG, CLS, or GTC or GTD on a limit or stop limit skip the session check.
+- **History is reproducible.** `BarStore` keeps restated bars and reads data as it stood at a past time, and with no `as_of` returns the latest. `SecurityMaster` answers "what did this ticker mean then, and what did we know then". A later record for the same symbol and start date replaces an earlier one from that time on, and a past query still sees what was believed then. A listing recorded with the wrong start date is taken back with `SecurityMaster.retract`, and a corporate action on the wrong ex-date with a neutral record on that date: `ratio=1` or `price_factor=1`.
+- **Backfills do not overclaim.** With a calendar, the window holding a session's close stays open until that session has a bar, in that window or an earlier one, and `BackfillReport` lists `sessions_missing`. A session with truly no trades therefore keeps the report incomplete.
+- **Flags travel with the data.** Exports carry `quality`, `source`, and `timeliness` columns. A Coinbase bar served from a CDN copy too old to show its bucket closed is flagged `STALE`, and a copy with no bars for such a window raises; repeat the request once the copy expires.
 - **Support is proven, not claimed.** A provider is listed only if it passes conformance on recorded responses.
 
 ## Providers
@@ -169,7 +169,8 @@ nyse.session(date(2026, 11, 27)).early_close  # True: closes at 13:00 New York
 nyse.is_open(datetime.now(timezone.utc))
 nyse.settlement_date(date(2026, 11, 25), 1)  # T+1 across Thanksgiving
 
-closed = nyse.with_closure(date(2026, 12, 7))  # a copy; register_calendar(closed) applies it
+# A copy; register_calendar(closed) applies it.
+closed = nyse.with_closure(date(2026, 12, 7))
 ```
 
 Bundled: XNYS, XNAS, XNSE, XBOM, XLON, XTKS, XJPX, XHKG, XSHG, XSHE, XETR, XFRA, XPAR, XAMS, XBRU, XMIL, XMAD, XSWX, XSTO, XTSE, XASX, XKRX, XSES, XTAI, XJSE, BVMF, XMEX, XNZE, and 24x7 crypto venues.
@@ -213,8 +214,9 @@ uv run ruff check . && uv run ruff format --check . && uv run mypy
 uv run pytest --cov
 ```
 
-CI runs on Linux, macOS, and Windows for every supported Python version, with `mypy --strict`, a 90 percent coverage gate, a calendar differential test, performance budgets, a dependency audit, CodeQL, and a fresh-install smoke test.
+CI runs on Linux, macOS, and Windows for every supported Python version, with `mypy --strict`, a 90 percent coverage gate, a calendar differential test, performance budgets, a dependency audit, and a fresh-install smoke test.
 A release publishes only from a tag naming the package's version, and only after all of that passes on the tagged commit.
+CodeQL runs in its own workflow and is not part of that gate, so a tag can publish before CodeQL has analysed its commit.
 
 ## Disclaimer
 

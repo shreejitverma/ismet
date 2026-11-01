@@ -484,6 +484,7 @@ class Client:
             ack_timeout=ack_timeout,
             query_timeout=5.0,
             logon_timeout=10.0,
+            venues=("XNAS",),
         )
         await self.provider.open()
         self._task = asyncio.create_task(self._collect(self.provider))
@@ -715,7 +716,8 @@ class TestSequenceRecovery:
         await client.disconnect()
 
         store = client.open_store()
-        store.set_next_outbound(store.next_outbound() + 3)
+        for _ in range(3):  # numbers consumed with nothing stored under them
+            store.allocate_outbound()
 
         provider = await client.connect()
         await provider.place_order(order("C2"))
@@ -762,7 +764,7 @@ class TestSequenceRecovery:
         await client.disconnect()
 
         store = client.open_store()
-        store.set_next_outbound(1)
+        store.reset_sequences()  # an operator's reset that the venue did not share
         config = client.config()
         provider = FixProvider(config, store, logon_timeout=5.0)
         client.provider = provider

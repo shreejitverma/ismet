@@ -98,13 +98,7 @@ class FixStore(Protocol):
 
     def set_next_inbound(self, value: int) -> None: ...
 
-    def set_next_outbound(self, value: int) -> None: ...
-
     def messages(self, begin: int, end: int) -> list[StoredMessage]: ...
-
-    def prune_messages_sent_before(self, sending_time: str) -> int:
-        """Drop outbound messages older than a UTCTimestamp, so they get gap-filled."""
-        ...
 
     def reset_sequences(self) -> None:
         """Begin a new FIX session: both numbers become 1, stored messages go."""
@@ -162,8 +156,15 @@ class FixStore(Protocol):
 
     def quarantined(self) -> list[QuarantinedMessage]: ...
 
-    def release_quarantine(self, operator: str, reason: str, at: str) -> int:
-        """Record an operator's release of every unreleased row. Returns the count."""
+    def release_quarantine(
+        self, operator: str, reason: str, at: str, *, expected: int
+    ) -> int:
+        """Record an operator's release of every unreleased row, in one transaction.
+
+        Returns how many unreleased rows there are. Nothing changes unless that equals
+        ``expected``, the count the operator saw, so a row that arrived meanwhile is
+        never released unseen.
+        """
         ...
 
     def close(self) -> None: ...
@@ -201,23 +202,10 @@ class MemoryFixStore:
     def set_next_inbound(self, value: int) -> None:
         self._next_in = value
 
-    def set_next_outbound(self, value: int) -> None:
-        self._next_out = value
-
     def messages(self, begin: int, end: int) -> list[StoredMessage]:
         return [
             self._messages[seq] for seq in sorted(self._messages) if begin <= seq <= end
         ]
-
-    def prune_messages_sent_before(self, sending_time: str) -> int:
-        stale = [
-            seq
-            for seq, message in self._messages.items()
-            if message.sending_time < sending_time
-        ]
-        for seq in stale:
-            del self._messages[seq]
-        return len(stale)
 
     def reset_sequences(self) -> None:
         self._next_out = 1
@@ -297,15 +285,24 @@ class MemoryFixStore:
     def quarantined(self) -> list[QuarantinedMessage]:
         return list(self._quarantine)
 
-    def release_quarantine(self, operator: str, reason: str, at: str) -> int:
-        count = 0
-        for index, record in enumerate(self._quarantine):
-            if record.released_by is None:
-                self._quarantine[index] = dataclasses.replace(
-                    record, released_by=operator, release_reason=reason, released_at=at
-                )
-                count += 1
-        return count
+    def release_quarantine(
+        self, operator: str, reason: str, at: str, *, expected: int
+    ) -> int:
+        unreleased = [
+            index
+            for index, record in enumerate(self._quarantine)
+            if record.released_by is None
+        ]
+        if len(unreleased) != expected:
+            return len(unreleased)
+        for index in unreleased:
+            self._quarantine[index] = dataclasses.replace(
+                self._quarantine[index],
+                released_by=operator,
+                release_reason=reason,
+                released_at=at,
+            )
+        return len(unreleased)
 
     def close(self) -> None:
         """Nothing to release."""
@@ -476,13 +473,6 @@ class SqliteFixStore:
                 (value, self.session),
             )
 
-    def set_next_outbound(self, value: int) -> None:
-        with self._transaction() as conn:
-            conn.execute(
-                "UPDATE fix_sequence SET next_out = ? WHERE session = ?",
-                (value, self.session),
-            )
-
     def messages(self, begin: int, end: int) -> list[StoredMessage]:
         rows = self._query(
             "SELECT seq, msg_type, sending_time, body FROM fix_outbound "
@@ -495,14 +485,6 @@ class SqliteFixStore:
             StoredMessage(int(str(r[0])), str(r[1]), str(r[2]), bytes(_blob(r[3])))
             for r in rows
         ]
-
-    def prune_messages_sent_before(self, sending_time: str) -> int:
-        with self._transaction() as conn:
-            cursor = conn.execute(
-                "DELETE FROM fix_outbound WHERE session = ? AND sending_time < ?",
-                (self.session, sending_time),
-            )
-            return int(cursor.rowcount)
 
     def reset_sequences(self) -> None:
         with self._transaction() as conn:
@@ -685,14 +667,24 @@ class SqliteFixStore:
             for r in rows
         ]
 
-    def release_quarantine(self, operator: str, reason: str, at: str) -> int:
+    def release_quarantine(
+        self, operator: str, reason: str, at: str, *, expected: int
+    ) -> int:
         with self._transaction() as conn:
-            cursor = conn.execute(
+            row = conn.execute(
+                "SELECT COUNT(*) FROM fix_quarantine "
+                "WHERE session = ? AND released_by IS NULL",
+                (self.session,),
+            ).fetchone()
+            unreleased = int(row[0])
+            if unreleased != expected:
+                return unreleased
+            conn.execute(
                 "UPDATE fix_quarantine SET released_by = ?, release_reason = ?, "
                 "released_at = ? WHERE session = ? AND released_by IS NULL",
                 (operator, reason, at, self.session),
             )
-            return int(cursor.rowcount)
+            return unreleased
 
     def close(self) -> None:
         with self._lock:

@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from functools import wraps
 from typing import ParamSpec, TypeVar
 
@@ -100,6 +101,23 @@ def parse_iso8601_utc(text: str) -> tuple[datetime, int | None]:
     seconds = (whole - _EPOCH) // timedelta(seconds=1)
     nanos = seconds * _NANOS_PER_SECOND + int(fraction.ljust(_NANOS_DIGITS, "0"))
     return datetime_from_ns(nanos), nanos if len(fraction) > _MICROS_DIGITS else None
+
+
+def copy_made_at(headers: Mapping[str, str], received: datetime) -> datetime:
+    """When a response was made, by the server's clock: ``Date`` minus any CDN ``Age``.
+
+    Never later than ``received``, so a fast host clock cannot make a bar look closed.
+    With no readable ``Date`` the response can only be taken as fresh, so this is
+    ``received``.
+    """
+    try:
+        served = parsedate_to_datetime(headers["date"])
+        age = timedelta(seconds=max(int(headers.get("age", 0)), 0))
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return received
+    if served.tzinfo is None:
+        served = served.replace(tzinfo=timezone.utc)
+    return min(received, served - age)
 
 
 def register_asset(code: str) -> str | None:
@@ -217,6 +235,7 @@ class StreamGate:
 __all__ = [
     "StreamGate",
     "check_range",
+    "copy_made_at",
     "datetime_from_ms",
     "merge_bars",
     "normalizer",

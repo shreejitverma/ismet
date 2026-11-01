@@ -24,6 +24,7 @@ from ismet.execution import (
     RiskLimits,
     SqliteJournal,
 )
+from ismet.execution.manager import CheckpointHook
 from ismet.execution.reconcile import BreakKind, ReconBreak
 from ismet.fix.provider import FixProvider
 from ismet.fix.store import FixStore, MemoryFixStore, SqliteFixStore
@@ -77,7 +78,7 @@ async def quote_source(symbol: Symbol) -> Quote:
     )
 
 
-def risk() -> RiskEngine:
+def risk(*, block_while_unknown: bool = False) -> RiskEngine:
     return RiskEngine(
         RiskConfig(
             default=RiskLimits(
@@ -90,9 +91,21 @@ def risk() -> RiskEngine:
             allow_short=True,
             prevent_self_match=False,
             enforce_session=False,
-            block_while_unknown=False,
+            block_while_unknown=block_while_unknown,
         )
     )
+
+
+class SimulatedCrash(BaseException):
+    """The process died here."""
+
+
+def crash_at(name: str) -> CheckpointHook:
+    def checkpoint(step: str, _: str) -> None:
+        if step == name:
+            raise SimulatedCrash(step)
+
+    return checkpoint
 
 
 def request(cid: str = "C1", **kw: Any) -> OrderRequest:
@@ -121,7 +134,13 @@ class Rig:
         self.breaks: list[ReconBreak] = []
 
     async def build(
-        self, *, ack_timeout: float = 0.2, unknown_grace: float = 0.0, **session: Any
+        self,
+        *,
+        ack_timeout: float = 0.2,
+        unknown_grace: float = 0.0,
+        checkpoint: CheckpointHook | None = None,
+        block_while_unknown: bool = False,
+        **session: Any,
     ) -> OrderManager:
         self.store = SqliteFixStore(self.fix_path, "s")
         self.journal = SqliteJournal(self.journal_path)
@@ -131,12 +150,13 @@ class Rig:
             ack_timeout=ack_timeout,
             query_timeout=1.0,
             logon_timeout=5.0,
+            venues=(ACME.venue,),
         )
         await self.provider.open()
         self.oms = OrderManager(
             self.provider,
             self.journal,
-            risk(),
+            risk(block_while_unknown=block_while_unknown),
             instrument_source=instrument_source,
             reference_source=quote_source,
             allow_live=True,
@@ -146,6 +166,7 @@ class Rig:
             reconcile_interval=3600.0,
             kill_poll_interval=0.01,
             on_break=self.breaks.append,
+            checkpoint=checkpoint,
         )
         await self.oms.start()
         return self.oms
@@ -577,6 +598,78 @@ class TestCrashRecovery:
         assert acceptor.resend_requests_answered == 0
         assert len(acceptor.logons) == 2
         assert int(acceptor.logons[1].require(34)) > 1
+
+    async def test_death_between_send_started_and_the_store_row_closes_as_never_sent(
+        self, acceptor: FixAcceptor, rig: Rig
+    ) -> None:
+        """The provider writes its row before the socket, so an intact store with no
+        row proves nothing left: the order closes and trading resumes."""
+        oms = await rig.build(checkpoint=crash_at("after_send_started"))
+        with pytest.raises(SimulatedCrash):
+            await oms.submit(request())
+        await rig.teardown()
+        assert acceptor.of_type("D") == []
+
+        # The journal replays C1 as unknown, and the startup reconciliation closes it.
+        restarted = await rig.build(block_while_unknown=True)
+        report = await restarted.reconcile()
+        assert not [b for b in report.breaks if b.kind is BreakKind.QUERY_FAILED]
+        closed = restarted.order("C1")
+        assert closed.status is OrderStatus.REJECTED
+        assert closed.reject_code == "NOT_FOUND_AT_VENUE"
+        assert closed.filled_quantity == Decimal(0)
+        assert acceptor.of_type("D") == []
+        assert acceptor.of_type("H") == [], "the store answered, not the venue"
+
+        state = await restarted.submit(request("C2"))
+        assert state.status is OrderStatus.ACCEPTED
+        assert [m.get(11) for m in acceptor.of_type("D")] == ["C2"]
+        assert list(acceptor.orders) == ["C2"]
+
+    async def test_death_before_the_store_row_with_a_lost_store_stays_refused(
+        self, acceptor: FixAcceptor, rig: Rig
+    ) -> None:
+        """A new empty store proves nothing, so the order stays unknown and new orders
+        stay refused until an operator resolves it."""
+        oms = await rig.build(checkpoint=crash_at("after_send_started"))
+        with pytest.raises(SimulatedCrash):
+            await oms.submit(request())
+        await rig.teardown()
+        for lost in rig.fix_path.parent.glob(f"{rig.fix_path.name}*"):
+            lost.unlink()
+        # The venue began a new session too, so a fresh store can log on at all.
+        acceptor.next_in = 1
+        acceptor.next_out = 1
+        acceptor.sent.clear()
+
+        restarted = await rig.build(block_while_unknown=True)
+        report = await restarted.reconcile()
+        assert restarted.order("C1").status is OrderStatus.UNKNOWN
+        failed = [b for b in report.breaks if b.kind is BreakKind.QUERY_FAILED]
+        assert failed and "no local record" in failed[0].detail
+        with pytest.raises(RiskRejected):
+            await restarted.submit(request("C2"))
+        assert acceptor.of_type("D") == []
+
+
+class TestHaltAcrossRestart:
+    async def test_the_first_order_after_a_restart_is_refused_while_halted(
+        self, acceptor: FixAcceptor, rig: Rig
+    ) -> None:
+        """``submit`` right after ``start`` can run before the stream loop has read
+        the halt, so the provider itself must refuse."""
+        oms = await rig.build()
+        await oms.submit(request())
+        await acceptor.send("8", [(150, "F"), (17, "NOID"), (32, "10"), (31, "5")])
+        await eventually(lambda: oms.stream_healthy is False)
+        await rig.teardown()
+
+        restarted = await rig.build()
+        with contextlib.suppress(RiskRejected):
+            state = await restarted.submit(request("C2"))
+            assert state.status is OrderStatus.REJECTED
+        assert [m.get(11) for m in acceptor.of_type("D")] == ["C1"]
+        assert list(acceptor.orders) == ["C1"]
 
 
 class TestSafetyInterlocks:

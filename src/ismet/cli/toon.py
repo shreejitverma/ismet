@@ -2,7 +2,7 @@
 
 See https://toonformat.dev/reference/spec.html. Objects are ``key: value`` lines with
 two-space nesting, uniform lists are ``name[N]{a,b}:`` tables, and other lists are
-``name[N]:`` followed by ``- `` items.
+``name[N]:`` followed by ``- `` scalar items.
 """
 
 from __future__ import annotations
@@ -73,21 +73,10 @@ def _is_table(items: Sequence[Any]) -> bool:
     )
 
 
-def _is_nested(value: Any) -> bool:
-    return isinstance(value, Mapping | list | tuple)
-
-
-def _item_lines(item: Any, depth: int) -> list[str]:
-    pad = "  " * depth
-    if not _is_nested(item):
-        return [f"{pad}- {scalar(item)}"]
-    if isinstance(item, Mapping):
-        lines = _mapping_lines(item, depth + 1)
-    else:
-        lines = _field_lines("", item, depth + 1)
-    if not lines:
-        return [f"{pad}-"]
-    return [f"{pad}- {lines[0].lstrip()}", *lines[1:]]
+def _item_line(item: Any, depth: int) -> str:
+    if isinstance(item, Mapping | list | tuple):
+        raise TypeError("a TOON list here holds scalars or uniform rows")
+    return f"{'  ' * depth}- {scalar(item)}"
 
 
 def _field_lines(head: str, item: Any, depth: int) -> list[str]:
@@ -102,10 +91,10 @@ def _field_lines(head: str, item: Any, depth: int) -> list[str]:
             f"{pad}{head}[{len(item)}]{{{fields}}}:",
             *(f"{pad}  " + ",".join(scalar(v) for v in row.values()) for row in item),
         ]
-    lines = [f"{pad}{head}[{len(item)}]:"]
-    for element in item:
-        lines.extend(_item_lines(element, depth + 1))
-    return lines
+    return [
+        f"{pad}{head}[{len(item)}]:",
+        *(_item_line(element, depth + 1) for element in item),
+    ]
 
 
 def _mapping_lines(value: Mapping[Any, Any], depth: int) -> list[str]:

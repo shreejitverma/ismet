@@ -37,6 +37,7 @@ from ismet.observability import (
     order_event_hook,
 )
 from ismet.providers.mock import MockProvider
+from ismet.refdata.master import ActionKind, CorporateAction, adjust_bars
 from ismet.store import BarStore, backfill
 from ismet.transport.clock import ManualClock
 from ismet.transport.http import RequestInfo
@@ -553,3 +554,188 @@ async def test_client_stream_can_treat_gaps_as_fatal() -> None:
                 ["ACME"], venue="XMOK", gap_policy=GapPolicy.RAISE
             ):
                 pass
+
+
+def test_a_stale_replay_cannot_overwrite_a_newer_restatement(store: BarStore) -> None:
+    store.write([bar(close="10", revision=0)])
+    store.write([bar(close="11", revision=1)])
+    result = store.write([bar(close="10", revision=0)])
+    assert (result.inserted, result.unchanged, result.revised) == (0, 1, 0)
+    span = (SYM, Interval.D1, DAY, DAY + timedelta(minutes=1))
+    assert [b.close for b in store.read(*span)] == [D("11")]
+    assert store.revisions(SYM, Interval.D1, DAY) == 2
+
+
+def test_a_correction_without_a_revision_number_is_still_a_revision(
+    store: BarStore,
+) -> None:
+    store.write([bar(close="10")])
+    assert store.write([bar(close="11")]).revised == 1
+
+
+def test_a_series_cannot_mix_adjustment_scales(store: BarStore) -> None:
+    store.write([bar(close="10")])
+    adjusted = bar(close="10.5", adjustment=Adjustment.SPLIT)
+    with pytest.raises(ValidationError, match="split"):
+        store.write([adjusted])
+    span = (SYM, Interval.D1, DAY, DAY + timedelta(minutes=1))
+    assert [(b.close, b.adjustment) for b in store.read(*span)] == [
+        (D("10"), Adjustment.RAW)
+    ]
+    assert store.revisions(SYM, Interval.D1, DAY) == 1
+
+
+def test_descriptive_symbol_fields_are_not_a_revision(store: BarStore) -> None:
+    store.write([bar()])
+    described = Symbol(venue="XNYS", ticker="ACME", vendor_codes={"polygon": "ACME"})
+    span = (SYM, Interval.D1, DAY, DAY + timedelta(minutes=1))
+    before = store.checksum(*span)
+    result = store.write([bar(symbol=described)])
+    assert (result.inserted, result.unchanged, result.revised) == (0, 1, 0)
+    assert store.checksum(*span) == before
+
+
+def test_formatting_of_a_price_is_not_a_revision(store: BarStore) -> None:
+    store.write([bar(close="10.10")])
+    assert store.write([bar(close="10.1")]).unchanged == 1
+
+
+def _at(ts: datetime, symbol: Symbol) -> Bar:
+    return bar(ts=ts, symbol=symbol, interval=Interval.H1, session_date=None)
+
+
+ASX = Symbol(venue="XASX", ticker="BHP")
+
+
+async def test_a_session_straddling_windows_with_no_bar_keeps_the_report_open(
+    store: BarStore,
+) -> None:
+    """Sydney's Monday 2026-03-09 runs 23:00 Sunday to 05:00 Monday UTC.
+
+    Each one-day UTC window holds a part of every session and none wholly, and the
+    Tuesday session here got no bar on either side of midnight.
+    """
+    sunday = datetime(2026, 3, 8, tzinfo=UTC)
+    answers = {
+        sunday: [_at(sunday + timedelta(hours=23), ASX)],
+        sunday + timedelta(days=1): [_at(sunday + timedelta(days=1, hours=1), ASX)],
+        sunday + timedelta(days=2): [_at(sunday + timedelta(days=2, hours=23), ASX)],
+    }
+
+    async def fetch(symbol, interval, start, end):  # type: ignore[no-untyped-def]
+        return answers[start]
+
+    report = await backfill(
+        fetch,
+        store,
+        ASX,
+        Interval.H1,
+        sunday,
+        sunday + timedelta(days=3),
+        window=timedelta(days=1),
+        calendar=get_calendar("XASX"),
+    )
+    assert report.sessions_missing == [date(2026, 3, 10)]
+    assert not report.complete
+    assert report.windows_incomplete == 1
+
+
+async def test_a_straddling_session_is_found_by_a_bar_in_the_window_before(
+    store: BarStore,
+) -> None:
+    sunday = datetime(2026, 3, 8, tzinfo=UTC)
+    answers = {
+        # Monday's session has its only bar before midnight, Tuesday's after.
+        sunday: [_at(sunday.replace(hour=23), ASX)],
+        sunday + timedelta(days=1): [_at(sunday + timedelta(days=1, hours=23), ASX)],
+    }
+
+    async def fetch(symbol, interval, start, end):  # type: ignore[no-untyped-def]
+        return answers[start]
+
+    report = await backfill(
+        fetch,
+        store,
+        ASX,
+        Interval.H1,
+        sunday,
+        sunday + timedelta(days=2),
+        window=timedelta(days=1),
+        calendar=get_calendar("XASX"),
+    )
+    assert report.complete and report.sessions_missing == []
+
+
+async def test_a_session_begun_before_the_requested_range_is_not_required(
+    store: BarStore,
+) -> None:
+    """Only the last hour of that session was asked for, so it proves nothing."""
+    start = datetime(2026, 3, 9, 4, tzinfo=UTC)  # inside Sydney's Monday session
+
+    async def fetch(symbol, interval, begin, end):  # type: ignore[no-untyped-def]
+        return [_at(datetime(2026, 3, 9, 23, tzinfo=UTC), ASX)]
+
+    report = await backfill(
+        fetch,
+        store,
+        ASX,
+        Interval.H1,
+        start,
+        datetime(2026, 3, 10, tzinfo=UTC),
+        window=timedelta(days=1),
+        calendar=get_calendar("XASX"),
+    )
+    assert report.complete
+
+
+async def test_a_weekend_window_from_utc_midnight_finishes_and_is_not_refetched(
+    store: BarStore,
+) -> None:
+    """Saturday 00:00 UTC is still Friday evening in New York, after the close."""
+    saturday = datetime(2026, 3, 7, tzinfo=UTC)
+    calls: list[datetime] = []
+
+    async def fetch(symbol, interval, start, end):  # type: ignore[no-untyped-def]
+        calls.append(start)
+        return []
+
+    span = (fetch, store, SYM, Interval.D1, saturday, saturday + timedelta(days=1))
+    calendar = get_calendar("XNYS")
+    first = await backfill(*span, window=timedelta(days=1), calendar=calendar)
+    assert first.complete and first.windows_fetched == 1
+    second = await backfill(*span, window=timedelta(days=1), calendar=calendar)
+    assert second.complete and second.windows_skipped == 1
+    assert calls == [saturday]
+
+
+async def test_an_empty_window_cutting_through_a_session_is_not_proven_empty(
+    store: BarStore,
+) -> None:
+    async def fetch(symbol, interval, start, end):  # type: ignore[no-untyped-def]
+        return []
+
+    monday = datetime(2026, 3, 9, 15, tzinfo=UTC)  # the session is open
+    report = await backfill(
+        fetch,
+        store,
+        SYM,
+        Interval.H1,
+        monday,
+        monday + timedelta(hours=1),
+        window=timedelta(hours=1),
+        calendar=get_calendar("XNYS"),
+    )
+    assert report.windows_empty_unproven == 1 and not report.complete
+
+
+def test_polars_names_the_way_out_when_decimals_are_too_wide() -> None:
+    pytest.importorskip("polars")
+    split = CorporateAction(ActionKind.SPLIT, date(2026, 3, 10), ratio=D(3))
+    raw = bar(close="100", open="100", high="100", low="100", session_date=DAY.date())
+    series = BarSeries(adjust_bars([raw], [split]))
+    assert series[0].close != D(100)
+    with pytest.raises(ValidationError, match="lossy_float"):
+        series.to_polars()
+    with pytest.raises(ValidationError, match="lossy_float"):
+        to_polars(series)
+    assert series.to_polars(lossy_float=True)["close"].dtype.is_float()

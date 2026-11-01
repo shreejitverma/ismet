@@ -22,7 +22,7 @@ from typing import TypeVar
 from ismet.calendars import TradingCalendar, get_calendar
 from ismet.errors import ValidationError
 from ismet.models import Adjustment, Bar, Symbol
-from ismet.models.decimals import mul, ratio, sub
+from ismet.models.decimals import add, mul, ratio, sub
 
 _FOREVER = date.max
 _BEGINNING = datetime(1900, 1, 1, tzinfo=timezone.utc)
@@ -37,7 +37,9 @@ class Listing:
     record for the same ``symbol`` and ``valid_from`` with a later ``known_from``. It
     replaces the old record from that time on, so it can change the security or end the
     range, and the old one stays in place, so a past query still returns what was
-    believed then.
+    believed then. A correction cannot change ``valid_from``, which is part of what it
+    replaces: record the listing with the right start, and take the wrong one back with
+    :meth:`SecurityMaster.retract`, which sets ``retracted``.
     """
 
     security_id: str
@@ -47,6 +49,7 @@ class Listing:
     known_from: datetime = _BEGINNING
     isin: str | None = None
     figi: str | None = None
+    retracted: bool = False
 
     def __post_init__(self) -> None:
         if self.valid_to <= self.valid_from:
@@ -82,8 +85,19 @@ class SecurityMaster:
     def add(self, listing: Listing) -> None:
         self.listings.append(listing)
 
+    def retract(
+        self, symbol: Symbol, valid_from: date, *, known_from: datetime
+    ) -> None:
+        """Record that the listing of ``symbol`` from ``valid_from`` was never true.
+
+        Queries stop returning it from ``known_from`` on, and earlier ones still see
+        what was believed then. A later record for the same symbol and date reinstates
+        it.
+        """
+        self.add(Listing("", symbol, valid_from, known_from=known_from, retracted=True))
+
     def _in_force(self, known_at: datetime | None) -> list[Listing]:
-        """Records known at ``known_at`` that no later record has replaced."""
+        """Records known at ``known_at`` that no later record replaced or retracted."""
         known = [
             listing
             for listing in self.listings
@@ -93,10 +107,20 @@ class SecurityMaster:
         for listing in known:
             key = (listing.symbol, listing.valid_from)
             newest[key] = max(newest.get(key, listing.known_from), listing.known_from)
-        return [
+        current = [
             listing
             for listing in known
             if listing.known_from == newest[(listing.symbol, listing.valid_from)]
+        ]
+        taken_back = {
+            (listing.symbol, listing.valid_from)
+            for listing in current
+            if listing.retracted
+        }
+        return [
+            listing
+            for listing in current
+            if (listing.symbol, listing.valid_from) not in taken_back
         ]
 
     def resolve(
@@ -135,11 +159,17 @@ class SecurityMaster:
             f"{security_id} on {on}",
         )
 
-    def history(self, security_id: str) -> list[Listing]:
-        """Every listing of a security, in date order."""
+    def history(
+        self, security_id: str, *, known_at: datetime | None = None
+    ) -> list[Listing]:
+        """Every listing of a security in date order, as known at ``known_at``."""
         return sorted(
-            (lst for lst in self.listings if lst.security_id == security_id),
-            key=lambda lst: (lst.valid_from, lst.known_from),
+            (
+                listing
+                for listing in self._in_force(known_at)
+                if listing.security_id == security_id
+            ),
+            key=lambda listing: (listing.valid_from, listing.known_from),
         )
 
     def universe(
@@ -187,7 +217,12 @@ class CorporateAction:
     A correction is a new record of the same ``kind`` and ``ex_date`` with a later
     ``known_from``. Two cash dividends on one ex-date are both paid only if they share a
     ``known_from``, so a special dividend announced later must be recorded with the
-    regular one, or combined with it.
+    regular one, or combined with it. Dividends on one ex-date scale by their total.
+
+    A correction replaces only the record with the same ``kind`` and ``ex_date``, so a
+    restated ex-date leaves the old record in force. Retract it with a neutral record
+    on the old ex-date, also with a later ``known_from``: ``ratio=1`` for a split or
+    stock dividend, and ``price_factor=1`` for anything else.
     """
 
     kind: ActionKind
@@ -223,16 +258,15 @@ def _rounded(value: Decimal) -> Decimal:
     return ratio(value, Decimal(1))
 
 
-def _dividend_factor(action: CorporateAction, prior: Decimal) -> Decimal:
-    assert action.amount is not None
+def _dividend_factor(ex_date: date, total: Decimal, prior: Decimal) -> Decimal:
     if prior <= 0:
         raise ValidationError(
-            f"the ratio method needs a positive close before ex-date {action.ex_date}"
+            f"the ratio method needs a positive close before ex-date {ex_date}"
         )
-    factor = ratio(sub(prior, action.amount), prior)
+    factor = ratio(sub(prior, total), prior)
     if factor <= 0:
         raise ValidationError(
-            f"dividend {action.amount} is not below the prior close {prior}; "
+            f"dividends of {total} on {ex_date} are not below the prior close {prior}; "
             "supply an explicit price_factor"
         )
     return factor
@@ -248,6 +282,7 @@ def _factors_for(
     numerator = Decimal(1)
     denominator = Decimal(1)
     volume = Decimal(1)
+    dividends: dict[date, Decimal] = {}
     for action in actions:
         if action.ex_date <= bar_date:
             continue
@@ -261,8 +296,12 @@ def _factors_for(
             denominator = _rounded(mul(denominator, action.ratio))
             volume = _rounded(mul(volume, action.ratio))
         elif is_dividend:
-            factor = _dividend_factor(action, closes_before[action.ex_date])
-            numerator = _rounded(mul(numerator, factor))
+            assert action.amount is not None
+            total = dividends.get(action.ex_date, Decimal(0))
+            dividends[action.ex_date] = add(total, action.amount)
+    for ex_date, total in dividends.items():
+        factor = _dividend_factor(ex_date, total, closes_before[ex_date])
+        numerator = _rounded(mul(numerator, factor))
     return _Factors(numerator, denominator, volume)
 
 

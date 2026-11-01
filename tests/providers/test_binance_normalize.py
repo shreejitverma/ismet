@@ -100,7 +100,7 @@ def test_order_book_maps_every_level() -> None:
 
 def test_klines_map_every_field() -> None:
     rows = body("binance", "conformance", "klines")
-    bars = nb.bars_from_klines(rows, BTC, Interval.M1, RECEIVED, "USDT")
+    bars = nb.bars_from_klines(rows, BTC, Interval.M1, RECEIVED, "USDT", as_of=RECEIVED)
     assert len(bars) == len(rows) == 30
     for row, bar in zip(rows, bars, strict=True):
         assert bar.exchange_ts == datetime_from_ms(row[0])
@@ -122,7 +122,7 @@ def test_klines_map_every_field() -> None:
 
 def test_daily_klines_carry_a_session_date() -> None:
     rows = body("binance", "bars_daily", "klines")
-    bars = nb.bars_from_klines(rows, BTC, Interval.D1, RECEIVED, "USDT")
+    bars = nb.bars_from_klines(rows, BTC, Interval.D1, RECEIVED, "USDT", as_of=RECEIVED)
     assert len(bars) == 3
     start = manifest("binance", "bars_daily_start")
     assert [b.session_date for b in bars] == [
@@ -136,11 +136,14 @@ def test_kline_still_open_at_receipt_is_dropped() -> None:
     recorded_at = manifest("binance", "recorded_at")
     closes = [datetime_from_ms(r[6]) for r in rows]
     assert closes[-1] >= recorded_at, "fixture must contain an open kline"
-    bars = nb.bars_from_klines(rows, BTC, Interval.M1, recorded_at, "USDT")
+    bars = nb.bars_from_klines(
+        rows, BTC, Interval.M1, RECEIVED, "USDT", as_of=recorded_at
+    )
     assert len(bars) == sum(c < recorded_at for c in closes)
     assert len(bars) < len(rows)
     later = closes[-1] + timedelta(milliseconds=1)
-    assert len(nb.bars_from_klines(rows, BTC, Interval.M1, later, "USDT")) == len(rows)
+    closed = nb.bars_from_klines(rows, BTC, Interval.M1, RECEIVED, "USDT", as_of=later)
+    assert len(closed) == len(rows)
 
 
 def test_instrument_maps_every_filter() -> None:

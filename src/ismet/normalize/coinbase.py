@@ -8,8 +8,7 @@ checked against recorded responses.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timedelta, timezone
-from email.utils import parsedate_to_datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from ismet.errors import ValidationError, VenueError
@@ -30,6 +29,7 @@ from ismet.models import (
     datetime_from_ns,
 )
 from ismet.normalize._common import (
+    copy_made_at,
     normalizer,
     parse_iso8601_utc,
     register_asset,
@@ -121,22 +121,6 @@ def order_book_from_book(
     )
 
 
-def copy_made_at(headers: Mapping[str, str], received: datetime) -> datetime:
-    """When a CDN's copy of a response was made: ``Date`` minus ``Age``.
-
-    Never later than ``received``. With no readable ``Date`` the response can only be
-    taken as fresh, so this is ``received``.
-    """
-    try:
-        served = parsedate_to_datetime(headers["date"])
-        age = timedelta(seconds=max(int(headers.get("age", 0)), 0))
-    except (KeyError, TypeError, ValueError, OverflowError):
-        return received
-    if served.tzinfo is None:
-        served = served.replace(tzinfo=timezone.utc)
-    return min(received, served - age)
-
-
 @_normalizes
 def bars_from_candles(
     rows: Sequence[Sequence[Any]],
@@ -145,26 +129,25 @@ def bars_from_candles(
     received: datetime,
     currency: str | None,
     *,
-    as_of: datetime | None = None,
+    as_of: datetime,
     outdated: bool = False,
 ) -> list[Bar]:
     """Closed bars from ``GET /products/{id}/candles``, in the order received.
 
     Each row is ``[time, low, high, open, close, volume]``: low comes before high
     and open comes third, and rows arrive newest first. A bucket still open at
-    ``as_of``, when the response was made and by default ``received``, is dropped
-    because its values are not final. Coinbase publishes nothing for a bucket with no
-    trades, so a gap is an interval with no ticks unless ``outdated`` says this copy
-    predates it; those bars are flagged ``STALE``. ``trade_count`` is not available.
+    ``as_of``, when the response was made, is dropped because its values are not
+    final. Coinbase publishes nothing for a bucket with no trades, so a gap is an
+    interval with no ticks unless ``outdated`` says this copy predates it; those bars
+    are flagged ``STALE``. ``trade_count`` is not available.
     """
     granularity = timedelta(seconds=CANDLE_GRANULARITY[interval])
-    closed_by = received if as_of is None else as_of
     quality = frozenset({QualityFlag.STALE}) if outdated else frozenset()
     source = venue_source(PROVIDER, FEED_CANDLES)
     bars: list[Bar] = []
     for row in rows:
         opened = datetime_from_ns(int(row[0]) * _NANOS_PER_SECOND)
-        if opened + granularity > closed_by:
+        if opened + granularity > as_of:
             continue
         bars.append(
             Bar(

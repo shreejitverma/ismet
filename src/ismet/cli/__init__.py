@@ -15,7 +15,6 @@ import json
 import os
 import platform
 import shlex
-import sqlite3
 import sys
 import tempfile
 import traceback
@@ -473,30 +472,16 @@ def _doctor() -> int:
     return EXIT_FAILED if problems else EXIT_OK
 
 
-def _holds_a_journal(path: Path) -> bool:
-    """Whether ``path`` is a journal, judged without writing anything to it."""
-    try:
-        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
-    except sqlite3.Error:
-        return False
-    try:
-        row = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'journal'"
-        ).fetchone()
-    except sqlite3.Error:
-        return False
-    finally:
-        conn.close()
-    return row is not None
-
-
-def _existing_journal(path: str) -> SqliteJournal:
+def _reading_journal(path: str) -> SqliteJournal:
     file_path = Path(path)
     if not file_path.exists():
         raise ValidationError(f"no journal at {file_path}")
-    if not _holds_a_journal(file_path):
-        raise ValidationError(f"{file_path} is not an ismet journal")
-    return SqliteJournal(file_path)
+    return SqliteJournal.open_read_only(file_path)
+
+
+def _existing_journal(path: str) -> SqliteJournal:
+    _reading_journal(path).close()
+    return SqliteJournal(path)
 
 
 def _export(journal: SqliteJournal, out: Path) -> int:
@@ -523,12 +508,15 @@ def _journal(args: argparse.Namespace) -> int:
             "--expect-head is empty; was the variable holding it set?",
             "ismet journal --help",
         )
-    journal = _existing_journal(args.path)
+    journal = _reading_journal(args.path)
     try:
         if args.action == "verify":
             result = journal.verify()
-            if args.expect_head is not None and not chain_contains(
-                journal, args.expect_head
+            # A broken chain is the stronger answer, and it names the bad record.
+            if (
+                result.ok
+                and args.expect_head is not None
+                and not chain_contains(journal, args.expect_head)
             ):
                 _print(
                     {
@@ -601,9 +589,13 @@ def _kill(args: argparse.Namespace) -> int:
         args.action == "engage" and args.create and not Path(args.journal).exists()
     )
     # A mistyped path must not look like a successful halt while trading continues.
-    journal = (
-        SqliteJournal(args.journal) if creating else _existing_journal(args.journal)
-    )
+    journal: SqliteJournal
+    if creating:
+        journal = SqliteJournal(args.journal)
+    elif args.action == "status":
+        journal = _reading_journal(args.journal)
+    else:
+        journal = _existing_journal(args.journal)
     try:
         state = journal.kill_state()
         if args.action == "engage":

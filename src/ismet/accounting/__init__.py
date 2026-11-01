@@ -18,6 +18,7 @@ from decimal import Decimal
 from enum import Enum
 
 from ismet.errors import ValidationError
+from ismet.execution.state import merged_fill, same_execution
 from ismet.models.decimals import absolute, add, mul, ratio, sub
 from ismet.models.orders import Fill, OrderSide
 from ismet.models.symbol import Symbol
@@ -110,22 +111,17 @@ class PositionLedger:
     def apply(self, fill: Fill) -> list[RealizedTrade]:
         """Book ``fill``; returns the closing matches it produced.
 
-        A repeated fill is ignored, so replaying reports cannot double count. Venues
-        promise ``fill_id`` unique only per order, so that is the identity. The same
-        identity with different terms raises: the books cannot tell which is true.
+        A repeated fill is not booked again, so replaying reports cannot double count.
+        Venues promise ``fill_id`` unique only per order, so that is the identity. A
+        report that adds detail, as a late fee does, is merged by the rule
+        ``ismet.execution.state`` uses, and the fee is booked then. The same identity
+        with a different execution or a different fee raises: the books cannot tell
+        which is true.
         """
         key = (fill.client_order_id, fill.fill_id)
         seen = self._seen.get(key)
         if seen is not None:
-            if (seen.side, seen.price, seen.quantity) != (
-                fill.side,
-                fill.price,
-                fill.quantity,
-            ):
-                raise ValidationError(
-                    f"fill {fill.fill_id} on {fill.client_order_id} was re-reported "
-                    "with different terms"
-                )
+            self._merge_report(key, seen, fill)
             return []
         if self.symbol is None:
             self.symbol = fill.symbol
@@ -133,15 +129,12 @@ class PositionLedger:
             raise ValidationError(
                 f"ledger for {self.symbol} was given a fill in {fill.symbol}"
             )
-        if fill.fee is not None and fill.fee != 0 and fill.fee_currency is None:
-            raise ValidationError(f"fill {fill.fill_id} has a fee with no currency")
+        _check_fee_has_currency(fill)
         self._seen[key] = fill
         if fill.fee is None:
             self.fills_with_unknown_fee += 1
-        elif fill.fee_currency is not None:
-            self.fees[fill.fee_currency] = add(
-                self.fees.get(fill.fee_currency, _ZERO), fill.fee
-            )
+        else:
+            self._book_fee(fill)
         signed = mul(Decimal(fill.side.sign), fill.quantity)
         closing: list[RealizedTrade] = []
         remaining = signed
@@ -176,6 +169,31 @@ class PositionLedger:
         self.realized_trades.extend(closing)
         return closing
 
+    def _merge_report(self, key: tuple[str, str], known: Fill, report: Fill) -> None:
+        if not same_execution(known, report):
+            raise ValidationError(
+                f"fill {report.fill_id} on {report.client_order_id} was re-reported "
+                "with different terms"
+            )
+        if _fees_differ(known, report):
+            raise ValidationError(
+                f"fill {report.fill_id} on {report.client_order_id} was re-reported "
+                f"with a different fee: {known.fee} {known.fee_currency} then "
+                f"{report.fee} {report.fee_currency}"
+            )
+        merged = merged_fill(known, report)
+        _check_fee_has_currency(merged)
+        self._seen[key] = merged
+        if known.fee is None and merged.fee is not None:
+            self.fills_with_unknown_fee -= 1
+            self._book_fee(merged)
+
+    def _book_fee(self, fill: Fill) -> None:
+        if fill.fee is not None and fill.fee_currency is not None:
+            self.fees[fill.fee_currency] = add(
+                self.fees.get(fill.fee_currency, _ZERO), fill.fee
+            )
+
     def _opposes(self, signed: Decimal) -> bool:
         return (self.lots[0].quantity > 0) != (signed > 0)
 
@@ -185,6 +203,23 @@ class PositionLedger:
             return
         average = ratio(self.cost_basis, quantity)
         self.lots = [Lot(quantity, average, self.lots[0].opened_by)]
+
+
+def _check_fee_has_currency(fill: Fill) -> None:
+    if fill.fee is not None and fill.fee != 0 and fill.fee_currency is None:
+        raise ValidationError(f"fill {fill.fill_id} has a fee with no currency")
+
+
+def _fees_differ(known: Fill, report: Fill) -> bool:
+    amounts_differ = (
+        known.fee is not None and report.fee is not None and known.fee != report.fee
+    )
+    currencies_differ = (
+        known.fee_currency is not None
+        and report.fee_currency is not None
+        and known.fee_currency != report.fee_currency
+    )
+    return amounts_differ or currencies_differ
 
 
 def build_ledger(

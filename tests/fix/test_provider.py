@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 import logging
 import threading
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -39,6 +39,7 @@ from ismet.models.orders import (
     FillBusted,
     Filled,
     Liquidity,
+    OrderAck,
     OrderEvent,
     OrderRequest,
     OrderSide,
@@ -95,6 +96,7 @@ async def make_provider(
         query_timeout: float = 2.0,
         provider_class: type[FixProvider] = FixProvider,
         environment: Environment = Environment.LIVE,
+        venues: Iterable[str] = ("XNAS",),
         **session_options: Any,
     ) -> FixProvider:
         provider = provider_class(
@@ -105,6 +107,7 @@ async def make_provider(
             query_timeout=query_timeout,
             logon_timeout=5.0,
             environment=environment,
+            venues=venues,
         )
         providers.append(provider)
         if open_now:
@@ -248,12 +251,37 @@ class TestFromSettings:
             FixProvider.from_settings(self._with_password(tmp_path))
         assert not (tmp_path / "fix.db").exists()
 
-    async def test_a_tunnel_can_opt_out_of_tls(self, tmp_path: Path) -> None:
+    async def test_a_tunnel_cannot_opt_out_of_tls_through_settings(
+        self, tmp_path: Path
+    ) -> None:
+        """A tunnel user builds the ``FixSessionConfig`` directly instead."""
+        with pytest.raises(ConfigError, match="in clear"):
+            FixProvider.from_settings(
+                self._with_password(tmp_path, allow_plaintext_credentials=True)
+            )
+
+    async def test_venues_are_declared_in_settings(self, tmp_path: Path) -> None:
         provider = FixProvider.from_settings(
-            self._with_password(tmp_path, allow_plaintext_credentials=True)
+            self._with_password(tmp_path, tls=True, venues=["xnas", "XLON"])
         )
-        assert provider.session.config.ssl is None
+        assert provider.serves("XNAS")
+        assert provider.serves("xlon")
+        assert not provider.serves("XPAR")
         await provider.close()
+
+    async def test_without_declared_venues_nothing_is_served(
+        self, tmp_path: Path
+    ) -> None:
+        provider = FixProvider.from_settings(self._with_password(tmp_path, tls=True))
+        assert not provider.serves("XNAS")
+        await provider.close()
+
+    def test_venues_must_be_a_list_of_names(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError, match="venues"):
+            FixProvider.from_settings(
+                self._with_password(tmp_path, tls=True, venues="XNAS")
+            )
+        assert not (tmp_path / "fix.db").exists()
 
     async def test_environment_can_opt_out(self, tmp_path: Path) -> None:
         provider = FixProvider.from_settings(
@@ -377,7 +405,10 @@ class TestNewOrderMapping:
         acceptor = FixAcceptor(begin_string)
         await acceptor.start()
         provider = FixProvider(
-            session_config(acceptor), MemoryFixStore(), logon_timeout=5.0
+            session_config(acceptor),
+            MemoryFixStore(),
+            logon_timeout=5.0,
+            venues=("XNAS",),
         )
         await provider.open()
         stream = Stream(provider)
@@ -481,6 +512,21 @@ class TestPlaceOrderContract:
             await provider.place_order(order())
         assert info.value.code == "DUPLICATE_CLIENT_ORDER_ID"
         assert len(acceptor.of_type("D")) == 1
+
+    async def test_concurrent_sends_of_one_id_reach_the_wire_once(
+        self, acceptor: FixAcceptor, make_provider: ProviderFactory
+    ) -> None:
+        """Two callers racing on one id: the store admits one, the other is refused."""
+        provider = await make_provider()
+        results = await asyncio.gather(
+            provider.place_order(order()),
+            provider.place_order(order()),
+            return_exceptions=True,
+        )
+        assert len([r for r in results if isinstance(r, OrderAck)]) == 1, results
+        assert len([r for r in results if isinstance(r, DuplicateOrderId)]) == 1
+        assert [m.get(11) for m in acceptor.of_type("D")] == ["C1"]
+        assert acceptor.orders["C1"].arrivals == 1
 
     async def test_venue_duplicate_reject_is_typed_and_not_a_rejection(
         self, acceptor: FixAcceptor, make_provider: ProviderFactory
@@ -873,7 +919,6 @@ class TestExecutionMapping:
         acceptor.orders["ALIEN"] = _alien_order()
         await acceptor.fill("ALIEN", "1", "2")
         await acceptor.wait_until(lambda: bool(acceptor.of_type("3")))
-        assert provider.dropped_reports == 1
         assert (await provider.quarantined())[0].msg_type == "8"
 
     @pytest.mark.parametrize(
@@ -913,8 +958,73 @@ class TestExecutionMapping:
         assert reject.get(371) == reject_tag
         await eventually(lambda: stream.error is not None)
         assert isinstance(stream.error, ReportQuarantinedError)
-        assert provider.dropped_reports == 1
         assert provider.session.is_ready
+        assert not stream.of(Filled)
+        assert len(await provider.quarantined()) == 1
+        await stream.close()
+
+    @pytest.mark.parametrize("exec_type", ["J", "A"])
+    async def test_a_quantity_under_an_exec_type_with_no_event_is_quarantined(
+        self,
+        acceptor: FixAcceptor,
+        make_provider: ProviderFactory,
+        exec_type: str,
+    ) -> None:
+        """A report that books nothing cannot carry a LastQty: it may be a fill.
+
+        Marking its ExecID seen would make the venue's readable redelivery look like
+        a repeat, so the fill would never be booked.
+        """
+        provider = await make_provider()
+        stream = Stream(provider)
+        await provider.place_order(order())
+        await eventually(lambda: bool(stream.of(Acknowledged)))
+        await acceptor.exec_report(
+            "C1",
+            exec_type,
+            "1",
+            last_qty=Decimal(100),
+            last_px=Decimal(10),
+            exec_id="X9",
+        )
+        await acceptor.wait_until(lambda: bool(acceptor.of_type("3")))
+        reject = acceptor.of_type("3")[0]
+        assert (reject.get(373), reject.get(371)) == ("5", "150")
+        await eventually(lambda: stream.error is not None)
+        assert isinstance(stream.error, ReportQuarantinedError)
+        assert not stream.of(Filled)
+        assert stream.of(Restated)[0].status is OrderStatus.UNKNOWN
+        assert len(await provider.quarantined()) == 1
+
+        await provider.release_quarantine(
+            operator="alice", reason="venue resends it", expected=1
+        )
+        await acceptor.fill("C1", "100", "10", exec_id="X9")
+        await eventually(lambda: provider.session.next_inbound == acceptor.next_out)
+        assert [f.fill_id for f in await provider.fills_since(LONG_AGO)] == ["X9"]
+        await stream.close()
+
+    async def test_an_empty_exec_type_is_a_missing_one(
+        self, acceptor: FixAcceptor, make_provider: ProviderFactory
+    ) -> None:
+        provider = await make_provider()
+        stream = Stream(provider)
+        await provider.place_order(order())
+        await eventually(lambda: bool(stream.of(Acknowledged)))
+        seq = acceptor.next_out
+        fields = (
+            f"35=8\x0149=VENUE\x0156=CLIENT\x0134={seq}\x0152={_now_text()}"
+            "\x0137=O1\x0111=C1\x0117=X1\x01150=\x0139=1\x0154=1\x0155=ACME"
+            "\x0132=40\x0131=10\x0114=40\x01"
+        ).encode()
+        head = f"8=FIX.4.4\x019={len(fields)}\x01".encode() + fields
+        acceptor.next_out += 1
+        await acceptor.write(head + f"10={sum(head) % 256:03d}\x01".encode())
+        await acceptor.wait_until(lambda: bool(acceptor.of_type("3")))
+        reject = acceptor.of_type("3")[0]
+        assert (reject.get(373), reject.get(371)) == ("1", "150")
+        await eventually(lambda: stream.error is not None)
+        assert isinstance(stream.error, ReportQuarantinedError)
         assert not stream.of(Filled)
         assert len(await provider.quarantined()) == 1
         await stream.close()
@@ -1015,7 +1125,9 @@ class TestUnreadableReports:
         assert isinstance(second.error, ReportQuarantinedError)
         assert second.of(Canceled) == [], "a later close must not hide the problem"
 
-        await provider.release_quarantine(operator="alice", reason="checked the venue")
+        await provider.release_quarantine(
+            operator="alice", reason="checked the venue", expected=1
+        )
         third = Stream(provider)
         await eventually(lambda: bool(third.of(Canceled)))
         assert third.error is None
@@ -1061,7 +1173,7 @@ class TestUnreadableReports:
         password = "hunter2-do-not-leak"
         provider = await make_provider(password=SecretStr(password))
         await acceptor.send("8", [(11, "C1"), (150, "0"), (58, f"echo {password}")])
-        await eventually(lambda: provider.dropped_reports == 1)
+        await acceptor.wait_until(lambda: bool(acceptor.of_type("3")))
         held = await provider.quarantined()
         assert password not in held[0].content
         assert password not in held[0].reason
@@ -1253,15 +1365,21 @@ class TestCancel:
         assert stream.of(CancelRejected)[0].client_order_id == "C1"
         await stream.close()
 
-    async def test_cancel_reject_for_nothing_we_know_is_counted(
+    async def test_cancel_reject_for_nothing_we_know_is_consumed_quietly(
         self, acceptor: FixAcceptor, make_provider: ProviderFactory
     ) -> None:
         provider = await make_provider()
+        stream = Stream(provider)
         await acceptor.send(
             "9",
             [(37, "NONE"), (11, "ZZ"), (41, "YY"), (39, "8"), (434, "1")],
         )
-        await eventually(lambda: provider.dropped_reports == 1)
+        await eventually(lambda: provider.session.next_inbound == acceptor.next_out)
+        assert provider.session.is_ready
+        assert stream.events == []
+        assert stream.error is None
+        assert acceptor.of_type("3") == []
+        await stream.close()
 
     async def test_cancel_works_for_an_order_that_was_never_acknowledged(
         self, acceptor: FixAcceptor, make_provider: ProviderFactory
@@ -1539,7 +1657,7 @@ class TestOrderStatus:
         with pytest.raises(VenueError):
             await task
 
-    async def test_no_local_record_raises_and_is_never_none(
+    async def test_no_local_record_in_a_new_store_raises_and_is_never_none(
         self, acceptor: FixAcceptor, make_provider: ProviderFactory
     ) -> None:
         """A wiped or misconfigured store must not make a live order look dead."""
@@ -1547,6 +1665,29 @@ class TestOrderStatus:
         with pytest.raises(TransportError, match="no local record"):
             await provider.order_status("NEVER", ACME)
         assert acceptor.of_type("H") == []
+
+    async def test_no_local_record_in_a_store_that_was_in_use_is_not_found(
+        self, acceptor: FixAcceptor, make_provider: ProviderFactory, tmp_path: Path
+    ) -> None:
+        """The row is written before the socket, so an intact store proves never sent.
+
+        A process that died between the order manager's ``send_started`` and that row
+        would otherwise leave the order unknown forever.
+        """
+        store = SqliteFixStore(tmp_path / "fix.db", "s")
+        first = await make_provider(store=store)
+        await first.place_order(order())
+        await first.close()
+
+        second = await make_provider(store=store)
+        assert await second.order_status("NEVER", ACME) is None
+        assert acceptor.of_type("H") == []
+        known = await second.order_status("C1", ACME)
+        assert known is not None
+        assert known.status is OrderStatus.ACCEPTED
+        assert len(acceptor.of_type("H")) == 1
+        await second.close()
+        store.close()
 
     async def test_malformed_status_report_raises(
         self, acceptor: FixAcceptor, make_provider: ProviderFactory
@@ -1740,7 +1881,9 @@ class TestRestart:
     ) -> None:
         path = tmp_path / "fix.db"
         store = SqliteFixStore(path, "s")
-        provider = FixProvider(session_config(acceptor), store, logon_timeout=5.0)
+        provider = FixProvider(
+            session_config(acceptor), store, logon_timeout=5.0, venues=("XNAS",)
+        )
         await provider.open()
         await provider.place_order(order(side=OrderSide.SELL))
         await provider.amend_order("C1", ACME, limit_price=Decimal(11))
@@ -1769,7 +1912,9 @@ class TestRestart:
     ) -> None:
         path = tmp_path / "fix.db"
         store = SqliteFixStore(path, "s")
-        provider = FixProvider(session_config(acceptor), store, logon_timeout=5.0)
+        provider = FixProvider(
+            session_config(acceptor), store, logon_timeout=5.0, venues=("XNAS",)
+        )
         await provider.open()
         await provider.place_order(order())
         await acceptor.fill("C1", "40", "10", exec_id="F1")
@@ -1797,7 +1942,11 @@ class TestRestart:
         path = tmp_path / "fix.db"
         store = SqliteFixStore(path, "s")
         provider = FixProvider(
-            session_config(acceptor), store, ack_timeout=0.05, logon_timeout=5.0
+            session_config(acceptor),
+            store,
+            ack_timeout=0.05,
+            logon_timeout=5.0,
+            venues=("XNAS",),
         )
         await provider.open()
         acceptor.faults.lose_ack = 1
@@ -1900,6 +2049,7 @@ class TestSecrets:
             ),
             store,
             logon_timeout=5.0,
+            venues=("XNAS",),
         )
         await provider.open()
         await provider.place_order(order())
@@ -2286,7 +2436,9 @@ class TestHaltsAreDurable:
         await eventually(lambda: stopped.error is not None)
         assert isinstance(stopped.error, ReportQuarantinedError)
 
-        await second.release_quarantine(operator="alice", reason="fill confirmed")
+        await second.release_quarantine(
+            operator="alice", reason="fill confirmed", expected=1
+        )
         held = await second.quarantined()
         assert (held[0].released_by, held[0].release_reason) == (
             "alice",
@@ -2303,15 +2455,69 @@ class TestHaltsAreDurable:
         await third.close()
         store.close()
 
+    async def test_a_halt_refuses_new_orders_and_amends_without_a_stream(
+        self, acceptor: FixAcceptor, make_provider: ProviderFactory, tmp_path: Path
+    ) -> None:
+        """The halt lives in the store, so it holds before any stream reads it.
+
+        That covers a direct caller, and the order manager's first order after a
+        restart, which can run before its stream loop has subscribed.
+        """
+        store = SqliteFixStore(tmp_path / "fix.db", "s")
+        first = await self._quarantine_one(store, make_provider, acceptor)
+        await first.close()
+
+        second = await make_provider(store=store)
+        with pytest.raises(ReportQuarantinedError):
+            await second.place_order(order("C2"))
+        with pytest.raises(ReportQuarantinedError):
+            await second.amend_order("C1", ACME, limit_price=Decimal("10.50"))
+        assert [m.get(11) for m in acceptor.of_type("D")] == ["C1"]
+        assert acceptor.of_type("G") == []
+        # A cancel only reduces exposure, so it still goes out.
+        await second.cancel_order("C1", ACME)
+        assert len(acceptor.of_type("F")) == 1
+        await second.close()
+        store.close()
+
     async def test_a_release_needs_an_operator(
         self, acceptor: FixAcceptor, make_provider: ProviderFactory
     ) -> None:
         store = MemoryFixStore()
         provider = await self._quarantine_one(store, make_provider, acceptor)
         with pytest.raises(ValidationError, match="operator"):
-            await provider.release_quarantine(operator="", reason="no one")
+            await provider.release_quarantine(operator="", reason="no one", expected=1)
         stopped = Stream(provider)
         await eventually(lambda: stopped.error is not None)
+
+    async def test_a_release_names_the_count_the_operator_saw(
+        self, acceptor: FixAcceptor, make_provider: ProviderFactory
+    ) -> None:
+        """A row that arrived after the operator looked is not theirs to release."""
+        store = MemoryFixStore()
+        provider = await self._quarantine_one(store, make_provider, acceptor)
+        seen = await provider.quarantined()
+        assert len(seen) == 1
+        await acceptor.send("8", [(150, "F"), (17, "LATER"), (32, "10"), (31, "5")])
+        await acceptor.wait_until(lambda: len(acceptor.of_type("3")) == 2)
+
+        with pytest.raises(ValidationError, match="2"):
+            await provider.release_quarantine(
+                operator="alice", reason="checked one", expected=len(seen)
+            )
+        assert [q.released_by for q in await provider.quarantined()] == [None, None]
+        stopped = Stream(provider)
+        await eventually(lambda: stopped.error is not None)
+        assert isinstance(stopped.error, ReportQuarantinedError)
+
+        released = await provider.release_quarantine(
+            operator="alice", reason="checked both", expected=2
+        )
+        assert released == 2
+        assert [q.released_by for q in await provider.quarantined()] == [
+            "alice",
+            "alice",
+        ]
 
     async def test_a_malformed_status_reply_does_not_halt(
         self, acceptor: FixAcceptor, make_provider: ProviderFactory
@@ -2443,7 +2649,7 @@ class TestDeclaredVenues:
     async def test_an_undeclared_venue_is_refused_before_the_wire(
         self, acceptor: FixAcceptor, make_provider: ProviderFactory
     ) -> None:
-        provider = await make_provider(provider_class=self.Nasdaq)
+        provider = await make_provider(provider_class=self.Nasdaq, venues=())
         other = order(symbol=Symbol(venue="XLON", ticker="BP"))
         with pytest.raises(VenueError) as info:
             await provider.place_order(other)
@@ -2453,8 +2659,29 @@ class TestDeclaredVenues:
     async def test_a_declared_venue_is_sent(
         self, acceptor: FixAcceptor, make_provider: ProviderFactory
     ) -> None:
-        provider = await make_provider(provider_class=self.Nasdaq)
+        provider = await make_provider(provider_class=self.Nasdaq, venues=())
         await provider.place_order(order())
+        assert len(acceptor.of_type("D")) == 1
+
+    async def test_a_plain_provider_serves_no_venue_and_sends_nothing(
+        self, acceptor: FixAcceptor, make_provider: ProviderFactory
+    ) -> None:
+        """Symbol(55) carries no venue, so an undeclared one would be routed by the
+        broker's default while risk judged the one the caller named."""
+        provider = await make_provider(venues=())
+        with pytest.raises(VenueError) as info:
+            await provider.place_order(order())
+        assert info.value.code == "UNSUPPORTED"
+        assert acceptor.of_type("D") == []
+
+    async def test_venues_can_be_declared_on_an_instance(
+        self, acceptor: FixAcceptor, make_provider: ProviderFactory
+    ) -> None:
+        provider = await make_provider(venues=("xlon",))
+        await provider.place_order(order(symbol=Symbol(venue="XLON", ticker="BP")))
+        assert [m.get(55) for m in acceptor.of_type("D")] == ["BP"]
+        with pytest.raises(VenueError):
+            await provider.place_order(order("C2"))
         assert len(acceptor.of_type("D")) == 1
 
 

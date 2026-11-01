@@ -56,7 +56,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import re
 import ssl as ssl_module
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -97,9 +96,6 @@ APPL_VER_FIX50SP2 = "9"
 """DefaultApplVerID(1137) for FIX 5.0 SP2."""
 
 ADMIN_TYPES = frozenset({"0", "1", "2", "3", "4", "5", "A"})
-
-# The FIX int datatype allows leading zeros: "00023" means 23.
-_SEQUENCE_NUMBER = re.compile(r"^(?=[0-9]{1,18}$)0*[1-9][0-9]*$")
 
 _SYNC_RETRY_SECONDS = 1.0
 
@@ -205,10 +201,7 @@ class FixSessionConfig:
     """One FIX session. ``repr`` cannot show ``password``, which is a ``SecretStr``.
 
     ``stale_resend_after`` gap-fills application messages older than this many seconds
-    instead of resending them, which "Message Recovery" allows for aged orders, and they
-    are dropped from the store at start. ``None`` resends everything and leaves the
-    venue to apply its own staleness rules, using PossDupFlag, OrigSendingTime, and
-    TransactTime.
+    instead of resending them, which "Message Recovery" allows for aged orders.
 
     ``reset_on_logon`` sends ResetSeqNumFlag on the first connection of each
     ``session_period``, a label computed from the current UTC time, by default the UTC
@@ -237,7 +230,7 @@ class FixSessionConfig:
     termination_wait: float = 2.0
     write_timeout: float = 10.0
     max_sending_time_skew: float | None = 120.0
-    stale_resend_after: float | None = 60.0
+    stale_resend_after: float = 60.0
     max_body_length: int = DEFAULT_MAX_BODY_LENGTH
     resend_timeout: float | None = None
     max_resend_requests: int = 3
@@ -323,7 +316,6 @@ class FixSession:
         self._resend_requested_at = 0.0
         self._resend_requests = 0
         self._reset_awaiting_confirmation: str | None = None
-        self.connections = 0
 
     @staticmethod
     def _collect_secrets(config: FixSessionConfig) -> tuple[str, ...]:
@@ -390,10 +382,6 @@ class FixSession:
             max_workers=1, thread_name_prefix="ismet-fix-store"
         )
         self._next_in = await self.run_store(self.store.next_inbound)
-        limit = self.config.stale_resend_after
-        if limit is not None:
-            cutoff = format_utc_timestamp(self._clock.now() - timedelta(seconds=limit))
-            await self.run_store(lambda: self.store.prune_messages_sent_before(cutoff))
         self._set_state(SessionState.DISCONNECTED)
         self._runner = asyncio.create_task(
             self._run(), name=f"ismet-fix-{self.config.session_id}"
@@ -462,6 +450,7 @@ class FixSession:
     # Connection management
 
     def _should_run(self) -> bool:
+        """Read again after each await: ``stop`` flips the flag from another task."""
         return not self._stopping
 
     async def _run(self) -> None:
@@ -478,7 +467,6 @@ class FixSession:
             except (OSError, asyncio.TimeoutError) as exc:
                 reason = f"connect failed: {type(exc).__name__}"
             else:
-                self.connections += 1
                 try:
                     reason = await self._serve(reader, writer)
                 except _TerminalError as exc:
@@ -836,10 +824,13 @@ class FixSession:
         expected = self._next_in
         if message.begin_string != cfg.begin_string:
             await self._terminate(f"Incorrect BeginString {message.begin_string}")
-        seq_text = message.get(34)
-        if seq_text is None or not _SEQUENCE_NUMBER.match(seq_text):
+        try:
+            # SeqNum is a positive int, and the int datatype allows leading zeros.
+            seq = parse_seq_num(message.get(34) or "", 34)
+        except FieldFormatError:
+            seq = 0
+        if seq == 0:
             await self._terminate("MsgSeqNum missing or invalid")
-        seq = int(seq_text)
         msg_type = message.msg_type
         if message.get(49) != cfg.target_comp_id or message.get(56) != (
             cfg.sender_comp_id
@@ -1210,11 +1201,10 @@ class FixSession:
                 self._deadline = self._clock.monotonic() + self.config.logon_timeout
 
     def _is_stale(self, record: StoredMessage) -> bool:
-        limit = self.config.stale_resend_after
-        if limit is None:
-            return False
         sent = parse_utc_timestamp(record.sending_time, 52)
-        stale = self._clock.now() - sent > timedelta(seconds=limit)
+        stale = self._clock.now() - sent > timedelta(
+            seconds=self.config.stale_resend_after
+        )
         if stale:
             logger.warning(
                 "FIX gap-filling aged message %d instead of resending it", record.seq

@@ -105,7 +105,7 @@ def test_order_book_maps_levels_with_counts_and_slices_to_depth() -> None:
 
 def test_candles_map_low_high_open_close_in_vendor_order() -> None:
     rows = body("coinbase", "conformance", "candles")
-    bars = nc.bars_from_candles(rows, BTC, Interval.M1, RECEIVED, "USD")
+    bars = nc.bars_from_candles(rows, BTC, Interval.M1, RECEIVED, "USD", as_of=RECEIVED)
     assert len(bars) == len(rows) > 0
     for row, bar in zip(rows, bars, strict=True):
         assert bar.exchange_ts == datetime_from_ns(row[0] * 1_000_000_000)
@@ -133,7 +133,7 @@ def test_candles_arrive_newest_first() -> None:
 
 def test_daily_candles_carry_a_session_date() -> None:
     rows = body("coinbase", "bars_daily", "candles")
-    bars = nc.bars_from_candles(rows, BTC, Interval.D1, RECEIVED, "USD")
+    bars = nc.bars_from_candles(rows, BTC, Interval.D1, RECEIVED, "USD", as_of=RECEIVED)
     assert bars
     assert all(b.session_date == b.exchange_ts.date() for b in bars)
 
@@ -142,7 +142,9 @@ def test_candle_still_open_at_receipt_is_dropped() -> None:
     rows = body("coinbase", "bars_open", "candles")
     recorded_at = manifest("coinbase", "recorded_at")
     assert max(r[0] for r in rows) + 60 > recorded_at.timestamp()
-    bars = nc.bars_from_candles(rows, BTC, Interval.M1, recorded_at, "USD")
+    bars = nc.bars_from_candles(
+        rows, BTC, Interval.M1, RECEIVED, "USD", as_of=recorded_at
+    )
     assert len(bars) == sum(r[0] + 60 <= recorded_at.timestamp() for r in rows)
     assert len(bars) < len(rows)
 

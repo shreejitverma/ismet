@@ -14,7 +14,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from ismet.errors import ConfigError
+from ismet.errors import ConfigError, ValidationError
 from ismet.models import Bar
 
 _DROPPED = {"symbol"}
@@ -69,12 +69,26 @@ def to_pandas(items: Iterable[BaseModel], *, lossy_float: bool = False) -> Any:
 
 
 def to_polars(items: Iterable[BaseModel], *, lossy_float: bool = False) -> Any:
-    """A polars DataFrame. Decimals stay exact unless ``lossy_float`` is set."""
+    """A polars DataFrame. Decimals stay exact unless ``lossy_float`` is set.
+
+    Polars holds at most 38 digits in a decimal column, and an adjusted price can have
+    up to 50. Such a value raises :class:`~ismet.errors.ValidationError`, rather than
+    being rounded unasked: pass ``lossy_float`` to take floats, or use pandas, which
+    keeps every digit.
+    """
     pl = _optional("polars")
     rows = to_records(items)
     if lossy_float:
         _floatify(rows)
-    return pl.DataFrame(rows, infer_schema_length=None)
+    try:
+        return pl.DataFrame(rows, infer_schema_length=None)
+    except (RuntimeError, pl.exceptions.PolarsError) as exc:
+        if "decimal" not in str(exc).lower():
+            raise
+        raise ValidationError(
+            f"polars cannot hold these decimals exactly ({exc}); pass lossy_float=True "
+            "for floats, or use to_pandas to keep every digit"
+        ) from exc
 
 
 class BarSeries(list[Bar]):

@@ -90,7 +90,6 @@ class BookBuilder:
         self._max_buffered = max_buffered
         self.gaps = 0
         self.stale_deltas = 0
-        self.overflowed = False
         self.stale_snapshots = 0
         self._batch: tuple[int, int] | None = None
         self._dropped_through: int | None = None
@@ -99,6 +98,11 @@ class BookBuilder:
     def is_synced(self) -> bool:
         """Whether the book reflects every update up to :attr:`last_sequence`."""
         return self._synced
+
+    @property
+    def overflowed(self) -> bool:
+        """Whether the buffer dropped a delta that no snapshot has covered yet."""
+        return self._dropped_through is not None
 
     @property
     def last_sequence(self) -> int | None:
@@ -132,7 +136,6 @@ class BookBuilder:
             self._asks.set(price, size)
         self._last = sequence
         self._synced = True
-        self.overflowed = False
         self._dropped_through = None
         self._batch = None
         buffered = list(self._buffer)
@@ -171,7 +174,6 @@ class BookBuilder:
     def _buffer_delta(self, delta: BookDelta) -> None:
         if len(self._buffer) >= self._max_buffered:
             dropped = self._buffer.popleft()
-            self.overflowed = True
             self._dropped_through = max(self._dropped_through or 0, dropped.sequence)
         self._buffer.append(delta)
 

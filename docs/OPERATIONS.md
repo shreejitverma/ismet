@@ -61,23 +61,24 @@ A strategy that restarts should resubmit with the same deterministic id, which r
 | Order status `unknown` | The send may have reached the venue, and the response did not return | Wait. Reconcile resolves it. New orders in that symbol are blocked meanwhile. |
 | `unknown` that will not clear | The venue's status query is failing | Check connectivity and credentials. A `query_failed` break is reported each pass. |
 | Break `orphan_order` | The venue has an open order ismet did not send or has closed, or its order under our id has another side or symbol | Find its source, such as another terminal or a late arrival. Cancel at the venue if unwanted. New orders are halted. |
-| Break `orphan_fill` | The venue reports a fill on an order ismet never sent | Find its source. New orders are halted once per fill: a release is final, also across restarts. If the fill moved a position, record it with `ismet position adjust`, or `position_mismatch` halts again. |
+| Break `orphan_fill` | The venue reports a fill on an order ismet never sent | Find its source. New orders are halted once per fill: a release is final, also across restarts. If the fill moved a position, record it with `ismet position adjust`, or `position_mismatch` halts again. Fills dated before a baseline taken on a journal with no orders are already in that baseline and are not reported; a venue clock behind the local one can date a later fill before it, and such a fill then shows only as `position_mismatch`. |
 | Break `position_mismatch` | Position differs from baseline plus fills and adjustments, for longer than `unknown_grace` | Look for outside trades, transfers, or corporate actions, then record the cause with `ismet position adjust`. New orders are halted. |
 | Break `fill_mismatch` | The venue's filled quantity held still across a fill query, and that query did not explain it | Get the venue's execution report. New orders are halted. |
 | Break `missing_at_venue` | A working order vanished, as can happen on venue failover | Confirm with the venue. The order is marked cancelled. New orders are halted. |
 | Anomaly `overfill` | More filled than ordered, judged against the requested size while a replace is pending | Contact the venue. New orders are halted. |
 | Anomaly `before the send started` | A venue report arrived for an order ismet never sent | The books were wrong. New orders are halted. |
-| `JournalError` on submit | The journal cannot be written, so that order was refused and nothing was sent | Check disk space and permissions. Orders are accepted again once writes succeed. |
-| `KillSwitchEngaged("journal failure: ...")` on submit | A venue event could not be journalled. It was applied in memory, and is rewritten in order once the journal recovers | Fix the disk, then restart: only a restart clears this. `ismet kill status` shows `not engaged` and `ismet kill release` cannot clear it, because it lives in this process. |
+| Anomaly `re-reported with different terms` | The stream or a fill query reports a known fill with another price, quantity, side or symbol | Get the venue's execution report; the record keeps the first terms. New orders are halted once per fill and set of terms, so a release holds across later sweeps and restarts. |
+| `JournalError` on submit | The journal cannot be written, so that order was refused and nothing was sent | Check disk space and permissions. Orders are accepted again once writes succeed, unless closing that order failed too, which is the next row. |
+| `KillSwitchEngaged("journal failure: ...")` on submit | A record that does not wait for the disk could not be journalled: a venue event, an internal event such as closing an order whose send failed, or a kill record. An order event was applied in memory, and is rewritten in order once the journal recovers | Fix the disk, then restart: only a restart clears this. `ismet kill status` shows `not engaged` and `ismet kill release` cannot clear it, because it lives in this process. |
 | `ConfigError` at start: risk limits differ | The latest journalled limits are not the ones passed in | Start with the journalled limits, or a person's earlier tightening is lost. Then change them with `update_risk_config`. |
-| `RiskRejected` from check `max_gross_notional`, "gross exposure unknown" | Holdings, a mark, or a multiplier is unknown, or exposure spans currencies | Check the reference quote of every held symbol. Orders that only reduce a position still pass. Set the gross limit to `None` to trade several currencies, since no rate is assumed. |
+| `RiskRejected` from check `max_gross_notional`, "gross exposure unknown" | Holdings, a mark, or a multiplier is unknown, or exposure spans currencies | Check the reference quote and reference data of every held symbol; both are looked up again on each new order, so a transient failure clears itself. Orders that only reduce a position, including closing it to flat, still pass. Set the gross limit to `None` to trade several currencies, since no rate is assumed. |
 | `RiskRejected` from check `limit_currency` | The order's currency is not `RiskConfig.limit_currency` | Limits are not converted. Trade that instrument under a configuration whose limits are in its currency. |
 | `journal failed verification` at start | The audit trail was altered, truncated, or corrupted | Treat as an incident. Preserve the journal and its `.head` file, and do not delete them to get started. |
 | `RiskRejected` from check `reconciliation` | The latest pass could not query the venue, so exposure is unverified | Fix connectivity. Orders resume by themselves after a clean pass, which retries every few seconds. |
 | `RiskRejected` from check `execution_stream` | The execution stream is down | It reconnects by itself and reconciles. Investigate if it persists. |
 | Halt after a bust | A fill was busted while ismet was down, on a venue that does not repeat the bust, so the books keep it and the venue does not | Confirm with the venue. ismet cannot tell a bust from a lost report, so it halts rather than guess. |
-| `ReportQuarantinedError` from a FIX stream | A report could not be applied, or a sequence reset may have skipped reports. New orders stay refused, also across restarts | Compare with the venue's records, then call `await FixProvider.release_quarantine(operator=..., reason=...)`, which is recorded in the store. |
-| `CalendarOutOfRange` rejection | The venue's calendar data has ended | Upgrade ismet, or supply newer data with `load_calendar_file`. `ismet doctor` warns 90 days ahead. |
+| `ReportQuarantinedError` from a FIX stream, `place_order`, or `amend_order` | A report could not be applied, or a sequence reset may have skipped reports. New orders and amendments stay refused, also across restarts | Read `await FixProvider.quarantined()`, compare each unreleased row with the venue's records, then call `await FixProvider.release_quarantine(operator=..., reason=..., expected=<the unreleased count you checked>)`, which is recorded in the store. The release is refused if the count has changed, because a row arrived that nobody checked. |
+| `CalendarOutOfRange` rejection | The venue's calendar data has ended. An order that rests for later (OPG, CLS, or GTC or GTD on a limit or stop limit) skips this check and is not refused | Upgrade ismet, or supply newer data with `load_calendar_file`. `ismet doctor` warns 90 days ahead. |
 | `stale_data` rejection | The reference quote is too old | Check the market data feed. |
 
 ## Monitoring
@@ -95,6 +96,7 @@ Bind `ismet.observability.Metrics` to your metrics system and alert on the follo
 Also poll `OrderManager.stream_healthy` and `OrderManager.kill_state`.
 Market data reconnects retry forever by default, and each logs a WARNING on `ismet.transport.ws`.
 Pass `ws_on_state` to a provider to watch them, or `ws_max_reconnects` to fail instead.
+From configuration, set `ISMET_BINANCE_WS_MAX_RECONNECTS`, `ISMET_COINBASE_WS_MAX_RECONNECTS`, or the option of that name in the config file; `ws_on_state` takes a function, so it is available only when constructing a provider directly.
 A stream that silently stops delivering cannot be told apart from a quiet market, so periodic reconciliation (`reconcile_interval`, 30 seconds by default) is what bounds how long a missed report can go unnoticed.
 
 ## Journal care
@@ -102,6 +104,9 @@ A stream that silently stops delivering cannot be told apart from a quiet market
 - Keep the journal on a local disk with a real flush.
   Network filesystems can break SQLite's locking.
 - Back it up with the SQLite backup API or `ismet journal export`, not by copying a live file.
+- Never restore an older copy of a FIX store over the live one.
+  An order missing from a store that shows prior use is treated as never sent, so a restored backup could close an order that is live at the venue.
+  After losing a FIX store, start from an empty one: orders with no record then stay refused until an operator confirms them with the counterparty.
 - `ismet journal export "$JOURNAL" --out <new file>` refuses an existing file. `ismet.execution.journal.verify_jsonl` checks the hash chain of an export on its own.
 - Copy `head_hash` from `ismet journal verify` to separate storage on a schedule, then check against it with `ismet journal verify "$JOURNAL" --expect-head "$SAVED"`.
   An empty value is a usage error, so an unset variable cannot skip the check.
@@ -139,7 +144,9 @@ Apply them at startup in every process that uses the venue, including after each
 
 `ismet.fix` is experimental, and these are the operational rules that differ from other providers.
 
-- Credentials are refused without `tls = true`, or `allow_plaintext_credentials = true` when a stunnel or VPN protects the connection.
+- Credentials are refused without `tls = true` in settings; a connection a stunnel or VPN protects needs a `FixSessionConfig` built directly, which chooses its own `ssl`.
+- A NewOrderSingle names the instrument by Symbol(55) alone, so the session decides where it trades: declare the MICs it serves with the `venues` option, or on a subclass, and an order for any other venue is refused before the wire.
+- An order whose process died after the order manager's `send_started` and before the FIX store's row closes as never sent on the next reconciliation, because the row is written before the socket, but only when the store already carried this session before the restart; a new or replaced store proves nothing, so the order stays unknown until an operator resolves it.
 - `reset_on_logon` resets once per `FixSessionConfig.session_period`, by default the UTC date, and a reconnect within the period keeps its numbers.
   Set it and `session_period` to match the venue's daily reset.
   Otherwise the venue's reset arrives unrequested and halts the stream until released.

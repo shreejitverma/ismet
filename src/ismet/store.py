@@ -22,7 +22,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
-from ismet.calendars import TradingCalendar
+from ismet.calendars import Session, TradingCalendar
 from ismet.errors import CalendarOutOfRange, IsmetError, ValidationError
 from ismet.export import BarSeries
 from ismet.models import Bar, Interval, Symbol
@@ -54,8 +54,9 @@ CREATE TABLE IF NOT EXISTS backfill_progress (
 
 
 def _content_digest(bar: Bar) -> str:
-    # received_ts and source describe the delivery, not the data.
-    fields = bar.model_dump(mode="json", exclude={"received_ts", "source"})
+    # received_ts and source describe the delivery, and symbol's other fields describe
+    # the listing, whose identity is the row's key. None of them is the data.
+    fields = bar.model_dump(mode="json", exclude={"received_ts", "source", "symbol"})
     fields["quality"] = sorted(fields["quality"])  # a set's order varies by process
     for name, value in bar:
         if isinstance(value, Decimal):
@@ -98,7 +99,14 @@ class BarStore:
         self.close()
 
     def write(self, bars: Iterable[Bar]) -> WriteResult:
-        """Store bars. Idempotent: rewriting identical data adds nothing."""
+        """Store bars. Idempotent: rewriting identical data adds nothing.
+
+        Replaying a lower ``revision`` than the latest stored adds nothing either, so it
+        cannot roll a restatement back. Equal revisions with different data are a new
+        version, for vendors that do not number them. A bar whose ``adjustment`` differs
+        from the latest stored version raises :class:`~ismet.errors.ValidationError`
+        and nothing in the call is written, because a read would mix price scales.
+        """
         now = self._clock.now().astimezone(timezone.utc)
         inserted = unchanged = revised = 0
         with self._conn:
@@ -110,22 +118,31 @@ class BarStore:
                     bar.exchange_ts.isoformat(),
                 )
                 latest = self._conn.execute(
-                    "SELECT digest, known_at FROM bars WHERE venue=? AND ticker=? "
+                    "SELECT digest, known_at, payload FROM bars WHERE venue=? "
+                    "AND ticker=? "
                     "AND interval=? "
                     "AND bar_ts=? ORDER BY known_at DESC LIMIT 1",
                     key,
                 ).fetchone()
                 digest = _content_digest(bar)
-                if latest is not None and latest[0] == digest:
-                    unchanged += 1
-                    continue
+                known_at = now
                 if latest is None:
                     inserted += 1
                 else:
+                    stored = Bar.model_validate_json(latest[2])
+                    if stored.adjustment is not bar.adjustment:
+                        raise ValidationError(
+                            f"{bar.symbol} {bar.interval.value} at "
+                            f"{bar.exchange_ts.isoformat()} is stored as "
+                            f"{stored.adjustment.value}, and this bar is "
+                            f"{bar.adjustment.value}; keep raw bars in the store and "
+                            "adjust on read"
+                        )
+                    if latest[0] == digest or bar.revision < stored.revision:
+                        unchanged += 1
+                        continue
                     revised += 1
-                # Each version of a bar needs its own, strictly later, knowledge time.
-                known_at = now
-                if latest is not None:
+                    # Each version needs its own, strictly later, knowledge time.
                     prior = datetime.fromisoformat(latest[1])
                     known_at = max(now, prior + timedelta(microseconds=1))
                 self._conn.execute(
@@ -330,10 +347,13 @@ async def backfill(
 
     Finished windows are recorded and skipped next time. A window's failure is logged
     and counted, and the rest continue. An empty window counts as finished only if
-    ``calendar`` shows no session in it. With ``calendar``, every session wholly inside
-    a window must have at least one bar, at any interval, for the window to finish; the
-    bars received are kept either way. Without one, a non-empty answer is taken as
-    final, since nothing can contradict it. Check :attr:`BackfillReport.complete`.
+    ``calendar`` shows no session touching it. With ``calendar``, every session must
+    have at least one bar, at any interval, for the window holding its close to finish.
+    The bars can be in an earlier window, since a session can straddle several, and the
+    store is what is asked. Sessions that began before ``start`` or close after ``end``
+    were only partly requested, so they are not required. The bars received are kept
+    either way. Without a calendar, a non-empty answer is taken as final, since nothing
+    can contradict it. Check :attr:`BackfillReport.complete`.
     """
     if window <= timedelta(0):
         raise ValidationError("window must be positive")
@@ -348,7 +368,7 @@ async def backfill(
             report.windows_skipped += 1
         else:
             await _backfill_window(
-                fetch, store, symbol, interval, cursor, upper, calendar, report
+                fetch, store, symbol, interval, cursor, upper, calendar, start, report
             )
         cursor = upper
     return report
@@ -362,12 +382,20 @@ async def _backfill_window(
     start: datetime,
     end: datetime,
     calendar: TradingCalendar | None,
+    requested_from: datetime,
     report: BackfillReport,
 ) -> None:
     try:
         bars = await fetch(symbol, interval, start, end)
         _check_window(bars, symbol, interval, start, end)
         result = store.write(bars)
+        missing = (
+            _sessions_without_bars(
+                store, symbol, interval, calendar, start, end, requested_from
+            )
+            if calendar is not None and bars
+            else []
+        )
     except (IsmetError, sqlite3.Error) as exc:
         logger.warning("backfill window %s failed: %s", start, exc)
         report.windows_failed += 1
@@ -380,7 +408,6 @@ async def _backfill_window(
     if not bars and not _proven_empty(calendar, start, end):
         report.windows_empty_unproven += 1
         return
-    missing = _sessions_without_bars(bars, calendar, start, end)
     if missing:
         report.windows_incomplete += 1
         report.sessions_missing.extend(missing)
@@ -389,29 +416,47 @@ async def _backfill_window(
     report.windows_fetched += 1
 
 
-def _sessions_without_bars(
-    bars: list[Bar],
-    calendar: TradingCalendar | None,
-    start: datetime,
-    end: datetime,
-) -> list[date]:
-    """Sessions wholly inside the window with no bar. Unprovable ones count too."""
-    if calendar is None or not bars:
-        return []
+def _sessions_touching(
+    calendar: TradingCalendar, start: datetime, end: datetime
+) -> list[Session]:
+    """Sessions with any moment in ``[start, end)``. Raises past the calendar's data."""
     first = calendar.local_date(start)
     last = calendar.local_date(end - timedelta(microseconds=1))
-    try:
-        sessions = calendar.sessions(first, last)
-    except CalendarOutOfRange:
-        return [first]
-    present = {bar.session_date or calendar.local_date(bar.exchange_ts) for bar in bars}
     return [
-        session.date
-        for session in sessions
-        if start <= session.open
-        and session.close <= end
-        and session.date not in present
+        session
+        for session in calendar.sessions(first, last)
+        if session.open < end and start < session.close
     ]
+
+
+def _sessions_without_bars(
+    store: BarStore,
+    symbol: Symbol,
+    interval: Interval,
+    calendar: TradingCalendar,
+    start: datetime,
+    end: datetime,
+    requested_from: datetime,
+) -> list[date]:
+    """Sessions closing in this window with no bar stored. Unprovable ones count too."""
+    try:
+        sessions = _sessions_touching(calendar, start, end)
+    except CalendarOutOfRange:
+        return [calendar.local_date(start)]
+    due = [
+        session
+        for session in sessions
+        if requested_from <= session.open and session.close <= end
+    ]
+    if not due:
+        return []
+    # A daily bar can be stamped before its session opens, so read a day wider.
+    earliest = min(start, due[0].open) - timedelta(days=1)
+    stored = store.read(symbol, interval, earliest, end)
+    present = {
+        bar.session_date or calendar.local_date(bar.exchange_ts) for bar in stored
+    }
+    return [session.date for session in due if session.date not in present]
 
 
 def _proven_empty(
@@ -419,9 +464,8 @@ def _proven_empty(
 ) -> bool:
     if calendar is None:
         return False
-    last = calendar.local_date(end - timedelta(microseconds=1))
     try:
-        return not calendar.sessions(calendar.local_date(start), last)
+        return not _sessions_touching(calendar, start, end)
     except CalendarOutOfRange:
         return False
 

@@ -33,10 +33,10 @@ Rules callers depend on that are easy to miss in the API reference.
 
 ## FIX
 
-- `FixProvider.release_quarantine(*, operator, reason)` is now `async` and durable.
-- New options are `tls` and `allow_plaintext_credentials`, and a new session setting is `session_period`.
+- `FixProvider.release_quarantine(*, operator, reason, expected)` is now `async` and durable.
+- A new option is `tls`, and a new session setting is `session_period`.
 - Removed: `FixTags`, `default_venue`, `sync_on_logon`, and the `FixDialect` overrides `status_request_ids`, `unknown_id_business_reasons`, `duplicate_order_reasons`, and `ignored_msg_types`.
-- `FixStore` gained `open_orders`, `fills_since`, `busted_executions`, `prune_messages_sent_before`, `reset_period`, `set_reset_period`, `release_quarantine`, and `put_order(..., is_open=)`.
+- `FixStore` gained `open_orders`, `fills_since`, `busted_executions`, `reset_period`, `set_reset_period`, `release_quarantine`, and `put_order(..., is_open=)`.
 - A provider declaring `venues` refuses an order on any other venue.
 - Tag 44 is read only for `LIMIT` and `STOP_LIMIT`, so an echoed zero cannot price a stop order at nothing.
 
