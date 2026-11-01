@@ -94,6 +94,9 @@ class TradingCapability(Protocol):
     - ``order_status`` finds an order by client order id and returns ``None`` only
       when the venue says it does not exist. A failed query raises.
     - ``cancel_order`` accepts a client order id whether or not an ack was seen.
+    - ``fills_since`` returns every fill at or after ``since``, following any paging,
+      with the same ``fill_id`` the execution stream uses. A shorter retention than the
+      order manager's lookback must raise rather than return a partial list.
     - ``stream_executions`` yields venue events until cancelled, and raises if the
       connection is lost and cannot be restored. Reports may be duplicated or
       reordered; fills must carry a stable ``fill_id``. Subscribe as early as possible;

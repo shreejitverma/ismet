@@ -4,9 +4,11 @@ Before an order is sent, its intent is on disk. After a crash, the journal says
 what was attempted, and for each order whether a send could have started. It is
 also the audit trail: every record carries the SHA-256 of its content and of the
 previous record, so editing, removing from the middle, or reordering history breaks
-the chain and :meth:`Journal.verify` reports where. Removing the newest records leaves
-a shorter chain that is still valid, so detecting that requires a head hash saved
-elsewhere: see ``expected_head_hash`` on :meth:`OrderManager.start`.
+the chain and :meth:`Journal.verify` reports where. Removing the newest records would
+leave a shorter chain that is still valid, so each commit also updates a small anchor
+file beside the journal (``<journal>.head``), and verification fails if the journal is
+behind its anchor. Deleting both defeats that, which is why
+``expected_head_hash`` on :meth:`OrderManager.start` exists for a hash saved elsewhere.
 
 :class:`SqliteJournal` commits with ``synchronous=FULL`` and ``fullfsync``, so a
 record has reached stable storage when ``append`` returns, as far as the drive honours
@@ -21,9 +23,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import os
 import sqlite3
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -31,6 +35,8 @@ from pathlib import Path
 from typing import IO, Protocol
 
 from ismet.errors import JournalError
+
+logger = logging.getLogger("ismet.execution")
 
 GENESIS_HASH = "0" * 64
 
@@ -57,6 +63,7 @@ class JournalRecord:
     payload: str
     prev_hash: str
     hash: str
+    unique_intent: bool = False
 
 
 @dataclass(frozen=True)
@@ -84,9 +91,10 @@ def _record_hash(
     client_order_id: str | None,
     payload: str,
     prev_hash: str,
+    unique_intent: bool = False,
 ) -> str:
     material = json.dumps(
-        [seq, ts, kind, client_order_id, payload, prev_hash],
+        [seq, ts, kind, client_order_id, payload, prev_hash, int(unique_intent)],
         separators=(",", ":"),
         ensure_ascii=False,
     )
@@ -124,37 +132,32 @@ def chain_contains(journal: Journal, record_hash: str) -> bool:
     return any(record.hash == record_hash for record in journal.records())
 
 
-def _verify_chain(records: Iterator[JournalRecord]) -> VerifyResult:
+_RawRow = tuple[int, str, str, str | None, str, str, str, int]
+
+
+def _verify_chain(rows: Iterable[_RawRow]) -> VerifyResult:
+    """Check stored text as written, so a corrupt field is a failure, not a crash."""
     prev = GENESIS_HASH
     expected_seq = 1
     count = 0
-    for record in records:
+    for seq, ts, kind, client_order_id, payload, prev_hash, digest, unique in rows:
         count += 1
-        if record.seq != expected_seq:
+        if seq != expected_seq:
             return VerifyResult(
                 False,
                 count,
                 prev,
-                record.seq,
-                f"sequence jumps from {expected_seq - 1} to {record.seq}",
+                seq,
+                f"sequence jumps from {expected_seq - 1} to {seq}",
             )
-        if record.prev_hash != prev:
-            return VerifyResult(
-                False, count, prev, record.seq, "previous hash mismatch"
-            )
+        if prev_hash != prev:
+            return VerifyResult(False, count, prev, seq, "previous hash mismatch")
         computed = _record_hash(
-            record.seq,
-            record.ts.isoformat(),
-            record.kind.value,
-            record.client_order_id,
-            record.payload,
-            record.prev_hash,
+            seq, ts, kind, client_order_id, payload, prev_hash, bool(unique)
         )
-        if computed != record.hash:
-            return VerifyResult(
-                False, count, prev, record.seq, "record content altered"
-            )
-        prev = record.hash
+        if computed != digest:
+            return VerifyResult(False, count, prev, seq, "record content altered")
+        prev = digest
         expected_seq += 1
     return VerifyResult(True, count, prev)
 
@@ -200,9 +203,11 @@ class MemoryJournal:
         prev = self._records[-1].hash if self._records else GENESIS_HASH
         seq = len(self._records) + 1
         stamp = moment.isoformat()
-        digest = _record_hash(seq, stamp, kind.value, client_order_id, payload, prev)
+        digest = _record_hash(
+            seq, stamp, kind.value, client_order_id, payload, prev, unique_intent
+        )
         record = JournalRecord(
-            seq, moment, kind, client_order_id, payload, prev, digest
+            seq, moment, kind, client_order_id, payload, prev, digest, unique_intent
         )
         self._records.append(record)
         return record
@@ -214,7 +219,19 @@ class MemoryJournal:
         return _kill_state_from(iter(self._records))
 
     def verify(self) -> VerifyResult:
-        return _verify_chain(iter(self._records))
+        return _verify_chain(
+            (
+                r.seq,
+                r.ts.isoformat(),
+                r.kind.value,
+                r.client_order_id,
+                r.payload,
+                r.prev_hash,
+                r.hash,
+                int(r.unique_intent),
+            )
+            for r in self._records
+        )
 
     def head_hash(self) -> str:
         return self._records[-1].hash if self._records else GENESIS_HASH
@@ -296,7 +313,13 @@ class SqliteJournal:
                     seq = head[0] + 1 if head else 1
                     prev = head[1] if head else GENESIS_HASH
                     digest = _record_hash(
-                        seq, stamp, kind.value, client_order_id, payload, prev
+                        seq,
+                        stamp,
+                        kind.value,
+                        client_order_id,
+                        payload,
+                        prev,
+                        unique_intent,
                     )
                     self._conn.execute(
                         "INSERT INTO journal "
@@ -323,7 +346,32 @@ class SqliteJournal:
                 ) from exc
             except sqlite3.Error as exc:
                 raise JournalError(f"journal write failed: {exc}") from exc
-        return JournalRecord(seq, moment, kind, client_order_id, payload, prev, digest)
+            self._write_anchor(seq, digest)
+        return JournalRecord(
+            seq, moment, kind, client_order_id, payload, prev, digest, unique_intent
+        )
+
+    @property
+    def anchor_path(self) -> Path:
+        return self.path.with_name(self.path.name + ".head")
+
+    def _write_anchor(self, seq: int, digest: str) -> None:
+        """Best effort: a missing or older anchor only weakens truncation detection."""
+        temporary = self.anchor_path.with_name(
+            f"{self.anchor_path.name}.{os.getpid()}.{threading.get_ident()}"
+        )
+        try:
+            temporary.write_text(f"{seq} {digest}", encoding="ascii")
+            temporary.replace(self.anchor_path)
+        except OSError as exc:
+            logger.warning("could not update the journal anchor: %s", exc)
+
+    def _read_anchor(self) -> tuple[int, str] | None:
+        try:
+            seq, digest = self.anchor_path.read_text(encoding="ascii").split()
+            return int(seq), digest
+        except (OSError, ValueError):
+            return None
 
     @staticmethod
     def _row(row: tuple[int, str, str, str | None, str, str, str]) -> JournalRecord:
@@ -370,7 +418,39 @@ class SqliteJournal:
         )
 
     def verify(self) -> VerifyResult:
-        return _verify_chain(self.records())
+        """Check the chain, then that nothing newer than the anchor has been removed."""
+        with self._lock:
+            try:
+                rows = self._conn.execute(
+                    "SELECT seq, ts, kind, client_order_id, payload, prev_hash, hash, "
+                    "unique_intent FROM journal ORDER BY seq"
+                ).fetchall()
+            except sqlite3.Error as exc:
+                raise JournalError(f"journal read failed: {exc}") from exc
+        result = _verify_chain(rows)
+        if not result.ok:
+            return result
+        anchor = self._read_anchor()
+        if anchor is None:
+            return result
+        seq, digest = anchor
+        if seq > len(rows):
+            return VerifyResult(
+                False,
+                result.records,
+                result.head_hash,
+                seq,
+                f"journal ends at {len(rows)} but its anchor saw {seq}: truncated",
+            )
+        if rows[seq - 1][6] != digest:
+            return VerifyResult(
+                False,
+                result.records,
+                result.head_hash,
+                seq,
+                f"record {seq} does not match the anchor: the journal was replaced",
+            )
+        return result
 
     def durability_settings(self) -> dict[str, int]:
         """The pragmas durability depends on, for tests and ``ismet doctor``."""

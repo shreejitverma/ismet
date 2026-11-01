@@ -22,7 +22,9 @@ from typing import ClassVar
 
 from ismet.errors import (
     AmbiguousOutcome,
+    AuthError,
     DuplicateOrderId,
+    RateLimited,
     TransportError,
     VenueError,
 )
@@ -82,6 +84,10 @@ class Fault(str, Enum):
     """The venue accepts the order, then answers with a 5xx."""
     ADAPTER_BUG = "adapter_bug"
     """An unexpected exception, which says nothing about delivery."""
+    RATE_LIMITED = "rate_limited"
+    """The venue throttled the request and did not process it."""
+    AUTH_FAILED = "auth_failed"
+    """The venue refused the credentials and did not process the request."""
 
 
 @dataclass
@@ -156,6 +162,15 @@ class SimVenue(Provider):
         self.fail_queries = 0
         self.fail_cancels = 0
         self.lose_cancel_response = 0
+        self.status_lag_queries = 0
+        """A new order stays invisible to this many status queries."""
+        self.positions_lag_queries = 0
+        """Positions stay frozen for this many queries after each fill."""
+        self.fee_only_on_query = False
+        """Stream fills carry no fee; the fee appears only in ``fills_since``."""
+        self._status_lag: Counter[str] = Counter()
+        self._positions_view: dict[Symbol, Decimal] | None = None
+        self._positions_view_left = 0
 
     # Scenario control
 
@@ -304,6 +319,9 @@ class SimVenue(Provider):
             queue.put_nowait(event)
 
     def _adjust_position(self, symbol: Symbol, delta: Decimal) -> None:
+        if self.positions_lag_queries:
+            self._positions_view = dict(self._positions)
+            self._positions_view_left = self.positions_lag_queries
         self._positions[symbol] = add(self._positions.get(symbol, Decimal(0)), delta)
 
     def _execute(
@@ -333,12 +351,17 @@ class SimVenue(Provider):
             liquidity=liquidity,
         )
         self._fills.append(fill)
+        reported = (
+            fill.model_copy(update={"fee": None, "fee_currency": None})
+            if self.fee_only_on_query
+            else fill
+        )
         self._publish(
             Filled(
                 client_order_id=request.client_order_id,
                 ts=self.clock.now(),
                 origin=EventOrigin.VENUE,
-                fill=fill,
+                fill=reported,
             )
         )
 
@@ -441,6 +464,10 @@ class SimVenue(Provider):
             raise TransportError("simulated: connection refused")
         if fault is Fault.ADAPTER_BUG:
             raise RuntimeError("simulated: adapter bug after send")
+        if fault is Fault.RATE_LIMITED:
+            raise RateLimited("simulated: too many requests", retry_after=1.0)
+        if fault is Fault.AUTH_FAILED:
+            raise AuthError("simulated: token expired", status=401)
         if fault is Fault.REJECT:
             raise VenueError("simulated: insufficient funds", code="INSUFFICIENT_FUNDS")
         if cid in self._orders:
@@ -450,6 +477,7 @@ class SimVenue(Provider):
         if request.post_only and self._would_cross(request):
             raise VenueError("post-only order would cross", code="WOULD_CROSS")
         self.accepted[cid] += 1
+        self._status_lag[cid] = self.status_lag_queries
         order = _Order(
             request,
             self._next_id("V"),
@@ -571,6 +599,9 @@ class SimVenue(Provider):
     ) -> VenueOrderSnapshot | None:
         self._maybe_fail_query()
         order = self._orders.get(client_order_id)
+        if self._status_lag[client_order_id] > 0:
+            self._status_lag[client_order_id] -= 1
+            return None
         return None if order is None else self._snapshot(order)
 
     async def open_orders(
@@ -620,9 +651,15 @@ class SimVenue(Provider):
 
     async def positions(self) -> list[Position]:
         self._maybe_fail_query()
+        view = self._positions
+        if self._positions_view is not None:
+            view = self._positions_view
+            self._positions_view_left -= 1
+            if self._positions_view_left <= 0:
+                self._positions_view = None
         return [
             Position(symbol=symbol, quantity=quantity)
-            for symbol, quantity in self._positions.items()
+            for symbol, quantity in view.items()
             if quantity != 0
         ]
 

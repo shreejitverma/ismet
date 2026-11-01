@@ -29,10 +29,72 @@ def venue(cls: type[SimVenue] = SimVenue) -> SimVenue:
     return sim
 
 
+def marketable(client_order_id: str) -> OrderRequest:
+    return order(client_order_id, price="10.01", quantity="1")
+
+
+async def run_full(sim: SimVenue, **kw: object):  # type: ignore[no-untyped-def]
+    return await run_trading_conformance(
+        sim,
+        passive,
+        make_marketable_order=marketable,
+        attempts=lambda cid: sim.attempts[cid],
+        **kw,  # type: ignore[arg-type]
+    )
+
+
 async def test_simulated_venue_conforms() -> None:
-    report = await run_trading_conformance(venue(), passive)
+    report = await run_full(venue())
     assert_conformant(report)
-    assert len(report.checks) >= 15
+    names = {check.name for check in report.checks}
+    assert {
+        "place_sends_exactly_once",
+        "duplicate_client_id_refused",
+        "status_none_when_not_found",
+        "fill_id_matches_across_channels",
+    } <= names
+
+
+class RetriesPlaceTwice(SimVenue):
+    async def place_order(self, request: OrderRequest) -> OrderAck:
+        ack = await super().place_order(request)
+        self.attempts[request.client_order_id] += 1
+        return ack
+
+
+class ForgetsFills(SimVenue):
+    async def fills_since(self, since, symbol=None):  # type: ignore[no-untyped-def]
+        return []
+
+
+class FillIdsDifferByChannel(SimVenue):
+    async def fills_since(self, since, symbol=None):  # type: ignore[no-untyped-def]
+        fills = await super().fills_since(since, symbol)
+        return [f.model_copy(update={"fill_id": f"Q{f.fill_id}"}) for f in fills]
+
+
+class FillsNotOnStream(SimVenue):
+    def _publish(self, event) -> None:  # type: ignore[no-untyped-def]
+        from ismet.models.orders import Filled
+
+        if not isinstance(event, Filled):
+            super()._publish(event)
+
+
+@pytest.mark.parametrize(
+    ("broken", "failing_check", "timeout"),
+    [
+        (RetriesPlaceTwice, "place_sends_exactly_once", 2.0),
+        (ForgetsFills, "fills_since_reports_fill", 2.0),
+        (FillIdsDifferByChannel, "fill_id_matches_across_channels", 2.0),
+        (FillsNotOnStream, "stream_reports_fill", 0.05),
+    ],
+)
+async def test_suite_catches_adapters_that_would_break_the_safety_claims(
+    broken: type[SimVenue], failing_check: str, timeout: float
+) -> None:
+    report = await run_full(venue(broken), timeout=timeout)
+    assert failing_check in {check.name for check in report.failures}
 
 
 async def test_refuses_to_run_against_a_live_provider() -> None:

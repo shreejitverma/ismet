@@ -34,7 +34,7 @@ import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any, TypeVar, cast
 
@@ -112,7 +112,13 @@ CheckpointHook = Callable[[str, str], None]
 _WORKING = (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED)
 _PENDING = (OrderStatus.PENDING_CANCEL, OrderStatus.PENDING_REPLACE)
 _RESOLVE = (OrderStatus.SUBMITTING, OrderStatus.UNKNOWN)
-_HALTING_ANOMALIES = ("overfill", "re-reported with different terms", "after terminal")
+# A fill after a cancel is an ordinary race, recorded but not a reason to stop. A fill
+# on an order believed never accepted means the books were wrong.
+_HALTING_ANOMALIES = (
+    "overfill",
+    "re-reported with different terms",
+    "after terminal status rejected",
+)
 
 
 def _bundled_calendar(venue: str) -> TradingCalendar | None:
@@ -139,6 +145,11 @@ class OrderManager:
     ``instrument_ttl`` bounds how long reference data is trusted, so a halt or a
     delisting is seen; a failed refresh refuses the order. ``cancel_retry_interval`` is
     how long a sent cancel may stay unanswered before it is sent again.
+    ``fill_lookback`` widens every fill query, so a venue clock behind the local one
+    cannot hide a fill. Reconciliation also compares all recent fills, including those
+    on closed orders, because a position check misses offsetting losses and a venue with
+    no account API has no position check at all. Positions must disagree for longer than
+    ``unknown_grace`` to count, since brokers' position views lag their fills.
     ``stream_settle`` is the delay before a follow-up reconciliation after the execution
     stream connects, covering the time a subscription takes to go live. ``None`` skips
     the follow-up.
@@ -162,6 +173,7 @@ class OrderManager:
         kill_poll_interval: float = 0.5,
         instrument_ttl: float = 60.0,
         cancel_retry_interval: float = 1.0,
+        fill_lookback: float = 3600.0,
         stream_settle: float | None = 2.0,
         locate_check: Callable[[OrderRequest], bool] | None = None,
         on_event: EventHook | None = None,
@@ -190,6 +202,7 @@ class OrderManager:
         self._kill_poll_interval = kill_poll_interval
         self._instrument_ttl = instrument_ttl
         self._cancel_retry_interval = cancel_retry_interval
+        self._fill_lookback = timedelta(seconds=fill_lookback)
         self._stream_settle = stream_settle
         self._locate_check = locate_check
         self._on_event = on_event
@@ -216,6 +229,8 @@ class OrderManager:
         self._kill = KillState(False)
         self._kill_unrecorded: dict[str, Any] | None = None
         self._reconcile_blind: str | None = None
+        self._last_sweep: datetime | None = None
+        self._position_suspect_since: dict[Symbol, float] = {}
         self._journal_failed: str | None = None
         self.stream_healthy = False
 
@@ -304,6 +319,12 @@ class OrderManager:
             return []
         if cancel_open:
             await self.cancel_all()
+        await self._record_kill()
+        if self._kill_unrecorded is not None:
+            logger.critical(
+                "stopping with a kill switch the journal never recorded: it will not "
+                "survive a restart. Engage it again with `ismet kill engage`"
+            )
         await self.abort()
         return [o for o in self._orders.values() if o.is_open]
 
@@ -370,8 +391,11 @@ class OrderManager:
         self._symbols_seen.clear()
         self._created_at.clear()
         self._baseline = None
+        self._last_sweep = None
         records = await self._call_journal(lambda: list(self._journal.records()))
         for record in records:
+            # Fills made while stopped lie after the last thing this journal saw.
+            self._last_sweep = record.ts
             if record.kind is RecordKind.ORDER_EVENT:
                 event = parse_order_event(record.payload)
                 cid = event.client_order_id
@@ -668,19 +692,37 @@ class OrderManager:
         logger.warning("kill switch released by %s: %s", operator, reason)
         return self._kill
 
-    def _merge_kill(self, durable: KillState) -> None:
-        """Adopt a kill state read from the journal only if it is newer than ours.
+    async def _merge_kill(self, durable: KillState) -> None:
+        """Adopt a kill state read from the journal only if it is newer and believable.
 
         A read can race a local engage, and a local engage may not have reached the
         journal yet. In both cases the journal looks "not engaged", and believing it
-        would silently switch the kill switch off.
+        would silently switch the kill switch off. A release from elsewhere must name an
+        operator and sit on an intact chain: anyone can insert a row in a SQLite file.
         """
-        if self._kill_unrecorded is None and durable.seq > self._kill.seq:
+        if self._kill_unrecorded is not None or durable.seq <= self._kill.seq:
+            return
+        if durable.engaged:
             self._kill = durable
+            return
+        if self._kill.engaged:
+            if not durable.operator:
+                logger.critical("ignoring a kill switch release with no operator")
+                return
+            result = await self._call_journal(self._journal.verify)
+            if not result.ok:
+                logger.critical(
+                    "ignoring a kill switch release: journal failed verification at "
+                    "record %s: %s",
+                    result.first_bad_seq,
+                    result.detail,
+                )
+                return
+        self._kill = durable
 
     async def _check_can_trade(self) -> None:
         """Refuse a new order if exposure cannot be trusted right now."""
-        self._merge_kill(await self._call_journal(self._journal.kill_state))
+        await self._merge_kill(await self._call_journal(self._journal.kill_state))
         if self._kill.engaged:
             raise KillSwitchEngaged(self._kill.reason)
         if self._journal_failed is not None:
@@ -695,7 +737,9 @@ class OrderManager:
             await asyncio.sleep(self._kill_poll_interval)
             try:
                 await self._record_kill()
-                self._merge_kill(await self._call_journal(self._journal.kill_state))
+                await self._merge_kill(
+                    await self._call_journal(self._journal.kill_state)
+                )
                 if self._kill.engaged and self._kill.cancel_open and self.open_orders():
                     await self.cancel_all()
             except asyncio.CancelledError:
@@ -1261,6 +1305,7 @@ class OrderManager:
                 except Exception as exc:
                     self._query_failed(report, state.client_order_id, exc)
             await self._find_orphans(report)
+            await self._sweep_fills(report)
             await self._check_positions(report)
             failed = [b for b in report.breaks if b.kind is BreakKind.QUERY_FAILED]
             self._reconcile_blind = (
@@ -1383,7 +1428,7 @@ class OrderManager:
     ) -> bool:
         """Book any fills the venue has for this order. False if it could not ask."""
         cid = state.client_order_id
-        since = self._created_at.get(cid, report.at)
+        since = self._created_at.get(cid, report.at) - self._fill_lookback
         try:
             fills = await self._venue.fills_since(since, state.request.symbol)
         except Exception as exc:
@@ -1394,6 +1439,35 @@ class OrderManager:
             if fill.client_order_id == cid and fill.fill_id not in known:
                 await self._record_recovered_fill(fill)
         return True
+
+    async def _sweep_fills(self, report: ReconReport) -> None:
+        """Book every recent fill not already recorded, on any order.
+
+        This is what catches a fill on an order already closed. Only a clean sweep moves
+        the window forward, so a failure leaves the fills for the next pass to find.
+        """
+        began = self._last_sweep if self._last_sweep is not None else report.at
+        try:
+            fills = await self._venue.fills_since(began - self._fill_lookback)
+        except Exception as exc:
+            self._query_failed(report, "fills", exc)
+            return
+        for fill in fills:
+            state = self._orders.get(fill.client_order_id)
+            if state is None:
+                report.breaks.append(
+                    ReconBreak(
+                        BreakKind.ORPHAN_FILL,
+                        fill.fill_id,
+                        f"{fill.side.value} {fill.quantity} {fill.symbol} at "
+                        f"{fill.price} on {fill.client_order_id}, which ismet never "
+                        "sent",
+                    )
+                )
+            elif all(known.fill_id != fill.fill_id for known in state.fills):
+                await self._record_recovered_fill(fill)
+                report.resolved.append(fill.client_order_id)
+        self._last_sweep = report.at
 
     async def _record_recovered_fill(self, fill: Fill) -> None:
         await self._record(
@@ -1518,10 +1592,12 @@ class OrderManager:
             self._query_failed(report, "positions", exc)
             return
         venue = {p.symbol: p.quantity for p in positions}
+        now = self._clock.monotonic()
         for symbol in sorted({*venue, *self._tracked_symbols()}, key=str):
             ours = self.net_position(symbol) or Decimal(0)
             theirs = venue.get(symbol, Decimal(0))
             if ours == theirs:
+                self._position_suspect_since.pop(symbol, None)
                 continue
             await self._recover_missing_fills(symbol, report)
             ours = self.net_position(symbol) or Decimal(0)
@@ -1533,14 +1609,20 @@ class OrderManager:
                 self._query_failed(report, str(symbol), exc)
                 continue
             theirs = next((p.quantity for p in fresh if p.symbol == symbol), Decimal(0))
-            if ours != theirs:
-                report.breaks.append(
-                    ReconBreak(
-                        BreakKind.POSITION_MISMATCH,
-                        str(symbol),
-                        f"ismet {ours}, venue {theirs}, difference {sub(ours, theirs)}",
-                    )
+            if ours == theirs:
+                self._position_suspect_since.pop(symbol, None)
+                continue
+            first_seen = self._position_suspect_since.setdefault(symbol, now)
+            if now - first_seen < self._unknown_grace:
+                report.complete = False  # brokers' positions can lag their fills
+                continue
+            report.breaks.append(
+                ReconBreak(
+                    BreakKind.POSITION_MISMATCH,
+                    str(symbol),
+                    f"ismet {ours}, venue {theirs}, difference {sub(ours, theirs)}",
                 )
+            )
 
     async def _recover_missing_fills(self, symbol: Symbol, report: ReconReport) -> None:
         # Rare by design: this runs only after a position disagreement.
@@ -1549,7 +1631,7 @@ class OrderManager:
             for o in self._orders.values()
             if o.request.symbol == symbol and o.client_order_id in self._created_at
         ]
-        since = min(times) if times else report.at
+        since = (min(times) if times else report.at) - self._fill_lookback
         try:
             fills = await self._venue.fills_since(since, symbol)
         except Exception as exc:

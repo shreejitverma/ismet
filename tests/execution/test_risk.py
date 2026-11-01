@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -239,7 +239,6 @@ def test_calendar_out_of_range_refuses_the_order() -> None:
     )
     fresh = QUOTE.model_copy(update={"exchange_ts": far, "received_ts": far})
     assert "covers" in rejected_by("session", ctx(now=far, reference=fresh))
-    assert date(2026, 3, 9) < far.date()
 
 
 def test_restricted_list_matches_full_symbol_or_ticker() -> None:

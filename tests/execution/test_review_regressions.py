@@ -17,6 +17,7 @@ from ismet.errors import (
     AmbiguousOutcome,
     ConfigError,
     JournalError,
+    KillSwitchEngaged,
     RiskRejected,
     ValidationError,
 )
@@ -562,7 +563,7 @@ async def test_failed_venue_queries_stop_new_orders_until_a_pass_succeeds(
     oms: OrderManager, venue: SimVenue
 ) -> None:
     await venue.drain()
-    venue.fail_queries = 3
+    venue.fail_queries = 100_000  # background passes keep retrying, and keep failing
     report = await oms.reconcile()
     assert not report.complete
     with pytest.raises(RiskRejected) as caught:
@@ -1384,3 +1385,398 @@ def test_adjustment_uses_the_venue_date_not_the_utc_date() -> None:
     )
     split = CorporateAction(ActionKind.SPLIT, date(2026, 3, 3), ratio=D(2))
     assert adjust_bars([after_hours], [split])[0].close == 50
+
+
+# Third review: fills on closed orders, adopted kill states, venue realism
+
+
+async def test_offsetting_dropped_fills_on_closed_orders_are_booked(
+    oms: OrderManager, venue: SimVenue
+) -> None:
+    await venue.drain()
+    await oms.submit(order("TR1", price="9.50"))
+    await oms.submit(
+        order(
+            "TR2",
+            side=SELL,
+            price="10.50",
+            short_sale=ShortSaleMark.SHORT_EXEMPT,
+        )
+    )
+    await venue.drain()
+    venue.report_faults.drop_next = 2
+    venue.trade_through(ACME, "9.50", "40")
+    venue.trade_through(ACME, "10.50", "40")
+    await venue.cancel_order("TR1", ACME)
+    await venue.cancel_order("TR2", ACME)
+    await venue.drain()
+    assert oms.order("TR1").is_terminal and oms.order("TR2").is_terminal
+    report = await oms.reconcile()
+    assert oms.order("TR1").filled_quantity == 40
+    assert oms.order("TR2").filled_quantity == 40
+    assert {"TR1", "TR2"} <= set(report.resolved)
+
+
+async def test_venue_with_no_account_api_books_a_fill_on_a_closed_order(
+    clock: ManualClock,
+) -> None:
+    venue = account_free(clock)
+    oms = bare_manager(venue, clock)
+    await oms.start()
+    try:
+        await venue.drain()
+        await oms.submit(order("TR3", price="9.50"))
+        await venue.drain()
+        venue.report_faults.drop_next = 1
+        venue.trade_through(ACME, "9.50", "40")
+        await venue.cancel_order("TR3", ACME)
+        await venue.drain()
+        report = await oms.reconcile()
+        assert oms.net_position(ACME) == 40
+        assert not report.positions_verified
+    finally:
+        await oms.abort()
+
+
+async def test_fill_recovery_survives_a_venue_clock_behind_ours(
+    journal_path: Path, clock: ManualClock
+) -> None:
+    behind = ManualClock(clock.now() - timedelta(milliseconds=500))
+    venue = SimVenue(clock=behind, instruments=[sim_instrument("ACME")])
+    venue.set_quote(ACME, "9.99", "10.01")
+    journal = SqliteJournal(journal_path)
+    oms = OrderManager(
+        venue,
+        journal,
+        RiskEngine(permissive_config()),
+        clock=clock,
+        unknown_grace=0.0,
+        reconcile_interval=3600,
+        stream_settle=None,
+    )
+    await oms.start()
+    try:
+        await venue.drain()
+        await oms.submit(order("TR4", price="9.50"))
+        await venue.drain()
+        venue.report_faults.drop_next = 1
+        venue.trade_through(ACME, "9.50", "40")
+        await oms.reconcile()
+        assert oms.order("TR4").filled_quantity == 40
+        assert not oms.kill_state.engaged
+    finally:
+        await oms.abort()
+        journal.close()
+
+
+async def test_a_failed_sweep_leaves_the_fill_for_the_next_pass(
+    oms: OrderManager,
+    venue: SimVenue,
+    clock: ManualClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await venue.drain()
+    await oms.submit(order("TR5", price="9.50"))
+    await venue.drain()
+    venue.report_faults.drop_next = 1
+    venue.trade_through(ACME, "9.50", "40")
+    await venue.cancel_order("TR5", ACME)
+    await venue.drain()
+    real = venue.fills_since
+
+    async def down(*_: object) -> list[Fill]:
+        raise ValidationError("down")
+
+    monkeypatch.setattr(venue, "fills_since", down)
+    assert not (await oms.reconcile()).complete
+    clock.advance(7200)
+    monkeypatch.setattr(venue, "fills_since", real)
+    await oms.reconcile()
+    assert oms.order("TR5").filled_quantity == 40
+
+
+async def test_fill_after_a_cancel_is_recorded_without_halting(
+    oms: OrderManager, venue: SimVenue
+) -> None:
+    await venue.drain()
+    await oms.submit(order("TR6", price="9.50"))
+    await venue.drain()
+    venue.report_faults.hold_next = 1
+    venue.trade_through(ACME, "9.50", "40")
+    await venue.cancel_order("TR6", ACME)
+    await oms.wait_for("TR6", lambda o: o.is_terminal, 2)
+    venue.release_held_reports()
+    state = await oms.wait_for("TR6", lambda o: o.filled_quantity == 40, 2)
+    assert any("after terminal" in a for a in state.anomalies)
+    assert not oms.kill_state.engaged
+
+
+async def test_fill_on_an_order_believed_rejected_halts(
+    oms: OrderManager, venue: SimVenue
+) -> None:
+    await venue.drain()
+    venue.faults.append(Fault.LOSE_REQUEST)
+    await oms.submit(order("TR7", price="9.50"))
+    await oms.reconcile()
+    assert oms.order("TR7").status is S.REJECTED
+    venue.add_external_order(order("TR7", price="9.50"))
+    venue.trade_through(ACME, "9.50", "1")
+    await oms.wait_for("TR7", lambda o: o.filled_quantity == 1, 2)
+    await venue.drain()
+    assert oms.kill_state.engaged
+
+
+async def test_rejection_after_acceptance_closes_the_order(
+    oms: OrderManager, venue: SimVenue
+) -> None:
+    from ismet.models.orders import EventOrigin, Rejected
+
+    await venue.drain()
+    await oms.submit(order("TR8", price="9.50"))
+    await venue.drain()
+    venue._publish(
+        Rejected(
+            client_order_id="TR8",
+            ts=venue.clock.now(),
+            origin=EventOrigin.VENUE,
+            reason="margin check failed",
+        )
+    )
+    state = await oms.wait_for("TR8", lambda o: o.is_terminal, 2)
+    assert state.status is S.REJECTED and not state.anomalies
+
+
+async def test_forged_release_is_not_adopted_by_a_running_manager(
+    oms: OrderManager, venue: SimVenue, journal_path: Path
+) -> None:
+    import sqlite3
+
+    await venue.drain()
+    await oms.engage_kill("halt", operator="ops", cancel_open=False)
+    conn = sqlite3.connect(journal_path)
+    row = conn.execute("SELECT MAX(seq) FROM journal").fetchone()
+    conn.execute(
+        "INSERT INTO journal (seq, ts, kind, client_order_id, payload, unique_intent, "
+        "prev_hash, hash) "
+        "VALUES (?, ?, 'kill_released', NULL, ?, 0, 'forged', 'forged')",
+        (row[0] + 1, NOW.isoformat(), '{"reason": "x", "operator": "mallory"}'),
+    )
+    conn.commit()
+    conn.close()
+    with pytest.raises(KillSwitchEngaged):
+        await oms.submit(order("TR9", price="9.50"))
+    assert oms.kill_state.engaged
+
+
+async def test_release_naming_no_operator_is_not_adopted(
+    oms: OrderManager, venue: SimVenue, journal_path: Path
+) -> None:
+    await venue.drain()
+    await oms.engage_kill("halt", operator="ops", cancel_open=False)
+    other = SqliteJournal(journal_path)
+    other.append(RecordKind.KILL_RELEASED, '{"reason": "x"}')
+    other.close()
+    with pytest.raises(KillSwitchEngaged):
+        await oms.submit(order("TR10", price="9.50"))
+
+
+async def test_keep_orders_kill_leaves_open_orders_working_across_polls(
+    oms: OrderManager, venue: SimVenue
+) -> None:
+    await venue.drain()
+    await oms.submit(order("TR11", price="9.50"))
+    await venue.drain()
+    await oms.engage_kill("halt", cancel_open=False)
+    await asyncio.sleep(0.05)  # many polls of the kill loop at 10 ms
+    assert oms.order("TR11").status is S.ACCEPTED
+    assert venue.attempts["TR11"] == 1
+
+
+async def test_short_sale_through_the_manager_needs_a_configured_locate(
+    make_manager: Factory, venue: SimVenue
+) -> None:
+    oms = make_manager()
+    await oms.start()
+    try:
+        await venue.drain()
+        with pytest.raises(RiskRejected) as caught:
+            await oms.submit(
+                order(
+                    "TR12",
+                    side=SELL,
+                    price="10.50",
+                    short_sale=ShortSaleMark.SHORT,
+                )
+            )
+        assert "locate" in caught.value.reason
+    finally:
+        await oms.abort()
+    allowed = make_manager(locate_check=lambda _: True)
+    await allowed.start()
+    try:
+        state = await allowed.submit(
+            order("TR13", side=SELL, price="10.50", short_sale=ShortSaleMark.SHORT)
+        )
+        assert state.status is S.ACCEPTED
+    finally:
+        await allowed.abort()
+
+
+@pytest.mark.parametrize(
+    ("fault", "code"),
+    [(Fault.RATE_LIMITED, "RateLimited"), (Fault.AUTH_FAILED, "AuthError")],
+)
+async def test_refusals_that_certainly_did_not_execute_close_the_order(
+    oms: OrderManager, venue: SimVenue, fault: Fault, code: str
+) -> None:
+    await venue.drain()
+    venue.faults.append(fault)
+    state = await oms.submit(order(f"TR-{code}", price="9.50"))
+    assert state.status is S.REJECTED and state.reject_code == code
+
+
+async def test_order_slow_to_appear_at_the_venue_is_not_declared_lost(
+    make_manager: Factory, venue: SimVenue, clock: ManualClock
+) -> None:
+    oms = make_manager(unknown_grace=5.0)
+    await oms.start()
+    try:
+        await venue.drain()
+        venue.status_lag_queries = 2
+        await oms.submit(order("TR14", price="9.50"))
+        await venue.drain()
+        await oms.reconcile()
+        assert oms.order("TR14").status is S.ACCEPTED
+        await oms.reconcile()
+        assert oms.order("TR14").status is S.ACCEPTED
+        clock.advance(1)
+        await oms.reconcile()
+        assert oms.order("TR14").status is S.ACCEPTED
+        assert not oms.kill_state.engaged
+    finally:
+        await oms.abort()
+
+
+async def test_a_fee_arriving_later_enriches_the_fill_rather_than_halting(
+    oms: OrderManager, venue: SimVenue
+) -> None:
+    await venue.drain()
+    venue.fee_only_on_query = True
+    await oms.submit(order("TR15", price="9.50"))
+    await venue.drain()
+    venue.trade_through(ACME, "9.50", "40")
+    state = await oms.wait_for("TR15", lambda o: o.filled_quantity == 40, 2)
+    assert state.fills[0].fee is None
+    fill_from_query = (await venue.fills_since(NOW - timedelta(days=1)))[0]
+    from ismet.models.orders import Filled
+
+    await oms._record(
+        Filled(
+            client_order_id="TR15",
+            ts=NOW,
+            fill=fill_from_query.model_copy(
+                update={"fee": D("0.10"), "fee_currency": "USD"}
+            ),
+        )
+    )
+    state = oms.order("TR15")
+    assert state.fills[0].fee == D("0.10")
+    assert state.filled_quantity == 40 and not state.anomalies
+    assert not oms.kill_state.engaged
+
+
+async def test_position_view_lagging_fills_does_not_halt(
+    make_manager: Factory, venue: SimVenue, clock: ManualClock
+) -> None:
+    oms = make_manager(unknown_grace=5.0)
+    await oms.start()
+    try:
+        await venue.drain()
+        await oms.submit(order("TR16", price="9.50"))
+        await venue.drain()
+        venue.positions_lag_queries = 3
+        venue.trade_through(ACME, "9.50", "40")
+        await oms.wait_for("TR16", lambda o: o.filled_quantity == 40, 2)
+        report = await oms.reconcile()
+        assert not report.complete and not oms.kill_state.engaged
+        await oms.reconcile()
+        assert not oms.kill_state.engaged
+    finally:
+        await oms.abort()
+
+
+async def test_persistent_position_difference_halts_after_the_grace_period(
+    make_manager: Factory, venue: SimVenue, clock: ManualClock
+) -> None:
+    oms = make_manager(unknown_grace=5.0)
+    await oms.start()
+    try:
+        await venue.drain()
+        venue.add_external_fill(ACME, BUY, D(25))
+        await oms.reconcile()
+        assert not oms.kill_state.engaged
+        clock.advance(6)
+        report = await oms.reconcile()
+        assert [b.kind for b in report.breaks] == [BreakKind.POSITION_MISMATCH]
+        assert oms.kill_state.engaged
+    finally:
+        await oms.abort()
+
+
+async def test_a_bust_while_down_halts_rather_than_guessing(
+    journal_path: Path, venue: SimVenue, clock: ManualClock
+) -> None:
+    journal = SqliteJournal(journal_path)
+    oms = OrderManager(
+        venue,
+        journal,
+        RiskEngine(permissive_config()),
+        clock=clock,
+        unknown_grace=0.0,
+        reconcile_interval=3600,
+        stream_settle=None,
+    )
+    await oms.start()
+    await venue.drain()
+    await oms.submit(order("TR17", price="9.50"))
+    await venue.drain()
+    venue.trade_through(ACME, "9.50", "40")
+    state = await oms.wait_for("TR17", lambda o: o.filled_quantity == 40, 2)
+    await oms.abort()
+    venue.bust(state.fills[0].fill_id)
+    second = OrderManager(
+        venue,
+        journal,
+        RiskEngine(permissive_config()),
+        clock=clock,
+        unknown_grace=0.0,
+        reconcile_interval=3600,
+        stream_settle=None,
+    )
+    report = await second.start()
+    try:
+        assert second.kill_state.engaged
+        kinds = {b.kind for b in report.breaks}
+        assert kinds & {BreakKind.FILL_MISMATCH, BreakKind.POSITION_MISMATCH}
+    finally:
+        await second.abort()
+        journal.close()
+
+
+async def test_concurrent_submits_cannot_jointly_exceed_a_limit(
+    make_manager: Factory, venue: SimVenue
+) -> None:
+    oms = make_manager(
+        risk=RiskEngine(permissive_config(default=RiskLimits(max_position=D(150))))
+    )
+    await oms.start()
+    try:
+        await venue.drain()
+        results = await asyncio.gather(
+            *(oms.submit(order(f"TR-C{i}", price="9.50")) for i in range(3)),
+            return_exceptions=True,
+        )
+        accepted = [r for r in results if not isinstance(r, Exception)]
+        assert len(accepted) == 1
+    finally:
+        await oms.abort()

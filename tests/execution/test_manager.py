@@ -36,7 +36,7 @@ from ismet.models.orders import (
     ShortSaleMark,
     TimeInForce,
 )
-from ismet.testing.simvenue import Fault, SimVenue
+from ismet.testing.simvenue import Fault, SimVenue, sim_instrument
 from ismet.transport.clock import ManualClock
 
 from .conftest import ACME, Factory, order, permissive_config
@@ -724,18 +724,32 @@ async def test_calls_before_start_and_double_start_are_refused(
         await oms.abort()
 
 
-async def test_short_sale_rejected_without_known_position(
-    venue: SimVenue, clock: ManualClock
-) -> None:
+async def test_short_sale_rejected_without_known_position(clock: ManualClock) -> None:
     class NoAccount(SimVenue):
-        positions = None  # type: ignore[assignment]
+        """A venue with no account API. None hides a method from a capability check."""
 
-    bare = NoAccount(clock=clock, instruments=[await venue.instrument(ACME)])
+        positions = None  # type: ignore[assignment]
+        balances = None  # type: ignore[assignment]
+
+    bare = NoAccount(clock=clock, instruments=[sim_instrument("ACME")])
     bare.set_quote(ACME, "9.99", "10.01")
     oms = OrderManager(
-        bare, MemoryJournal(), RiskEngine(permissive_config()), clock=clock
+        bare,
+        MemoryJournal(),
+        RiskEngine(permissive_config()),
+        clock=clock,
+        stream_settle=None,
     )
-    assert oms.net_position(ACME) is None
+    await oms.start()
+    try:
+        await bare.drain()
+        assert oms.net_position(ACME) is None
+        with pytest.raises(RiskRejected) as caught:
+            await oms.submit(order("NA1", side=OrderSide.SELL, price="10.50"))
+        assert caught.value.check == "short_sale"
+        assert bare.attempts["NA1"] == 0
+    finally:
+        await oms.abort()
 
 
 async def test_time_in_force_behaviour_through_the_oms(
@@ -743,7 +757,7 @@ async def test_time_in_force_behaviour_through_the_oms(
 ) -> None:
     await venue.drain()
     ioc = await oms.submit(order("T1", price="9.50", time_in_force=TimeInForce.IOC))
-    assert ioc.client_order_id == "T1"
+    assert ioc.request.time_in_force is TimeInForce.IOC
     state = await oms.wait_for("T1", lambda o: o.is_terminal, 2)
     assert state.status is S.CANCELED
     venue.set_quote(ACME, "9.99", "10.01", ask_size="50")
@@ -860,7 +874,7 @@ async def test_a_stale_journal_read_cannot_undo_a_local_engage(
 ) -> None:
     before = journal.kill_state()
     await oms.engage_kill("halt", cancel_open=False)
-    oms._merge_kill(before)
+    await oms._merge_kill(before)
     assert oms.kill_state.engaged
 
 

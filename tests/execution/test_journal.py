@@ -16,6 +16,7 @@ from ismet.execution.journal import (
     MemoryJournal,
     RecordKind,
     SqliteJournal,
+    chain_contains,
     export_jsonl,
 )
 
@@ -178,9 +179,88 @@ def test_deleting_the_tail_is_visible_through_an_anchored_head_hash(
     journal.close()
     _tamper(path, "DELETE FROM journal WHERE seq = 2")
     reopened = SqliteJournal(path)
-    assert reopened.verify().ok  # a truncated chain is still self-consistent
+    result = reopened.verify()
+    assert not result.ok and "truncated" in result.detail
     assert reopened.head_hash() != anchor
     reopened.close()
+    # Without the anchor file the shorter chain is self-consistent, which is why a head
+    # saved elsewhere exists as a stronger check.
+    (tmp_path / "j.db.head").unlink()
+    bare = SqliteJournal(path)
+    assert bare.verify().ok
+    assert not chain_contains(bare, anchor)
+    bare.close()
+
+
+def _three_records(path: Path) -> None:
+    journal = SqliteJournal(path)
+    for value in range(3):
+        journal.append(
+            RecordKind.ANOMALY, json.dumps({"a": value}), client_order_id="C", ts=TS
+        )
+    journal.close()
+
+
+def test_a_record_rewritten_with_its_own_hash_recomputed_breaks_the_link(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "j.db"
+    _three_records(path)
+    from ismet.execution.journal import _record_hash
+
+    conn = sqlite3.connect(path)
+    seq, ts, kind, cid, _, prev = conn.execute(
+        "SELECT seq, ts, kind, client_order_id, payload, prev_hash FROM journal "
+        "WHERE seq = 2"
+    ).fetchone()
+    forged = _record_hash(seq, ts, kind, cid, '{"a":9}', prev)
+    _tamper(
+        path, f"UPDATE journal SET payload='{{\"a\":9}}', hash='{forged}' WHERE seq=2"
+    )
+    conn.close()
+    journal = SqliteJournal(path)
+    result = journal.verify()
+    journal.close()
+    assert not result.ok
+    assert result.first_bad_seq == 3 and "previous hash" in result.detail
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "UPDATE journal SET client_order_id = 'X' WHERE seq = 2",
+        "UPDATE journal SET prev_hash = 'abc' WHERE seq = 2",
+        "UPDATE journal SET unique_intent = 1 WHERE seq = 2",
+        "UPDATE journal SET kind = 'bogus' WHERE seq = 2",
+        "UPDATE journal SET ts = 'garbage' WHERE seq = 2",
+        "UPDATE journal SET seq = CASE seq WHEN 2 THEN 30 WHEN 3 THEN 2 END "
+        "WHERE seq IN (2, 3)",
+    ],
+)
+def test_every_stored_field_is_covered_and_corruption_is_a_failure_not_a_crash(
+    tmp_path: Path, sql: str
+) -> None:
+    path = tmp_path / "j.db"
+    _three_records(path)
+    _tamper(path, sql)
+    journal = SqliteJournal(path)
+    result = journal.verify()
+    journal.close()
+    assert not result.ok
+
+
+def test_an_anchor_that_disagrees_with_the_chain_means_the_journal_was_replaced(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "j.db"
+    _three_records(path)
+    (tmp_path / "j.db.head").write_text("2 " + "e" * 64, encoding="ascii")
+    journal = SqliteJournal(path)
+    result = journal.verify()
+    assert not result.ok and "replaced" in result.detail
+    (tmp_path / "j.db.head").write_text("garbage", encoding="ascii")
+    assert journal.verify().ok  # an unreadable anchor weakens the check, nothing more
+    journal.close()
 
 
 def test_unusable_path_raises_journal_error(tmp_path: Path) -> None:

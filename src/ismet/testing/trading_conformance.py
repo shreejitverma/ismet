@@ -7,6 +7,11 @@ fixtures.
 
 ``make_passive_order(client_order_id)`` must return an order that rests without
 executing, such as a limit far from the market, so the suite can observe it working.
+``make_marketable_order(client_order_id)``, if given, must return an order that fills
+at once, which lets the suite check how fills are reported.
+``attempts(client_order_id)``, if given, reports how many requests actually reached the
+venue or its test double, which is the only way to catch an adapter that resends
+internally.
 """
 
 from __future__ import annotations
@@ -14,12 +19,15 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import Callable, Coroutine
+from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 
 from ismet.capabilities import AccountCapability, Capability, TradingCapability
 from ismet.errors import ConfigError, IsmetError, VenueError
 from ismet.models.orders import (
     Environment,
+    Fill,
+    Filled,
     OrderRequest,
     OrderStatus,
 )
@@ -35,6 +43,8 @@ async def run_trading_conformance(
     *,
     id_prefix: str = "CONF",
     timeout: float = 15.0,
+    make_marketable_order: Callable[[str], OrderRequest] | None = None,
+    attempts: Callable[[str], int] | None = None,
 ) -> ConformanceReport:
     """Exercise the order-entry contract and return a report."""
     if provider.environment is Environment.LIVE:
@@ -124,8 +134,15 @@ async def run_trading_conformance(
             )
         )
 
+    if attempts is not None:
+        count = attempts(cid)
+        add(Check(_CAP, "place_sends_exactly_once", count == 1, f"{count} requests"))
     await _check_duplicate_refused(venue, request, report)
     await _check_stream_reports(venue, make_passive_order, id_prefix, report, timeout)
+    if make_marketable_order is not None:
+        await _check_fill_reporting(
+            venue, make_marketable_order(f"{id_prefix}-3"), report, timeout
+        )
 
     ok, _ = await step("cancel_order", venue.cancel_order(cid, symbol))
     if ok:
@@ -211,6 +228,64 @@ async def _check_stream_reports(
             await received
         with contextlib.suppress(IsmetError):
             await venue.cancel_order(request.client_order_id, request.symbol)
+
+
+async def _check_fill_reporting(
+    venue: TradingCapability,
+    request: OrderRequest,
+    report: ConformanceReport,
+    timeout: float,
+) -> None:
+    """A fill must reach the stream and the query, under one ``fill_id``.
+
+    Different ids on the two channels would make reconciliation count it twice.
+    """
+    stream = venue.stream_executions()
+    started = datetime.now(timezone.utc) - timedelta(minutes=5)
+    collected = asyncio.create_task(_first_fill_for(stream, request.client_order_id))
+    await asyncio.sleep(0)
+    add = report.checks.append
+    try:
+        await venue.place_order(request)
+        streamed = await asyncio.wait_for(collected, timeout)
+    except Exception as exc:
+        add(Check(_CAP, "stream_reports_fill", False, f"{type(exc).__name__}: {exc}"))
+        return
+    finally:
+        collected.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await collected
+    add(Check(_CAP, "stream_reports_fill", True, streamed.fill_id))
+    try:
+        fills = await asyncio.wait_for(
+            venue.fills_since(started, request.symbol), timeout
+        )
+    except Exception as exc:
+        add(Check(_CAP, "fills_since_reports_fill", False, repr(exc)))
+        return
+    ids = {f.fill_id for f in fills if f.client_order_id == request.client_order_id}
+    add(Check(_CAP, "fills_since_reports_fill", bool(ids), f"{len(ids)} fills"))
+    if ids:
+        add(
+            Check(
+                _CAP,
+                "fill_id_matches_across_channels",
+                streamed.fill_id in ids,
+                f"stream {streamed.fill_id}, query {sorted(ids)}",
+            )
+        )
+
+
+async def _first_fill_for(stream: Any, client_order_id: str) -> Fill:
+    try:
+        async for event in stream:
+            if isinstance(event, Filled) and event.client_order_id == client_order_id:
+                return event.fill
+    finally:
+        aclose = getattr(stream, "aclose", None)
+        if aclose is not None:
+            await aclose()
+    raise ConfigError("the execution stream ended before reporting the fill")
 
 
 async def _first_event_for(stream: Any, client_order_id: str) -> None:

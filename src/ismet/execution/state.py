@@ -26,6 +26,7 @@ from ismet.models.orders import (
     Fill,
     FillBusted,
     Filled,
+    Liquidity,
     OrderEvent,
     OrderRequest,
     OrderStatus,
@@ -72,6 +73,11 @@ TRANSITIONS: dict[str, dict[OrderStatus, Target]] = {
         S.SUBMITTING: S.REJECTED,
         S.UNKNOWN: S.REJECTED,
         S.REJECTED: S.REJECTED,
+        # Brokers can reject after accepting, for example on a later margin check.
+        S.ACCEPTED: S.REJECTED,
+        S.PARTIALLY_FILLED: S.REJECTED,
+        S.PENDING_CANCEL: S.REJECTED,
+        S.PENDING_REPLACE: S.REJECTED,
     },
     "outcome_unknown": {
         S.SUBMITTING: S.UNKNOWN,
@@ -214,10 +220,15 @@ def _note(state: OrderState, message: str) -> OrderState:
 
 
 def _apply_fill(state: OrderState, fill: Fill) -> OrderState:
-    for known in state.fills:
+    for index, known in enumerate(state.fills):
         if known.fill_id == fill.fill_id:
             if known == fill:
                 return state  # the same report delivered twice
+            if _same_execution(known, fill):
+                # Details such as fees often arrive later, or on another channel.
+                fills = list(state.fills)
+                fills[index] = _merged(known, fill)
+                return replace(state, fills=tuple(fills))
             return _note(state, f"fill {fill.fill_id} re-reported with different terms")
     updated = replace(
         state,
@@ -241,6 +252,32 @@ def _apply_fill(state: OrderState, fill: Fill) -> OrderState:
     if state.status in (S.ACCEPTED, S.SUBMITTING):
         return replace(updated, status=S.PARTIALLY_FILLED)
     return updated
+
+
+def _same_execution(a: Fill, b: Fill) -> bool:
+    """Whether two reports agree on what traded: the part that moves money."""
+    return (a.symbol, a.side, a.price, a.quantity) == (
+        b.symbol,
+        b.side,
+        b.price,
+        b.quantity,
+    )
+
+
+def _merged(known: Fill, report: Fill) -> Fill:
+    """Fill in what ``known`` lacks, without overwriting anything it already has."""
+    return known.model_copy(
+        update={
+            "fee": known.fee if known.fee is not None else report.fee,
+            "fee_currency": known.fee_currency or report.fee_currency,
+            "venue_order_id": known.venue_order_id or report.venue_order_id,
+            "liquidity": (
+                known.liquidity
+                if known.liquidity is not Liquidity.UNKNOWN
+                else report.liquidity
+            ),
+        }
+    )
 
 
 def _apply_bust(state: OrderState, event: FillBusted) -> OrderState:

@@ -224,9 +224,12 @@ async def test_books_match_the_venue_after_any_crash(
     try:
         state = manager.order("CR1")
         snapshot = await venue.order_status("CR1", ACME)
-        assert venue.attempts["CR1"] <= 1, "the order was sent more than once"
+        # A fault is only consumed by the call to the venue, which happens only after
+        # the send-started record.
+        sent = 1 if step == "after_venue_accept" else 0
+        assert venue.attempts["CR1"] == sent, "wrong number of sends"
         assert venue.accepted["CR1"] <= 1
-        assert state.status is not S.UNKNOWN and state.status is not S.SUBMITTING
+        assert state.status not in (S.UNKNOWN, S.SUBMITTING)
         if snapshot is None:
             assert state.status is S.REJECTED
             assert state.filled_quantity == 0
@@ -272,15 +275,52 @@ async def test_a_retried_submit_after_restart_does_not_resend(
     await crash_during_submit(journal_path, venue, clock, "after_venue_accept")
     manager, journal = await recover(journal_path, venue, clock)
     try:
-        request = order("CR1", price="9.50")
-        original = manager.order("CR1").request
-        assert request.symbol == original.symbol
-        again = await manager.submit(original)
+        again = await manager.submit(order("CR1", price="9.50"))
         assert again.client_order_id == "CR1"
         assert venue.attempts["CR1"] == 1
     finally:
         await manager.abort()
         journal.close()
+
+
+async def test_fills_while_down_recovered_when_time_has_passed(
+    journal_path: Path, venue: SimVenue, clock: ManualClock
+) -> None:
+    await crash_during_submit(journal_path, venue, clock, "after_venue_accept")
+    clock.advance(3600)
+    venue.trade_through(ACME, "9.50", "40")
+    clock.advance(3600)
+    manager, journal = await recover(journal_path, venue, clock)
+    try:
+        assert manager.order("CR1").filled_quantity == 40
+        assert not manager.kill_state.engaged
+    finally:
+        await manager.abort()
+        journal.close()
+
+
+async def test_truncating_the_kill_record_is_refused_on_restart(
+    journal_path: Path, venue: SimVenue, clock: ManualClock
+) -> None:
+    import sqlite3
+
+    from ismet.errors import JournalError
+
+    manager, journal = build(journal_path, venue, clock)
+    await manager.start()
+    await manager.engage_kill("halt", operator="ops", cancel_open=False)
+    await manager.abort()
+    seq = journal.kill_state().seq
+    journal.close()
+    conn = sqlite3.connect(journal_path)
+    conn.execute("DROP TRIGGER journal_no_delete")
+    conn.execute("DELETE FROM journal WHERE seq >= ?", (seq,))
+    conn.commit()
+    conn.close()
+    manager, journal = build(journal_path, venue, clock)
+    with pytest.raises(JournalError, match="truncated"):
+        await manager.start()
+    journal.close()
 
 
 async def test_position_baseline_survives_restart_and_is_not_retaken(

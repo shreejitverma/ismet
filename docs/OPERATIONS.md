@@ -56,7 +56,10 @@ A strategy that restarts should resubmit with the same deterministic id, which r
 | Break `missing_at_venue` | A working order vanished, as can happen on venue failover | Confirm with the venue. The order is marked cancelled. |
 | Anomaly `overfill` | More filled than ordered | Contact the venue. New orders are halted. |
 | `JournalError` on submit | The journal cannot be written, so nothing was sent | Check disk space and permissions. New orders stay blocked until restart. |
-| `journal failed verification` at start | The audit trail was altered or corrupted | Treat as an incident. Preserve the file, and do not delete it to get started. |
+| `journal failed verification` at start | The audit trail was altered, truncated, or corrupted | Treat as an incident. Preserve the journal and its `.head` file, and do not delete them to get started. |
+| `RiskRejected` from check `reconciliation` | The latest pass could not query the venue, so exposure is unverified | Fix connectivity. Orders resume by themselves after a clean pass, which retries every few seconds. |
+| `RiskRejected` from check `execution_stream` | The execution stream is down | It reconnects by itself and reconciles. Investigate if it persists. |
+| Halt after a bust | A fill was busted while ismet was down, so the books keep it and the venue does not | Confirm with the venue. ismet cannot tell a bust from a lost report, so it halts rather than guess. |
 | `CalendarOutOfRange` rejection | The venue's calendar data has ended | Upgrade ismet, or supply newer data with `load_calendar_file`. `ismet doctor` warns 90 days ahead. |
 | `stale_data` rejection | The reference quote is too old | Check the market data feed. |
 
@@ -66,13 +69,14 @@ Bind `ismet.observability.Metrics` to your metrics system and alert on the follo
 
 | Metric | Alert when |
 |---|---|
-| `ismet_recon_breaks_total{kind}` | Any increase other than `query_failed` |
+| `ismet_recon_breaks_total{kind}` | Any increase; for `query_failed`, a sustained rate |
 | `ismet_order_events_total{kind="outcome_unknown"}` | Any increase |
 | `ismet_orders_terminal_total{status="rejected"}` | Rate above your normal level |
 | `ismet_http_requests_total{outcome="error"}` | Rate above your normal level |
 | `ismet_http_latency_seconds` | p99 above your budget |
 
 Also poll `OrderManager.stream_healthy` and `OrderManager.kill_state`.
+A stream that silently stops delivering cannot be told apart from a quiet market, so periodic reconciliation (`reconcile_interval`, 30 seconds by default) is what bounds how long a missed report can go unnoticed.
 
 ## Journal care
 

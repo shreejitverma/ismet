@@ -32,6 +32,14 @@ def isolated_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("ISMET_CONFIG_FILE", str(tmp_path / "absent.toml"))
 
 
+@pytest.fixture(autouse=True)
+def fixed_now(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The bundled calendars end, so these tests must not depend on today's date."""
+    monkeypatch.setattr(
+        "ismet.cli._now", lambda: datetime(2026, 3, 9, 15, 0, tzinfo=timezone.utc)
+    )
+
+
 def run(capsys: pytest.CaptureFixture[str], *args: str) -> tuple[int, str]:
     code = main(list(args))
     return code, capsys.readouterr().out

@@ -375,7 +375,17 @@ def raiser(exc: type[httpx.HTTPError]):  # type: ignore[no-untyped-def]
     return handle
 
 
-@pytest.mark.parametrize("exc", [httpx.ReadTimeout, httpx.ReadError, httpx.WriteError])
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.ReadTimeout,
+        httpx.ReadError,
+        httpx.WriteError,
+        httpx.WriteTimeout,
+        httpx.RemoteProtocolError,
+        httpx.LocalProtocolError,
+    ],
+)
 async def test_lost_response_on_order_post_is_never_resent(
     exc: type[httpx.HTTPError],
 ) -> None:
@@ -386,16 +396,19 @@ async def test_lost_response_on_order_post_is_never_resent(
     assert calls == ["POST"]
 
 
-async def test_5xx_on_order_post_is_ambiguous_and_never_resent() -> None:
-    calls, transport = counting(lambda _: httpx.Response(503, text="busy"))
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+async def test_5xx_on_order_post_is_ambiguous_and_never_resent(status: int) -> None:
+    calls, transport = counting(lambda _: httpx.Response(status, text="busy"))
     async with HttpTransport("https://v", transport=transport, retry_policy=FAST) as t:
         with pytest.raises(AmbiguousOutcome) as caught:
             await t.post_json("/orders", {})
-    assert caught.value.status == 503 and not caught.value.retryable
+    assert caught.value.status == status and not caught.value.retryable
     assert calls == ["POST"]
 
 
-@pytest.mark.parametrize("exc", [httpx.ConnectError, httpx.ConnectTimeout])
+@pytest.mark.parametrize(
+    "exc", [httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout]
+)
 async def test_undelivered_order_post_is_a_plain_transport_error(
     exc: type[httpx.HTTPError],
 ) -> None:

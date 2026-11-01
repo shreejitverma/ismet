@@ -208,3 +208,54 @@ def test_next_open_and_close_are_consistent(naive: datetime) -> None:
         assert closed < opened
     else:
         assert opened < closed
+
+
+def _past_end() -> date:
+    return XNYS.last_date + timedelta(days=1)
+
+
+def _before_start() -> date:
+    return XNYS.first_date - timedelta(days=1)
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: XNYS.is_session(_past_end()),
+        lambda: XNYS.session(_past_end()),
+        lambda: XNYS.is_session(_before_start()),
+        lambda: XNYS.previous_session_date(XNYS.first_date),
+        lambda: XNYS.next_session_date(XNYS.last_date),
+        lambda: XNYS.sessions(XNYS.first_date, _past_end()),
+        lambda: XNYS.sessions(_before_start(), XNYS.first_date),
+        lambda: XNYS.closed_weekdays(XNYS.first_date, _past_end()),
+        lambda: XNYS.closed_weekdays(_before_start(), XNYS.first_date),
+        lambda: XNYS.settlement_date(XNYS.last_date, 1),
+        lambda: XNYS.add_sessions(XNYS.first_date, -1),
+        lambda: XNYS.session_of(datetime.combine(_past_end(), time(15), tzinfo=NY)),
+        lambda: XNYS.phase_at(datetime.combine(_past_end(), time(15), tzinfo=NY)),
+        lambda: XNYS.is_open(datetime.combine(_past_end(), time(15), tzinfo=NY)),
+        lambda: XNYS.next_open(datetime.combine(XNYS.last_date, time(23), tzinfo=NY)),
+        lambda: XNYS.next_close(datetime.combine(XNYS.last_date, time(23), tzinfo=NY)),
+        lambda: XNYS.with_hours(_past_end(), time(9), time(16)),
+        lambda: XNYS.with_closure(_past_end()),
+    ],
+)
+def test_every_entry_point_refuses_dates_outside_the_data(call) -> None:  # type: ignore[no-untyped-def]
+    with pytest.raises(CalendarOutOfRange):
+        call()
+
+
+def test_the_first_and_last_covered_dates_are_answered() -> None:
+    assert XNYS.is_session(XNYS.last_date) in (True, False)
+    assert XNYS.is_session(XNYS.first_date) in (True, False)
+    assert XNYS.sessions(XNYS.last_date, XNYS.last_date) is not None
+
+
+def test_session_lookup_uses_the_venue_date_not_the_utc_date() -> None:
+    sydney = get_calendar("XASX")
+    session = sydney.session(date(2025, 1, 6))
+    assert session is not None and session.open.date() == date(2025, 1, 5)
+    during = session.open + timedelta(minutes=1)
+    assert sydney.is_open(during)
+    assert sydney.local_date(during) == date(2025, 1, 6)

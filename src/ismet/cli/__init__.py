@@ -65,6 +65,10 @@ _COMMANDS = (
 Out = Mapping[str, Any]
 
 
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def _version() -> str:
     try:
         return importlib.metadata.version("ismet")
@@ -185,7 +189,7 @@ def _build_parser() -> _Parser:
 
 
 def _home() -> int:
-    now = datetime.now(timezone.utc)
+    now = _now()
     rows: list[dict[str, Any]] = []
     for code in HOME_VENUES:
         calendar = get_calendar(code)
@@ -274,7 +278,7 @@ async def _book(args: argparse.Namespace, client: IsmetClient) -> int:
 
 
 async def _bars(args: argparse.Namespace, client: IsmetClient) -> int:
-    now = datetime.now(timezone.utc)
+    now = _now()
     bars = await client.bars(
         args.symbol,
         interval=args.interval,
@@ -313,7 +317,7 @@ def _calendar(args: argparse.Namespace) -> int:
         _print({"count": len(names), "calendars": names})
         return EXIT_OK
     calendar = get_calendar(args.venue)
-    now = datetime.now(timezone.utc)
+    now = _now()
     if args.next_open:
         _print({"venue": calendar.venue, "next_open": calendar.next_open(now)})
         return EXIT_OK
@@ -403,7 +407,7 @@ def _doctor() -> int:
                 "detail": "installed" if found else f"pip install ismet[{extra}]",
             }
         )
-    today = datetime.now(timezone.utc).date()
+    today = _now().date()
     for code in available_calendars():
         calendar = get_calendar(code)
         remaining = (calendar.last_date - today).days
