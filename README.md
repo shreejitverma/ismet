@@ -77,24 +77,36 @@ Every order goes through `OrderManager`.
 from decimal import Decimal
 
 from ismet import (
-    OrderManager, OrderRequest, OrderSide, RiskConfig, RiskEngine, RiskLimits, SqliteJournal,
+    OrderManager,
+    OrderRequest,
+    OrderSide,
+    RiskConfig,
+    RiskEngine,
+    RiskLimits,
+    SqliteJournal,
 )
 
-risk = RiskEngine(RiskConfig(default=RiskLimits(
-    max_order_quantity=Decimal(1000),
-    max_order_notional=Decimal(100_000),
-    max_position=Decimal(5000),
-    price_collar_bps=Decimal(100),
-)))
+risk = RiskEngine(
+    RiskConfig(
+        default=RiskLimits(
+            max_order_quantity=Decimal(1000),
+            max_order_notional=Decimal(100_000),
+            max_position=Decimal(5000),
+            price_collar_bps=Decimal(100),
+        )
+    )
+)
 
 async with OrderManager(provider, SqliteJournal("orders.db"), risk) as oms:
-    state = await oms.submit(OrderRequest(
-        client_order_id="strategy-a-000001",
-        symbol=symbol,
-        side=OrderSide.BUY,
-        quantity="10",
-        limit_price="100.00",
-    ))
+    state = await oms.submit(
+        OrderRequest(
+            client_order_id="strategy-a-000001",
+            symbol=symbol,
+            side=OrderSide.BUY,
+            quantity="10",
+            limit_price="100.00",
+        )
+    )
 ```
 
 What happens, and why it matters:
@@ -145,7 +157,7 @@ from ismet import get_calendar
 nyse = get_calendar("XNYS")
 nyse.session(date(2026, 11, 27)).early_close  # True: closes at 13:00 New York
 nyse.is_open(datetime.now(timezone.utc))
-nyse.settlement_date(date(2026, 11, 25), 1)   # T+1 across Thanksgiving
+nyse.settlement_date(date(2026, 11, 25), 1)  # T+1 across Thanksgiving
 
 closed = nyse.with_closure(date(2026, 12, 7))  # apply an announced closure at once
 ```
