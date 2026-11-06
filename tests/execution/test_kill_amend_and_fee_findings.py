@@ -521,6 +521,43 @@ async def test_a_fill_re_reported_with_another_fee_is_recorded_once_and_flagged(
         await restarted.abort()
 
 
+async def test_a_fee_dispute_that_also_names_the_currency_is_raised_once(
+    make_manager: Factory, venue: SimVenue, journal: SqliteJournal
+) -> None:
+    """The sweep's report adds the fee currency the record lacked and disputes the
+    fee. It is recorded for the detail, and a later sweep must not raise it again."""
+    anomalies: list[str] = []
+    oms = make_manager(on_anomaly=lambda _cid, message: anomalies.append(message))
+    await oms.start()
+    try:
+        await venue.drain()
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(venue, "_currency", None)
+            await oms.submit(order("FE2", price="10.01"))
+            booked = (
+                await oms.wait_for("FE2", lambda o: o.status is S.FILLED, 2)
+            ).fills[0]
+        assert booked.fee is not None and booked.fee_currency is None
+        disputed = booked.model_copy(
+            update={"fee": add(booked.fee, D(8)), "fee_currency": "USD"}
+        )
+        venue._fills[:] = [
+            disputed if f.fill_id == booked.fill_id else f for f in venue._fills
+        ]
+        await oms.reconcile()
+        state = oms.order("FE2")
+        assert state.fills[0].fee == booked.fee
+        assert state.fills[0].fee_currency == "USD"
+        assert len([a for a in anomalies if "different fee" in a]) == 1
+        assert len(fills_recorded(journal, "FE2")) == 2
+        await oms.reconcile()
+        assert len([a for a in anomalies if "different fee" in a]) == 1
+        assert len(fills_recorded(journal, "FE2")) == 2
+        assert not oms.kill_state.engaged
+    finally:
+        await oms.abort()
+
+
 # replay-rejects-unregistered-codes
 
 

@@ -2114,6 +2114,9 @@ class OrderManager:
                 continue
             known = any(f.fill_id == fill.fill_id for f in state.fills)
             if not known or fill_adds_detail(state, fill):
+                if known and fill_disputes(state, fill):
+                    # Recorded for the detail, so a later sweep must not raise it again.
+                    self._reported_corrections.add(_fill_terms(fill))
                 await self._record_recovered_fill(fill)
                 report.resolved.append(fill.client_order_id)
             elif fill_disputes(state, fill):
