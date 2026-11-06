@@ -244,7 +244,16 @@ def _apply_fill(state: OrderState, fill: Fill) -> OrderState:
                 # Details such as fees often arrive later, or on another channel.
                 fills = list(state.fills)
                 fills[index] = merged_fill(known, fill)
-                return replace(state, fills=tuple(fills))
+                merged = replace(state, fills=tuple(fills))
+                if fees_differ(known, fill):
+                    # The first fee stays booked; a person decides which is right.
+                    return _note(
+                        merged,
+                        f"fill {fill.fill_id} re-reported with a different fee: "
+                        f"{known.fee} {known.fee_currency} then "
+                        f"{fill.fee} {fill.fee_currency}",
+                    )
+                return merged
             return _note(state, f"fill {fill.fill_id} re-reported with different terms")
     updated = replace(
         state,
@@ -292,6 +301,31 @@ def fill_contradicts(state: OrderState, fill: Fill) -> bool:
     """Whether a report of a known fill disagrees with the record on what traded."""
     known = next((f for f in state.fills if f.fill_id == fill.fill_id), None)
     return known is not None and not same_execution(known, fill)
+
+
+def fill_disputes(state: OrderState, fill: Fill) -> bool:
+    """Whether a report of a known fill disagrees on what traded or on what it cost.
+
+    Either is recorded as the venue said it, once per fill and set of terms. Only the
+    first halts: a fee is a correction a person settles, not a position at risk.
+    """
+    known = next((f for f in state.fills if f.fill_id == fill.fill_id), None)
+    return known is not None and (
+        not same_execution(known, fill) or fees_differ(known, fill)
+    )
+
+
+def fees_differ(known: Fill, report: Fill) -> bool:
+    """Whether two reports of one execution name different fees, where both name one."""
+    amounts_differ = (
+        known.fee is not None and report.fee is not None and known.fee != report.fee
+    )
+    currencies_differ = (
+        known.fee_currency is not None
+        and report.fee_currency is not None
+        and known.fee_currency != report.fee_currency
+    )
+    return amounts_differ or currencies_differ
 
 
 def same_execution(a: Fill, b: Fill) -> bool:
@@ -491,8 +525,10 @@ __all__ = [
     "WORKING_STATUSES",
     "OrderState",
     "apply_event",
+    "fees_differ",
     "fill_adds_detail",
     "fill_contradicts",
+    "fill_disputes",
     "new_order",
     "replay",
 ]

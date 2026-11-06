@@ -699,6 +699,11 @@ def _kill(args: argparse.Namespace) -> int:
         journal = _existing_journal(args.journal)
     try:
         chain = None if args.action == "engage" else journal.verify()
+        # Engaging reports the chain but never waits on it: the evidence of a broken
+        # chain survives the append, so `kill release` still refuses on it.
+        chain_text = (
+            _lenient_chain_text(journal) if chain is None else _chain_text(chain)
+        )
         if args.action == "release" and chain is not None:
             _require_intact(chain, "kill switch not released")
         state = journal.kill_state()
@@ -733,12 +738,20 @@ def _kill(args: argparse.Namespace) -> int:
                 "reason": state.reason or "none",
                 "operator": state.operator or "none",
                 "cancel_open": state.cancel_open,
-                **({} if chain is None else {"chain": _chain_text(chain)}),
+                "chain": chain_text,
             }
         )
         return EXIT_OK if chain is None or chain.ok else EXIT_FAILED
     finally:
         journal.close()
+
+
+def _lenient_chain_text(journal: SqliteJournal) -> str:
+    """The chain check as a diagnostic: nothing here may stop an emergency halt."""
+    try:
+        return _chain_text(journal.verify())
+    except Exception as exc:
+        return f"could not be checked: {_error_text(exc)}"
 
 
 def _journal_names_venue(journal: SqliteJournal, venue: str) -> bool:

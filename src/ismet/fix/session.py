@@ -48,7 +48,9 @@ Not implemented: NextExpectedMsgSeqNum(789) resynchronization, FIXT per-message
 ApplVerID, encryption (EncryptMethod is always 0; pass ``ssl`` for TLS), and scheduled
 session times. A daily reset is done with ``reset_on_logon``, which resets once per
 :attr:`FixSessionConfig.session_period` and not on a reconnect within it, or with
-:meth:`FixStore.reset_sequences`.
+:meth:`FixStore.reset_sequences`. Whether the last connection ended with a Logout
+exchange that left inbound fully read is kept in the store, so that a reset after an
+unclean end can be reported as a possible loss of what the peer sent meanwhile.
 """
 
 from __future__ import annotations
@@ -181,6 +183,15 @@ class SessionListener(Protocol):
         """
         ...
 
+    async def on_reset_discarding_unread(self, first_seq: int) -> None:
+        """Our own ``reset_on_logon`` is about to make numbers from ``first_seq`` on
+        unrequestable, and the previous connection did not end with a Logout exchange
+        that left inbound fully read, so the peer may have sent messages never read
+        here. Return only once that is durably recorded and surfaced, or at once if
+        nothing could be affected.
+        """
+        ...
+
     def on_sequence_reset(self) -> None:
         """Numbers restart at 1, so an older number no longer names the same message."""
         ...
@@ -206,9 +217,12 @@ class FixSessionConfig:
     ``reset_on_logon`` sends ResetSeqNumFlag on the first connection of each
     ``session_period``, a label computed from the current UTC time, by default the UTC
     date. Its confirmation is recorded in the store, so a reconnect later in the period
-    keeps the numbers and can recover what it missed by ResendRequest. Orders that were
-    open across the reset are checked by the order manager's reconciliation, through
-    CumQty.
+    keeps the numbers and can recover what it missed by ResendRequest. The reset itself
+    makes the prior period's unread messages unrequestable, so unless the previous
+    connection ended with a Logout exchange that left inbound fully read, the listener
+    hears :meth:`SessionListener.on_reset_discarding_unread` first. Orders that were
+    open across a clean reset are checked by the order manager's reconciliation,
+    through CumQty.
     """
 
     host: str
@@ -757,11 +771,31 @@ class FixSession:
             if cfg.reset_on_logon:
                 period = cfg.session_period(self._clock.now())
                 if period != await self.run_store(self.store.reset_period):
+                    await self._report_unread_before_reset()
                     await self._reset_numbers()
                     self._reset_awaiting_confirmation = period
+            # From this Logon on the peer may send again, so a clean end no longer
+            # holds. A reset we just did keeps it false, which is already the case.
+            await self.run_store(lambda: self.store.set_inbound_complete(False))
             self._set_state(SessionState.LOGON_SENT)
             reset = self._reset_awaiting_confirmation is not None
             await self._send_admin_locked("A", self._logon_fields(reset=reset))
+
+    async def _report_unread_before_reset(self) -> None:
+        """Our reset discards what the peer sent since we last read, as a peer's does.
+
+        Quiet when nothing was ever received, or when the last connection ended with a
+        Logout exchange that left inbound fully read, which is a clean daily reset.
+        """
+        if self._next_in <= 1 or self.listener is None:
+            return
+        if await self.run_store(self.store.inbound_complete):
+            return
+        await self.listener.on_reset_discarding_unread(self._next_in)
+
+    async def _mark_inbound_complete(self) -> None:
+        """A Logout read at the expected number: the peer has sent nothing unread."""
+        await self.run_store(lambda: self.store.set_inbound_complete(True))
 
     async def _reset_numbers(self) -> None:
         """Both numbers back to 1. The caller holds the send lock."""
@@ -846,6 +880,7 @@ class FixSession:
             # Case 13a. A confirming Logout ends this connection whatever its number.
             if seq == expected:
                 await self._advance()
+                await self._mark_inbound_complete()
             raise _DisconnectError("Logout confirmed")
         if self._state is SessionState.LOGON_SENT:
             if msg_type == "5":
@@ -1014,6 +1049,7 @@ class FixSession:
             await self._advance()
         elif msg_type == "5":
             await self._advance()
+            await self._mark_inbound_complete()
             logger.warning("FIX peer logged out: %s", self.scrub(message.get(58) or ""))
             await self._begin_logout("Logout confirmed")
 

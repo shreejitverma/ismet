@@ -176,7 +176,8 @@ def _kill_state_from(rows: Iterable[tuple[int, str, str]]) -> KillState:
     A release naming no operator is ignored, so it leaves the switch as it was: every
     reader, including a process starting up, must agree that the halt still holds. A row
     that cannot be read could have been either kind, so it leaves the switch engaged
-    until a later readable row says otherwise.
+    until a later readable row says otherwise. Engages only widen until a release: two
+    can race, and the later one's narrower terms must not stop the earlier's cancels.
     """
     state = KillState(False)
     for seq, kind, payload in rows:
@@ -203,7 +204,8 @@ def _kill_state_from(rows: Iterable[tuple[int, str, str]]) -> KillState:
             detail.get("reason", ""),
             detail.get("operator", ""),
             seq,
-            bool(detail.get("cancel_open", False)),
+            bool(detail.get("cancel_open", False))
+            or (engaged and state.engaged and state.cancel_open),
         )
     return state
 
@@ -354,9 +356,33 @@ class SqliteJournal:
             # power cut can lose a committed record. Ignored on other platforms.
             self._conn.execute("PRAGMA fullfsync=ON")
             self._conn.execute("PRAGMA checkpoint_fullfsync=ON")
+            self._warn_if_triggers_dropped()
             self._conn.executescript(_SCHEMA)
         except (sqlite3.Error, OSError) as exc:
             raise JournalError(f"cannot open journal {self.path}: {exc}") from exc
+
+    def _warn_if_triggers_dropped(self) -> None:
+        """The schema script puts a dropped trigger back, so say so before it does.
+
+        Only tampering removes one, and recreating it quietly would hide that.
+        """
+        names = {
+            row[0]
+            for row in self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table', 'trigger')"
+            )
+        }
+        if "journal" not in names:
+            return
+        missing = {"journal_no_update", "journal_no_delete"} - names
+        if missing:
+            logger.critical(
+                "journal %s had its append-only trigger%s %s removed: treat the file "
+                "as tampered with. They are being recreated",
+                self.path,
+                "s" if len(missing) > 1 else "",
+                ", ".join(sorted(missing)),
+            )
 
     @classmethod
     def open_read_only(cls, path: str | Path) -> SqliteJournal:
@@ -443,7 +469,21 @@ class SqliteJournal:
         return self.path.with_name(self.path.name + ".head")
 
     def _write_anchor(self, seq: int, digest: str) -> None:
-        """Best effort: a missing or older anchor only weakens truncation detection."""
+        """Best effort: a missing or older anchor only weakens truncation detection.
+
+        An anchor the chain has fallen behind, or that names a record the chain no
+        longer has, is evidence of truncation or replacement. Appending must not move
+        it, or an emergency ``kill engage`` would make the journal verify clean again.
+        Called with the connection lock held.
+        """
+        anchor = self._read_anchor()
+        if anchor is not None and self._anchor_disputes_chain(anchor, seq):
+            logger.critical(
+                "journal %s is behind its anchor at record %s: keeping the anchor",
+                self.path,
+                anchor[0],
+            )
+            return
         temporary = self.anchor_path.with_name(
             f"{self.anchor_path.name}.{os.getpid()}.{threading.get_ident()}"
         )
@@ -459,6 +499,19 @@ class SqliteJournal:
             return int(seq), digest
         except (OSError, ValueError):
             return None
+
+    def _anchor_disputes_chain(self, anchor: tuple[int, str], new_seq: int) -> bool:
+        """Whether the anchor says records below ``new_seq`` are gone or replaced."""
+        anchored_seq, anchored_digest = anchor
+        if anchored_seq >= new_seq:
+            return True
+        try:
+            row = self._conn.execute(
+                "SELECT hash FROM journal WHERE seq = ?", (anchored_seq,)
+            ).fetchone()
+        except sqlite3.Error:
+            return True  # unreadable now; the next append looks again
+        return row is None or row[0] != anchored_digest
 
     @staticmethod
     def _row(

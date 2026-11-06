@@ -443,8 +443,10 @@ async def test_a_released_overfill_does_not_halt_again_on_restart(
 
 
 async def test_an_anomaly_hook_that_raises_does_not_stop_the_halt(
-    make_manager: Factory, venue: SimVenue
+    make_manager: Factory, venue: SimVenue, journal: Journal
 ) -> None:
+    """The halt lands, the record lands, and the stream that carried it stays up."""
+
     def explode(*_: object) -> None:
         raise RuntimeError("hook bug")
 
@@ -456,6 +458,13 @@ async def test_an_anomaly_hook_that_raises_does_not_stop_the_halt(
         await venue.drain()
         venue._deliver(filled("CR3", quantity="150"))
         await until(lambda: oms.kill_state.engaged)
+        # A later report on the same stream is still consumed, so the hook's exception
+        # ended neither the consumer nor the record of the anomaly it was told about.
+        venue._deliver(filled("CR3", fill_id="1002", quantity="1"))
+        await oms.wait_for("CR3", lambda o: len(o.fills) == 2, 2)
+        assert oms.stream_healthy
+        anomalies = [r for r in journal.records() if r.kind is RecordKind.ANOMALY]
+        assert anomalies and "overfill" in anomalies[0].payload
     finally:
         await oms.abort()
 

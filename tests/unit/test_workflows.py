@@ -8,6 +8,7 @@ id-token, would fail here.
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 import tarfile
@@ -75,6 +76,14 @@ def test_every_third_party_action_is_pinned_to_a_commit(path: Path) -> None:
                 assert all(c in "0123456789abcdef" for c in ref), uses
 
 
+@pytest.mark.parametrize("path", sorted(ROOT.glob("*.yml")), ids=lambda p: p.name)
+def test_every_job_on_a_runner_has_a_time_limit(path: Path) -> None:
+    """A hung test must fail its job, not hold a runner for GitHub's six hours."""
+    for name, job in yaml.safe_load(path.read_text(encoding="utf-8"))["jobs"].items():
+        if "runs-on" in job:
+            assert 0 < job.get("timeout-minutes", 0) <= 60, name
+
+
 SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 
 
@@ -128,9 +137,153 @@ def steps_running(job: dict[str, Any], script: str) -> list[str]:
     return [s["run"] for s in job["steps"] if script in s.get("run", "")]
 
 
+CANNOT_FAIL_ITS_STEP = ("||", "set +e")
+QUOTED = re.compile(r"'[^']*'|\"[^\"]*\"")
+PIPE = re.compile(r"(?<!\|)\|(?!\|)")
+
+
+def masking_shell(step: dict[str, Any], label: object) -> list[str]:
+    """What in a step's script lets a failed command leave the step green.
+
+    A step with no ``shell`` runs under ``bash -e`` without pipefail, where a pipe
+    reports its last command and a failed command in an ``&&`` list does not stop
+    the script, so only the last line may hold one. ``shell: bash`` adds pipefail.
+    """
+    script = QUOTED.sub("", step.get("run", ""))
+    lines = [
+        line.strip()
+        for line in script.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    found = []
+    pipefail = step.get("shell") == "bash" or "pipefail" in script
+    if not pipefail and any(PIPE.search(line) for line in lines):
+        found.append(f"pipe without pipefail in {label}")
+    if any("&&" in line for line in lines[:-1]):
+        found.append(f"&& before the last line in {label}")
+    return found
+
+
+def ways_a_job_cannot_fail(
+    job: dict[str, Any], *, may_be_conditional: bool
+) -> list[str]:
+    """What stops a failure in ``job`` from failing it, or lets later jobs run anyway.
+
+    The oracle is GitHub Actions' failure semantics: ``continue-on-error`` hides a
+    failure, a shell ``||``, ``set +e``, a pipe, or an ``&&`` list that is not the
+    last line hides a command's status, and an ``if`` such
+    as ``always()`` overrides the rule that a job is skipped when one it needs did not
+    pass.
+    """
+    found = []
+    if "continue-on-error" in job:
+        found.append("job continue-on-error")
+    if "if" in job and not may_be_conditional:
+        found.append(f"job if: {job['if']}")
+    for step in job.get("steps", []):
+        label = step.get("name") or step.get("uses") or step.get("run")
+        if "continue-on-error" in step:
+            found.append(f"continue-on-error on {label}")
+        if "if" in step:
+            found.append(f"if on {label}")
+        run = step.get("run", "")
+        found.extend(
+            f"{word} in {label}" for word in CANNOT_FAIL_ITS_STEP if word in run
+        )
+        found.extend(masking_shell(step, label))
+    return found
+
+
+RELEASE_JOB = {
+    "needs": "attest",
+    "steps": [{"name": "Gate", "run": "python scripts/check_dist.py dist --smoke"}],
+}
+
+
+@pytest.mark.parametrize(
+    ("job", "named"),
+    [
+        ({**RELEASE_JOB, "if": "always()"}, "job if: always()"),
+        ({**RELEASE_JOB, "continue-on-error": True}, "job continue-on-error"),
+        (
+            {"steps": [{**RELEASE_JOB["steps"][0], "continue-on-error": True}]},
+            "continue-on-error on Gate",
+        ),
+        (
+            {"steps": [{**RELEASE_JOB["steps"][0], "if": "false"}]},
+            "if on Gate",
+        ),
+        (
+            {"steps": [{"name": "Gate", "run": "python scripts/x.py || true"}]},
+            "|| in Gate",
+        ),
+        (
+            {"steps": [{"name": "Gate", "run": "set +e\npython scripts/x.py"}]},
+            "set +e in Gate",
+        ),
+        (
+            {"steps": [{"name": "Gate", "run": "python scripts/x.py | tee log"}]},
+            "pipe without pipefail in Gate",
+        ),
+        (
+            {
+                "steps": [
+                    {"name": "Gate", "run": "python scripts/x.py && echo ok\ntrue"}
+                ]
+            },
+            "&& before the last line in Gate",
+        ),
+    ],
+    ids=[
+        "job-if",
+        "job-continue",
+        "step-continue",
+        "step-if",
+        "or-true",
+        "set-e",
+        "pipe",
+        "and-list",
+    ],
+)
+def test_a_gate_that_cannot_fail_its_job_is_detected(
+    job: dict[str, Any], named: str
+) -> None:
+    assert named in ways_a_job_cannot_fail(job, may_be_conditional=False)
+
+
+@pytest.mark.parametrize(
+    "step",
+    [
+        {"name": "Gate", "run": "python scripts/x.py | tee log", "shell": "bash"},
+        {"name": "Gate", "run": "pip install x && python scripts/x.py"},
+        {"name": "Gate", "run": "python -c 'import a; print(1 | 2)'"},
+    ],
+    ids=["pipefail", "and-list-last", "quoted"],
+)
+def test_a_gate_whose_status_still_counts_is_not_flagged(step: dict[str, Any]) -> None:
+    assert ways_a_job_cannot_fail({"steps": [step]}, may_be_conditional=False) == []
+
+
+def test_a_plain_gate_is_not_flagged() -> None:
+    assert ways_a_job_cannot_fail(RELEASE_JOB, may_be_conditional=False) == []
+
+
+def test_a_failed_gate_stops_the_release() -> None:
+    jobs = workflow("publish.yml")["jobs"]
+    assert ways_a_job_cannot_fail(jobs["version"], may_be_conditional=True) == []
+    for name in ("ci", "build", "attest", "publish"):
+        assert ways_a_job_cannot_fail(jobs[name], may_be_conditional=False) == [], name
+
+
+def test_every_ci_job_can_fail_the_ci_a_release_depends_on() -> None:
+    for name, job in workflow("workflow.yml")["jobs"].items():
+        assert ways_a_job_cannot_fail(job, may_be_conditional=False) == [], name
+
+
 def test_the_version_job_runs_the_tested_check() -> None:
     job = workflow("publish.yml")["jobs"]["version"]
     assert steps_running(job, "scripts/check_release_version.py")
+    assert ways_a_job_cannot_fail(job, may_be_conditional=True) == []
 
 
 @pytest.mark.parametrize(
@@ -146,6 +299,10 @@ def test_what_is_built_is_checked_and_smoke_tested_in_the_same_job(
         i for i, run in enumerate(runs) if "check_dist.py dist --smoke" in run
     )
     assert built < checked
+    assert (
+        ways_a_job_cannot_fail(workflow(name)["jobs"][job], may_be_conditional=False)
+        == []
+    )
 
 
 def make_dist(

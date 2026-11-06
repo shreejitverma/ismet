@@ -273,3 +273,19 @@ def test_session_lookup_uses_the_venue_date_not_the_utc_date() -> None:
     during = session.open + timedelta(minutes=1)
     assert sydney.is_open(during)
     assert sydney.local_date(during) == date(2025, 1, 6)
+
+
+def test_no_bundled_venue_has_a_weekend_session_and_the_gap_matrix_agrees() -> None:
+    root = Path(__file__).parents[2]
+    data = json.loads(
+        (root / "src/ismet/calendars/data/calendars.json").read_text(encoding="utf-8")
+    )
+    for venue, body in data["venues"].items():
+        assert body["extra"] == [], venue
+        weekend = [
+            day for day in body["special"] if date.fromisoformat(day).weekday() >= 5
+        ]
+        assert weekend == [], venue
+    matrix = (root / "docs/GAP_MATRIX.md").read_text(encoding="utf-8")
+    assert "special weekend sessions are unconfirmed" not in matrix
+    assert "no weekend session" in matrix

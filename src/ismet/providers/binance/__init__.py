@@ -334,9 +334,12 @@ class BinanceProvider(Provider):
         self, status: int, body: bytes, headers: Mapping[str, str]
     ) -> IsmetError:
         if status != 418:
-            return map_response_error(status, body, headers)
+            return map_response_error(status, body, headers, clock=self.clock)
         text = body.decode("utf-8", errors="replace")[:500]
-        waits = [_SHORTEST_BAN_SECONDS, retry_after_seconds(headers) or 0.0]
+        waits = [
+            _SHORTEST_BAN_SECONDS,
+            retry_after_seconds(headers, clock=self.clock) or 0.0,
+        ]
         found = _BANNED_UNTIL.search(text)
         if found:
             waits.append(
@@ -356,7 +359,7 @@ class BinanceProvider(Provider):
             {"symbol": ticker, "showPermissionSets": "false"},
             _EXCHANGE_INFO,
         )
-        info: Mapping[str, Any] = payload["symbols"][0]
+        info = normalize.symbol_info_from_exchange_info(payload)
         self._currencies[ticker] = normalize.quote_asset_of(info)
         return info
 
@@ -573,6 +576,7 @@ class BinanceProvider(Provider):
             backpressure=self._ws_backpressure,
             decode=decode,
             is_data=lambda item: number_field in item[3],
+            clock=self.clock,
         )
         gate = StreamGate(contiguous=contiguous)
         seen_generation = 1
@@ -592,12 +596,13 @@ class BinanceProvider(Provider):
                 if number_field not in frame:
                     self._control(frame)
                     continue
-                symbol = by_ticker.get(frame["s"])
+                ticker = normalize.ticker_of(frame)
+                symbol = by_ticker.get(ticker)
                 if symbol is None:
-                    logger.warning("frame for unsubscribed %s ignored", frame["s"])
+                    logger.warning("frame for unsubscribed %s ignored", ticker)
                     continue
-                event = parse(frame, symbol, received, currencies[frame["s"]])
-                admitted = gate.admit(frame["s"], frame[number_field], event)
+                event = parse(frame, symbol, received, currencies[ticker])
+                admitted = gate.admit(ticker, frame[number_field], event)
                 if admitted is not None:
                     yield admitted
         finally:
@@ -628,7 +633,7 @@ class BinanceProvider(Provider):
             payload = await self._get(
                 "/api/v3/exchangeInfo", {"showPermissionSets": "false"}, _EXCHANGE_INFO
             )
-            self._all_symbols = payload["symbols"]
+            self._all_symbols = normalize.listings_from_exchange_info(payload)
             self._all_symbols_at = now
         return self._all_symbols
 

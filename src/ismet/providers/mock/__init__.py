@@ -1,8 +1,10 @@
 """Deterministic in-memory provider for tests, demos, and conformance runs.
 
 Prices follow a seeded random walk in whole ticks, so every price is tick
-aligned and every run with the same seed produces the same data. Venue MIC is
-``XMOK``.
+aligned and every run with the same seed produces the same data. Each stream walks
+from the seed on its own, so nothing else running on the provider changes its prices.
+Bars open on the interval's grid and each is seeded by its open time, so a bar is the
+same whichever range asks for it. Venue MIC is ``XMOK``.
 """
 
 from __future__ import annotations
@@ -12,7 +14,7 @@ import hashlib
 import math
 import random
 from collections.abc import AsyncIterator, Callable, Sequence
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, ClassVar, TypeVar
 
@@ -45,6 +47,7 @@ DEFAULT_UNIVERSE: tuple[tuple[str, str], ...] = (
 MAX_BARS = 100_000
 MAX_DEPTH = 100
 MIN_TICKS = MAX_DEPTH + 1
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 T = TypeVar("T")
 
 
@@ -88,6 +91,10 @@ def _option(
         ) from None
 
 
+def _start_ticks(digest: bytes) -> int:
+    return 5_000 + int.from_bytes(digest[8:12], "big") % 45_000
+
+
 class _Walk:
     """Random walk in integer ticks for one ticker.
 
@@ -98,7 +105,7 @@ class _Walk:
     def __init__(self, ticker: str, seed: int) -> None:
         digest = hashlib.sha256(f"{seed}:{ticker}".encode()).digest()
         self.rng = random.Random(int.from_bytes(digest[:8], "big"))
-        self.ticks = 5_000 + int.from_bytes(digest[8:12], "big") % 45_000
+        self.ticks = _start_ticks(digest)
         self.snapshots = 0
         self.trades = 0
 
@@ -117,6 +124,20 @@ class _StreamSequence:
         key = symbol.ticker.upper()
         self._last[key] = self._last.get(key, 0) + 1
         return self._last[key]
+
+
+class _StreamWalks:
+    """One stream's prices per ticker, so what else runs cannot change them."""
+
+    def __init__(self, seed: int) -> None:
+        self._seed = seed
+        self._walks: dict[str, _Walk] = {}
+
+    def of(self, symbol: Symbol) -> _Walk:
+        key = symbol.ticker.upper()
+        if key not in self._walks:
+            self._walks[key] = _Walk(key, self._seed)
+        return self._walks[key]
 
 
 class MockProvider(Provider):
@@ -249,24 +270,29 @@ class MockProvider(Provider):
         seconds = interval.nominal_seconds
         if seconds is None:
             raise ValidationError(f"interval {interval.value} is not supported")
-        count = int((end - start).total_seconds() // seconds)
+        step = timedelta(seconds=seconds)
+        # The grid positions in [start, end), by ceiling division, as a venue serves.
+        first, stop = -((_EPOCH - start) // step), -((_EPOCH - end) // step)
+        count = stop - first
         if count > MAX_BARS:
             raise ValidationError(f"range would produce {count} bars (max {MAX_BARS})")
-        digest = hashlib.sha256(
-            f"{self.seed}:{symbol.ticker.upper()}:{start.timestamp()}".encode()
-        ).digest()
-        rng = random.Random(int.from_bytes(digest[:8], "big"))
-        ticks = 5_000 + int.from_bytes(digest[8:12], "big") % 45_000
+        ticker = symbol.ticker.upper()
+        level = _start_ticks(hashlib.sha256(f"{self.seed}:{ticker}".encode()).digest())
         received = self._now()
+        # A venue serves only bars that have closed: none still open, none ahead.
+        stop = min(stop, (received - _EPOCH) // step)
         out: list[Bar] = []
-        step = timedelta(seconds=seconds)
-        for i in range(count):
-            open_t = ticks
-            path = [open_t]
+        for position in range(first, stop):
+            digest = hashlib.sha256(
+                f"{self.seed}:{ticker}:{interval.value}:{position}".encode()
+            ).digest()
+            rng = random.Random(int.from_bytes(digest[:8], "big"))
+            ticks = level + rng.randint(-100, 100)
+            path = [ticks]
             for _ in range(4):
                 ticks = max(100, ticks + rng.randint(-20, 20))
                 path.append(ticks)
-            ts = start + step * i
+            ts = _EPOCH + step * position
             out.append(
                 Bar(
                     symbol=symbol,
@@ -290,19 +316,23 @@ class MockProvider(Provider):
         for symbol in symbols:
             self._check(symbol)
         sequence = _StreamSequence()
+        walks = _StreamWalks(self.seed)
         while True:
             for symbol in symbols:
-                yield self._quote(symbol, self._walk(symbol), sequence.next(symbol))
+                yield self._quote(symbol, walks.of(symbol), sequence.next(symbol))
             await asyncio.sleep(self.tick_interval)
 
     async def stream_trades(self, symbols: Sequence[Symbol]) -> AsyncIterator[Trade]:
         for symbol in symbols:
             self._check(symbol)
         sequence = _StreamSequence()
+        walks = _StreamWalks(self.seed)
         while True:
             for symbol in symbols:
-                walk = self._walk(symbol)
-                walk.trades += 1
+                walk = walks.of(symbol)
+                # Prices are this stream's own; trade ids stay unique across streams.
+                shared = self._walk(symbol)
+                shared.trades += 1
                 px = walk.step() * TICK
                 now = self._now()
                 yield Trade(
@@ -313,7 +343,7 @@ class MockProvider(Provider):
                     price=px,
                     size=Decimal(walk.rng.randint(1, 20) * 100),
                     side=walk.rng.choice((Side.BUY, Side.SELL)),
-                    trade_id=f"{symbol.ticker.upper()}-{walk.trades}",
+                    trade_id=f"{symbol.ticker.upper()}-{shared.trades}",
                     currency="USD",
                 )
             await asyncio.sleep(self.tick_interval)

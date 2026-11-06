@@ -29,10 +29,15 @@ This falls short of the brief's "phase evidence is published in the repo".
 ## Known limits
 
 - A lost FIX 150=G before a crash can cause a false overfill halt on restart: the first reconciliation runs before the stream replays busts, so it books the corrected fill while the old one still counts. This fails closed, and clears after an operator release.
-- The first FIX sequence reset of a session period makes the prior period's messages unrequestable, so a report sent just before it is caught only by the reconciliation CumQty comparison on an open order.
-- A FIX SequenceReset-GapFill over a report the venue no longer holds is not visible when it arrives. The next report on that order whose CumQty exceeds the fills received halts through the quarantine and ends in a `FILL_MISMATCH` break. With no later report, only reconciliation of an open order can catch it.
+- The first FIX sequence reset of a session period makes the prior period's messages unrequestable. With an order working and a previous connection that did not end with a clean Logout exchange, the reset halts through the quarantine until an operator releases it. After a clean Logout, a report the venue sent while we were logged out is caught only by the reconciliation CumQty comparison on an open order.
+- A FIX SequenceReset-GapFill over a report the venue no longer holds is not visible when it arrives. The next report on that order whose CumQty differs from the fills received, below for a lost bust or correction and above for a lost fill, halts through the quarantine and ends in a `FILL_MISMATCH` break. With no later report, only reconciliation of an open order can catch it.
 - XBOM, XSHG, and XSES data, and the aliases XNSE and XSHE, ends on 2026-12-31, two months from this assessment, and orders on those venues are then refused unless they rest for later. Refresh the snapshot before then.
-- XBOM's special weekend sessions are unconfirmed, from memory rather than a source.
+- The bundled calendars hold no weekend session for any venue, XBOM included: every venue's `extra` list is empty and no `special` date falls on a weekend.
+  A weekend session a venue really holds therefore reads as closed, and whether XBOM holds any has not been checked.
+- Conformance does not check for open bars.
+  It asks for a range ending at the last whole minute, so a provider returning a partial bar is never exposed, and a range past now needs newly recorded cassettes.
+- Conformance checks that bars are a whole number of intervals apart, not that none are missing.
+  Bars of a longer interval mislabelled as the asked one, such as one bar every 30 minutes labelled 1m, still pass, because a venue may close or have minutes with no trades.
 - The private code for the simulated venue changed from `XSIM`, which is a real MIC, to `ZSIM`.
 
 ## P0 Correctness
@@ -98,7 +103,7 @@ This falls short of the brief's "phase evidence is published in the repo".
 
 | Requirement | Status | Note |
 |---|---|---|
-| FIX 4.2, 4.4, 5.0 SP2 session and order entry | Partial | **Experimental.** 500 tests against a Python test acceptor, plus literal frames from the specification. A real QuickFIX acceptor interop run (44 passed, 1 skipped) was run by hand before the latest changes and has not been repeated, because QuickFIX is not in CI. No real counterparty. Reviewed by reading only. Open orders and fills come from the local record, so outside orders are unseen, and the session's own fills are missing too if their reports never arrived before a reset. A provider with no account API has no position check to catch that. Trading conformance passes with one declared exception, `run_trading_conformance(unknown_status_error=TransportError)`: an order with no local row raises rather than looking dead. The order manager reads that as not found only when the store id journalled with the send equals the current store's, since then the missing row proves the order never left. After a lost store the order stays unknown until an operator resolves it. |
+| FIX 4.2, 4.4, 5.0 SP2 session and order entry | Partial | **Experimental.** 522 tests against a Python test acceptor, plus literal frames from the specification. A real QuickFIX acceptor interop run (44 passed, 1 skipped) was repeated by hand on 2026-11-06 against this change; QuickFIX is not in CI, so a later change can break interop unseen. No real counterparty. Reviewed by reading only. Open orders and fills come from the local record, so outside orders are unseen, and the session's own fills are missing too if their reports never arrived before a reset. A provider with no account API has no position check to catch that. Trading conformance passes with one declared exception, `run_trading_conformance(unknown_status_error=TransportError)`: an order with no local row raises rather than looking dead. The order manager reads that as not found only when the store id journalled with the send equals the current store's, since then the missing row proves the order never left. After a lost store the order stays unknown until an operator resolves it. |
 | ITCH, OUCH, SBE parsers | Missing | |
 | Audit trail | Proven | Hash chain, append-only triggers, anchor file. Not assessed against Rule 17a-4. |
 | Control mappings | Partial | SEC 15c3-5, Reg SHO, MiFID II RTS 6 and RTS 25, SEBI, with unverified items marked. DORA, MAR, MiCA, and CAT are not mapped. |

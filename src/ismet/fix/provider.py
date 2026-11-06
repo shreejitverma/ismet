@@ -63,16 +63,21 @@ What FIX does and does not offer, and how this provider handles each:
   venue. This fails closed: one malformed report stops new orders on this provider.
   A report with only a field defect such as an empty Text is applied and then rejected.
   A SequenceReset-Reset that skips numbers, or a peer's unrequested sequence reset, can
-  hide fills the same way and stops the stream the same way. A GapFill over a report the
-  venue no longer holds is seen only later: the next report on that order whose CumQty
-  exceeds the fills received is committed and quarantined the same way, its closing
-  status is withheld, and the order is restated as ``UNKNOWN``. With no later report,
-  only reconciliation can find it.
+  hide fills the same way and stops the stream the same way. So does our own
+  ``reset_on_logon`` while an order is working, unless the previous connection ended
+  with a clean Logout exchange, which is what a daily reset looks like. A GapFill over a
+  report the venue no longer holds is seen only later: the next report on that order
+  whose CumQty differs from the fills received is committed and quarantined the same
+  way, its closing status is withheld, and the order is restated as ``UNKNOWN``. Below
+  the fills received means a bust or correction was lost, above means a fill was. With
+  no later report, only reconciliation can find it.
 - Fill identity: ``fill_id`` is ExecID(17). ExecID is unique within a day or the life
   of a multi-day order (FIX 4.2 field definition), so duplicates are detected per order.
-  A repeat with the same content is dropped. A repeated fill with different content is
-  forwarded, so the order manager flags it. PossResend=Y reports are forwarded to this
-  same check, as "Standard Message Header" says to.
+  A repeat with the same content is dropped; standard header fields such as
+  LastMsgSeqNumProcessed do not count as content. A repeat with different content is
+  quarantined durably and halts, and a fill among it is forwarded too, so the order
+  manager flags it. PossResend=Y reports are forwarded to this same check, as "Standard
+  Message Header" says to.
 - ExecType G/H, or ExecTransType 2/1 in 4.2, name the affected execution in ExecRefID:
   H becomes :class:`FillBusted`, and G becomes a bust plus a fill under the new ExecID.
 
@@ -172,7 +177,10 @@ logger = logging.getLogger("ismet.fix")
 T = TypeVar("T")
 Fields = list[tuple[int, FieldValue]]
 
-_HEADER_TAGS = frozenset({34, 43, 49, 50, 52, 56, 57, 97, 115, 116, 122, 128, 129})
+_HEADER_TAGS = frozenset(
+    {34, 43, 49, 50, 52, 56, 57, 97, 115, 116, 122, 128, 129, 369, 1128, 1129, 1156}
+)
+"""Standard header fields a venue may re-stamp on a repeat, so not part of a digest."""
 _BACKLOG_LIMIT = 100_000
 _MULTI_DAY = frozenset({TimeInForce.GTC, TimeInForce.GTD})
 _SENT_INDEX_LIMIT = 10_000
@@ -615,7 +623,7 @@ class FixProvider(Provider):
             logger.warning("FIX session Reject for message %s: %s", seq_text, text)
             return
         pending = None if seq is None else self._pending_by_seq.get(seq)
-        self._reject_sent(pending, sent, f"session reject: {text}", code)
+        await self._reject_sent(pending, sent, f"session reject: {text}", code)
 
     async def on_application_message(self, message: FixMessage) -> None:
         msg_type = message.msg_type
@@ -648,6 +656,21 @@ class FixProvider(Provider):
         )
         await self._session.run_store(lambda: self._store.quarantine(record))
         self._halt(ReportQuarantinedError(f"messages may be lost: {text}"))
+
+    async def on_reset_discarding_unread(self, first_seq: int) -> None:
+        """Our own reset loses what the venue sent while we were away.
+
+        Only a working order can have a fill among it, so a session with nothing
+        working stays quiet, as the module docstring says a clean daily reset does.
+        """
+        if not await self._session.run_store(self._store.open_orders):
+            return
+        await self.on_possible_message_loss(
+            first_seq,
+            None,
+            "our sequence reset at Logon discards messages never read here, after a "
+            "connection that did not end with a clean Logout, while orders are working",
+        )
 
     async def _quarantine(self, message: FixMessage, reason: str) -> None:
         """Record a message that will never be redelivered, and stop if it mattered."""
@@ -909,24 +932,15 @@ class FixProvider(Provider):
             )
         events = self._events_for(message, client_order_id, exec_id, record)
         if conflicting:
-            logger.error(
-                "FIX ExecID %s was reported again with different content", exec_id
-            )
-            for event in events:
-                if isinstance(event, Filled):
-                    self._publish(event)
+            await self._quarantine_conflict(message, client_order_id, exec_id, events)
             return
         fill = next((e.fill for e in events if isinstance(e, Filled)), None)
         bust = next((e.fill_id for e in events if isinstance(e, FillBusted)), None)
-        unreported = self._unreported_quantity(record, message, fill, bust)
+        lost = self._lost_report_reason(record, message, client_order_id, fill, bust)
         lost_report: QuarantinedMessage | None = None
-        if unreported is not None:
+        if lost is not None:
             events = [e for e in events if isinstance(e, Filled)]
-            lost_report = self._quarantine_row(
-                message,
-                f"CumQty is {unreported} above the fills received, so a report on "
-                f"{client_order_id} was lost",
-            )
+            lost_report = self._quarantine_row(message, lost)
         updated = self._updated_record(record, message, wire_id, fill, bust)
         received = self.clock.now()
         execution = StoredExecution(
@@ -970,14 +984,47 @@ class FixProvider(Provider):
         if cancelled is not None:
             raise cancelled
 
-    def _unreported_quantity(
+    async def _quarantine_conflict(
+        self,
+        message: FixMessage,
+        client_order_id: str,
+        exec_id: str,
+        events: list[OrderEvent],
+    ) -> None:
+        """An ExecID seen before, with other content: the venue contradicts itself.
+
+        The halt is committed before anything is published, so a process that dies
+        before the order manager journals the event still refuses new orders on
+        restart. A fill among the events is forwarded too, so the manager flags it.
+        """
+        row = self._quarantine_row(
+            message, f"ExecID {exec_id} was reported again with different content"
+        )
+        await self._session.run_store(
+            lambda: self._store.record_report(
+                client_order_id, order_payload=None, quarantine=row
+            )
+        )
+        for event in events:
+            if isinstance(event, Filled):
+                self._publish(event)
+        self._halt_order(client_order_id, row.reason)
+
+    def _lost_report_reason(
         self,
         record: _Record | None,
         message: FixMessage,
+        client_order_id: str,
         fill: Fill | None,
         bust: str | None,
-    ) -> Decimal | None:
-        """How far CumQty exceeds the fills this session was told of, if it does."""
+    ) -> str | None:
+        """Why CumQty says a report on this order never arrived, if it does.
+
+        CumQty(14) is the venue's total executed, so after this report it must equal the
+        fills this session was told of: below means a bust or correction was never
+        read, above means a fill was. A bust or correction itself is excluded, because
+        its CumQty moves away from the fills received by design.
+        """
         if (
             record is None
             or bust is not None
@@ -988,7 +1035,12 @@ class FixProvider(Provider):
         if cum_qty is None:
             return None
         received = record.filled + (fill.quantity if fill is not None else Decimal(0))
-        return cum_qty - received if cum_qty > received else None
+        if cum_qty == received:
+            return None
+        return (
+            f"CumQty is {cum_qty} but the fills received total {received}, so a "
+            f"report on {client_order_id} was lost"
+        )
 
     def _updated_record(
         self,
@@ -1413,7 +1465,7 @@ class FixProvider(Provider):
                 logger.error("FIX BusinessMessageReject matches no request: %s", text)
                 return
             sent = _Sent(kind, root, ref_id or root)
-        self._reject_sent(pending, sent, text, code)
+        await self._reject_sent(pending, sent, text, code)
 
     def _find_pending(self, ref_id: str | None, seq: int | None) -> _Pending | None:
         if seq is not None and seq in self._pending_by_seq:
@@ -1425,19 +1477,30 @@ class FixProvider(Provider):
             return found
         return next((p for p in self._pending.values() if p.wire_id == ref_id), None)
 
-    def _reject_sent(
+    async def _reject_sent(
         self, pending: _Pending | None, sent: _Sent, reason: str, code: str | None
     ) -> None:
         """Fail the waiter if one remains. Otherwise tell the stream.
 
         A rejected new order always reaches the stream too, because the order manager
         may have stopped waiting and marked it unknown, and the reject resolves that.
+        Not once the venue has acknowledged the order: that reject answers a copy the
+        session resent at the venue's request, and the order is live.
         """
         waiting = pending is not None and not pending.future.done()
         if pending is not None and waiting:
             pending.future.set_exception(VenueError(reason, code=code))
         if sent.kind is _Kind.STATUS:
             return
+        if sent.kind is _Kind.NEW and not waiting:
+            record = await self._load(sent.client_order_id)
+            if record is not None and record.acknowledged:
+                logger.warning(
+                    "FIX reject of a resent copy of %s, which the venue holds: %s",
+                    sent.client_order_id,
+                    reason,
+                )
+                return
         if sent.kind is _Kind.NEW or not waiting:
             self._publish_reject(sent.kind, sent.client_order_id, reason, code)
 

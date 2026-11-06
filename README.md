@@ -72,6 +72,12 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
+`bars.to_pandas()` needs an optional extra, and without it raises `ConfigError`:
+
+```bash
+pip install 'ismet[pandas]'
+```
+
 Blocking code, including inside a notebook, uses `IsmetSyncClient`, with the same market data and stream calls.
 
 ## Orders

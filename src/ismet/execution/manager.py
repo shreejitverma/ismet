@@ -87,7 +87,7 @@ from ismet.execution.state import (
     OrderState,
     apply_event,
     fill_adds_detail,
-    fill_contradicts,
+    fill_disputes,
     new_order,
 )
 from ismet.models import Instrument, Quote, Symbol, to_decimal
@@ -119,6 +119,7 @@ from ismet.models.orders import (
     parse_order_event,
 )
 from ismet.providers.base import Provider
+from ismet.refdata.codes import accepting_stored_codes
 from ismet.transport.backoff import ExponentialBackoff
 from ismet.transport.clock import SYSTEM_CLOCK, Clock
 
@@ -162,8 +163,11 @@ def _is_halting(anomaly: str) -> bool:
     return any(tag in anomaly for tag in _HALTING_ANOMALIES)
 
 
-def _fill_terms(fill: Fill) -> tuple[str, str, str, str, str, str]:
-    """A fill report's identity and what it says traded, as one hashable key."""
+_FillTerms = tuple[str, str, str, str, str, str, str, str]
+
+
+def _fill_terms(fill: Fill) -> _FillTerms:
+    """A fill report's identity, what it says traded and what it cost, as one key."""
     return (
         fill.client_order_id,
         fill.fill_id,
@@ -171,6 +175,8 @@ def _fill_terms(fill: Fill) -> tuple[str, str, str, str, str, str]:
         fill.side.value,
         str(fill.price),
         str(fill.quantity),
+        str(fill.fee),
+        str(fill.fee_currency),
     )
 
 
@@ -292,11 +298,12 @@ class OrderManager:
         self._change_requested_at: dict[str, float] = {}
         self._kill = KillState(False)
         self._kill_unrecorded: dict[str, Any] | None = None
+        self._engaging = 0  # engages reading the journal before deciding their record
         self._reconcile_blind: str | None = None
         self._last_sweep: datetime | None = None
         self._durable_sweep: datetime | None = None
         self._reported_orphan_fills: set[str] = set()
-        self._reported_corrections: set[tuple[str, str, str, str, str, str]] = set()
+        self._reported_corrections: set[_FillTerms] = set()
         self._sweep_floor: datetime | None = None
         self._adjustments_seen = 0
         self._journalled_config: RiskConfig | None = None
@@ -486,48 +493,11 @@ class OrderManager:
         # With no clean sweep on record, every fill since the first record is unproven.
         self._last_sweep = records[0].ts if records else None
         halting: tuple[int, str] | None = None
-        for record in records:
-            if record.kind is RecordKind.SWEEP_MARK:
-                self._durable_sweep = datetime.fromisoformat(
-                    json.loads(record.payload)["at"]
-                )
-                self._last_sweep = self._durable_sweep
-            elif record.kind is RecordKind.CONFIG_CHANGE:
-                self._journalled_config = RiskConfig.model_validate(
-                    json.loads(record.payload)["risk"]
-                )
-            elif record.kind is RecordKind.RECON_BREAK:
-                detail = json.loads(record.payload)
-                if detail["kind"] == BreakKind.ORPHAN_FILL.value:
-                    self._reported_orphan_fills.add(detail["subject"])
-            elif record.kind is RecordKind.POSITION_ADJUSTED:
-                self._apply_adjustment(record)
-            elif record.kind is RecordKind.ORDER_EVENT:
-                event = parse_order_event(record.payload)
-                cid = event.client_order_id
-                if isinstance(event, SubmitIntent) and cid not in self._orders:
-                    self._store(new_order(event))
-                    self._created_at[cid] = event.ts
-                elif cid in self._orders:
-                    prior = self._orders[cid]
-                    if isinstance(event, Filled) and fill_contradicts(
-                        prior, event.fill
-                    ):
-                        # Raised below if it never was; a sweep must not halt again.
-                        self._reported_corrections.add(_fill_terms(event.fill))
-                    state = apply_event(prior, event)
-                    self._store(state)
-                    for message in state.anomalies[len(prior.anomalies) :]:
-                        if _is_halting(message):
-                            halting = (record.seq, f"order {cid}: {message}")
-                else:
-                    raise JournalError(f"event {event.kind} for {cid} has no intent")
-            elif record.kind is RecordKind.POSITION_BASELINE:
-                self._baseline = {
-                    Symbol.parse(key): Decimal(value["quantity"])
-                    for key, value in json.loads(record.payload).items()
-                }
-                self._sweep_floor = self._baseline_floor(record.ts)
+        # The process that wrote a record may have registered a venue or an asset this
+        # one has not; what it stored is still its history.
+        with accepting_stored_codes():
+            for record in records:
+                halting = self._replay(record) or halting
         self._adjustments_seen = records[-1].seq if records else 0
         self._marks.clear()  # replayed fills are history, not the market now
         self._kill = await self._call_journal(self._journal.kill_state)
@@ -542,6 +512,54 @@ class OrderManager:
                 await self._mark_unknown(
                     state.client_order_id, "process stopped during the send"
                 )
+
+    def _replay(self, record: JournalRecord) -> tuple[int, str] | None:
+        """Apply one journal record to memory; returns a halting anomaly it carried."""
+        if record.kind is RecordKind.SWEEP_MARK:
+            self._durable_sweep = datetime.fromisoformat(
+                json.loads(record.payload)["at"]
+            )
+            self._last_sweep = self._durable_sweep
+        elif record.kind is RecordKind.CONFIG_CHANGE:
+            self._journalled_config = RiskConfig.model_validate(
+                json.loads(record.payload)["risk"]
+            )
+        elif record.kind is RecordKind.RECON_BREAK:
+            detail = json.loads(record.payload)
+            if detail["kind"] == BreakKind.ORPHAN_FILL.value:
+                self._reported_orphan_fills.add(detail["subject"])
+        elif record.kind is RecordKind.POSITION_ADJUSTED:
+            self._apply_adjustment(record)
+        elif record.kind is RecordKind.ORDER_EVENT:
+            return self._replay_event(record)
+        elif record.kind is RecordKind.POSITION_BASELINE:
+            self._baseline = {
+                Symbol.parse(key): Decimal(value["quantity"])
+                for key, value in json.loads(record.payload).items()
+            }
+            self._sweep_floor = self._baseline_floor(record.ts)
+        return None
+
+    def _replay_event(self, record: JournalRecord) -> tuple[int, str] | None:
+        event = parse_order_event(record.payload)
+        cid = event.client_order_id
+        if isinstance(event, SubmitIntent) and cid not in self._orders:
+            self._store(new_order(event))
+            self._created_at[cid] = event.ts
+            return None
+        if cid not in self._orders:
+            raise JournalError(f"event {event.kind} for {cid} has no intent")
+        prior = self._orders[cid]
+        if isinstance(event, Filled) and fill_disputes(prior, event.fill):
+            # Raised below if it never was; a sweep must not raise it again.
+            self._reported_corrections.add(_fill_terms(event.fill))
+        state = apply_event(prior, event)
+        self._store(state)
+        halting = None
+        for message in state.anomalies[len(prior.anomalies) :]:
+            if _is_halting(message):
+                halting = (record.seq, f"order {cid}: {message}")
+        return halting
 
     async def _establish_baseline(self) -> None:
         if self._baseline is not None:
@@ -801,45 +819,80 @@ class OrderManager:
     ) -> KillState:
         """Stop new orders, durably. With ``cancel_open``, also cancel what is open.
 
-        In-memory state changes first, so the switch works even if the journal is
+        In-memory state changes before anything is awaited: a send already past its
+        checks reads only memory, and the journal read below can stall behind a write
+        or be cancelled with the caller. So the switch works even if the journal is
         down, and the record is retried until it lands. Cancels are retried by a
         background sweep until nothing is open. Engaging when already engaged keeps the
         original reason and can only widen the action: a later automatic halt cannot
-        stop a cancel sweep an operator asked for. That judgment reads the journal
-        first, since memory may predate a release or an engage from another process.
+        stop a cancel sweep an operator asked for. That judgment reads the journal,
+        since memory may predate a release or an engage from another process. It is
+        finished even if the caller is cancelled, so what memory flipped on the way in
+        always ends up recorded or superseded by the journal.
         """
-        await self._refresh_kill()
-        current = self._kill
-        if current.engaged:
-            if current.cancel_open or not cancel_open:
-                if cancel_open and self._started:
-                    await self.cancel_all()
-                return current
-            reason, operator = current.reason, current.operator
-        self._kill = KillState(True, reason, operator, current.seq, cancel_open)
-        self._kill_unrecorded = {
-            "reason": reason,
-            "operator": operator,
-            "cancel_open": cancel_open,
-        }
-        logger.critical("kill switch engaged by %s: %s", operator, reason)
-        await self._record_kill()
+        before = self._kill
+        if not before.engaged:
+            self._kill = KillState(True, reason, operator, before.seq, cancel_open)
+            logger.critical("kill switch engaged by %s: %s", operator, reason)
+        state = await self._uncancellable(
+            self._settle_kill(before, reason, operator, cancel_open)
+        )
         if cancel_open and self._started:
             await self.cancel_all()
+        return state
+
+    async def _settle_kill(
+        self, before: KillState, reason: str, operator: str, cancel_open: bool
+    ) -> KillState:
+        """Decide what the engage changes against the journal, then record it.
+
+        ``before`` is memory as it was on the way in. A kill memory holds and the
+        journal has not yet recorded outranks the journal, as :meth:`_merge_kill` says.
+        """
+        pending = self._kill_unrecorded
+        self._engaging += 1
+        try:
+            if pending is not None:
+                current = before
+            else:
+                current = await self._durable_kill(before)
+            if current.engaged and (current.cancel_open or not cancel_open):
+                if pending is None:
+                    self._kill = current  # on record already, at least as wide
+                return current
+            if current.engaged:
+                logger.critical(
+                    "kill switch widened by %s: cancelling orders", operator
+                )
+                reason, operator = current.reason, current.operator
+            elif before.engaged:
+                logger.critical("kill switch engaged by %s: %s", operator, reason)
+            self._kill = KillState(True, reason, operator, current.seq, cancel_open)
+            self._kill_unrecorded = {
+                "reason": reason,
+                "operator": operator,
+                "cancel_open": cancel_open,
+            }
+        finally:
+            self._engaging -= 1
+        await self._record_kill()
         return self._kill
 
     async def _halt(self, reason: str) -> None:
         """Stop new orders without touching what is open, unless already engaged."""
-        await self._refresh_kill()
-        if not self._kill.engaged:
-            await self.engage_kill(reason, operator="oms", cancel_open=False)
+        await self.engage_kill(reason, operator="oms", cancel_open=False)
 
-    async def _refresh_kill(self) -> None:
-        """Adopt the journal's kill state. With the journal down, memory stands."""
+    async def _durable_kill(self, memory: KillState) -> KillState:
+        """``memory`` brought up to date with the journal, without touching memory.
+
+        With the journal down, ``memory`` stands.
+        """
         try:
-            await self._merge_kill(await self._call_journal(self._journal.kill_state))
+            durable = await self._call_journal(self._journal.kill_state)
+            return await self._newer_kill(memory, durable)
         except Exception:
             logger.exception("could not read the kill switch from the journal")
+            return memory
 
     async def _record_kill(self) -> None:
         """Try to make an engaged kill durable. A restart must not lose it."""
@@ -886,22 +939,40 @@ class OrderManager:
         an intact chain: anyone can insert a row in a SQLite file. The journal has
         already ignored one naming no operator.
         """
-        if self._kill_unrecorded is not None or durable.seq <= self._kill.seq:
+        if self._kill_unrecorded is not None:
             return
-        if durable.engaged:
-            self._kill = durable
-            return
-        if self._kill.engaged:
-            result = await self._call_journal(self._journal.verify)
-            if not result.ok:
-                logger.critical(
-                    "ignoring a kill switch release: journal failed verification at "
-                    "record %s: %s",
-                    result.first_bad_seq,
-                    result.detail,
-                )
-                return
-        self._kill = durable
+        if self._engaging and not durable.engaged:
+            return  # an engage under way reads this release itself, and re-engages
+        memory = self._kill
+        newer = await self._newer_kill(memory, durable)
+        unchanged = self._kill is memory and self._kill_unrecorded is None
+        if newer is not memory and unchanged:
+            self._kill = newer
+
+    async def _newer_kill(self, memory: KillState, durable: KillState) -> KillState:
+        """The newer of a kill state in memory and one read from the journal.
+
+        A release is believed only on an intact chain, so it costs a verification. At
+        the same record the journal can still be wider: this process's own narrower
+        engage may have landed just after another's wider one.
+        """
+        if durable.seq < memory.seq:
+            return memory
+        if durable.seq == memory.seq:
+            widens = durable.engaged and durable.cancel_open and not memory.cancel_open
+            return durable if widens else memory
+        if durable.engaged or not memory.engaged:
+            return durable
+        result = await self._call_journal(self._journal.verify)
+        if not result.ok:
+            logger.critical(
+                "ignoring a kill switch release: journal failed verification at "
+                "record %s: %s",
+                result.first_bad_seq,
+                result.detail,
+            )
+            return memory
+        return durable
 
     async def _check_can_trade(self) -> None:
         """Refuse a new order if exposure cannot be trusted right now."""
@@ -1198,9 +1269,17 @@ class OrderManager:
             )
             self._pass("after_send_started", cid)
             # Writing that record took time: the order may have been cancelled or the
-            # kill switch engaged meanwhile, and nothing has gone to the venue yet.
+            # kill switch engaged meanwhile, here or by another process, and nothing
+            # has gone to the venue yet. A kill switch that cannot be read refuses too.
             if state.status is not OrderStatus.SUBMITTING:
                 return state
+            if cid not in self._cancel_before_send:
+                try:
+                    durable = await self._call_journal(self._journal.kill_state)
+                    await self._merge_kill(durable)
+                except Exception as exc:
+                    logger.critical("kill switch unreadable before the send: %s", exc)
+                    return await self._refuse_send(cid, "JOURNAL_UNREADABLE")
             refusal = self._send_refusal(cid)
             if refusal is not None:
                 return await self._refuse_send(cid, refusal)
@@ -1432,6 +1511,16 @@ class OrderManager:
             )
         if state.status is not OrderStatus.PENDING_REPLACE:
             return state  # a cancel or a last fill won while the record was written
+        if self._kill.engaged:
+            # Engaged while the record was written; the venue has not seen the change.
+            return await self._record(
+                ReplaceRejected(
+                    client_order_id=client_order_id,
+                    ts=self._clock.now(),
+                    reason="stopped before the amendment was sent",
+                    code="KILL_SWITCH",
+                )
+            )
         try:
             await self._venue.amend_order(
                 client_order_id, symbol, quantity=quantity, limit_price=limit_price
@@ -1515,7 +1604,8 @@ class OrderManager:
         if self._baseline is None or not names_operator(detail):
             logger.critical("ignoring position adjustment at record %s", record.seq)
             return
-        symbol = Symbol.parse(detail["symbol"])
+        with accepting_stored_codes():  # the venue may be known only to its writer
+            symbol = Symbol.parse(detail["symbol"])
         self._baseline[symbol] = add(
             self._baseline.get(symbol, Decimal(0)), Decimal(detail["delta"])
         )
@@ -1650,10 +1740,8 @@ class OrderManager:
             event.fill_id in self._orders[cid].busted_fill_ids
         ):
             return  # a venue may repeat a bust, and the record already has it
-        if isinstance(event, Filled) and fill_contradicts(
-            self._orders[cid], event.fill
-        ):
-            # Recorded and halted on below; a sweep finding it again must not halt.
+        if isinstance(event, Filled) and fill_disputes(self._orders[cid], event.fill):
+            # Recorded and raised below; a sweep finding it again must not raise it.
             self._reported_corrections.add(_fill_terms(event.fill))
         await self._record(event)
 
@@ -1997,9 +2085,9 @@ class OrderManager:
         A fill on an unknown order is reported once, per order and fill id, since a fill
         id is unique only per order. It reaches the journal, so an
         operator's release of the halt it causes is final, even across a restart. A
-        known fill reported with other terms is recorded too, which raises the same
-        halting anomaly the stream would, once per fill and set of terms, so the
-        sweeps inside the lookback window do not halt again after a release.
+        known fill reported with other terms, or another fee, is recorded too, which
+        raises the same anomaly the stream would, once per fill and set of terms, so
+        the sweeps inside the lookback window do not raise it again after a release.
         """
         for fill in fills:
             state = self._orders.get(fill.client_order_id)
@@ -2023,7 +2111,7 @@ class OrderManager:
             if not known or fill_adds_detail(state, fill):
                 await self._record_recovered_fill(fill)
                 report.resolved.append(fill.client_order_id)
-            elif fill_contradicts(state, fill):
+            elif fill_disputes(state, fill):
                 terms = _fill_terms(fill)
                 if terms not in self._reported_corrections:
                     self._reported_corrections.add(terms)
@@ -2212,10 +2300,16 @@ class OrderManager:
 
 
 def events_of(journal: Journal) -> Iterable[OrderEvent]:
-    """Every order event in a journal, in order, for audit and replay."""
+    """Every order event in a journal, in order, for audit and replay.
+
+    A code the writing process had registered and this one has not still parses: the
+    context is entered per record, so it never leaks to the consumer between yields.
+    """
     for record in journal.records():
         if record.kind is RecordKind.ORDER_EVENT:
-            yield parse_order_event(record.payload)
+            with accepting_stored_codes():
+                event = parse_order_event(record.payload)
+            yield event
 
 
 __all__ = ["OrderManager", "events_of"]

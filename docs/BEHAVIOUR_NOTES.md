@@ -30,6 +30,9 @@ Rules callers depend on that are easy to miss in the API reference.
 - `run_trading_conformance` requires `DuplicateOrderId` for a repeated client order id, and fails a stream that ends before reporting.
 - `unknown_status_error=` declares a documented exception to "status of an unknown order is `None`". `FixProvider` uses it with `TransportError`, because its only record is local and a wiped store must not make a live order look dead.
 - `SimVenue.answer_ticks`, `after_answer`, and `retain_busted_fills` let a test interleave stream events with venue answers.
+- `run_conformance` adds `instrument_symbol`, failing an instrument answered for another symbol, and fails bars spaced by anything other than a whole number of the asked interval.
+- `MockProvider.bars` serves only bars that have closed by its clock, so a range reaching past now stops at the last closed bar.
+- The release-workflow test also flags a gate step that pipes without pipefail, or runs an `&&` list on any line but the last, since GitHub's default `bash -e` hides either failure.
 
 ## FIX
 

@@ -63,3 +63,12 @@ def test_safe_order_path_shows_what_it_claims() -> None:
     assert "cancelled by the switch: canceled" in output
     assert "position from fills: 10" in output
     assert "journal chain intact: True" in output
+
+
+def test_the_readme_names_the_extra_its_snippet_needs() -> None:
+    root = Path(__file__).parents[2]
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    assert ".to_pandas()" in readme
+    assert "pip install 'ismet[pandas]'" in readme
+    pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
+    assert re.search(r"^pandas = \[", pyproject, re.MULTILINE)

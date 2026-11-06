@@ -131,7 +131,9 @@ def test_failed_open_leaves_no_thread() -> None:
 
 def test_from_env(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("ISMET_PROVIDERS", "mock")
-    monkeypatch.setenv("ISMET_CONFIG_FILE", str(tmp_path / "none.toml"))
+    empty = tmp_path / "empty.toml"
+    empty.write_text("", encoding="utf-8")
+    monkeypatch.setenv("ISMET_CONFIG_FILE", str(empty))
     with IsmetSyncClient.from_env() as client:
         assert client.quote("ACME@XMOK").last is not None
 
@@ -361,3 +363,31 @@ def test_a_closed_client_can_be_opened_again() -> None:
         assert client.quote("ACME@XMOK").bid is not None
         assert next(client.stream_quotes(["ACME@XMOK"])).bid is not None
     assert sync_threads() == []
+
+
+def test_a_call_blocked_during_close_raises_a_config_error() -> None:
+    entered = threading.Event()
+
+    class Blocks(MockProvider):
+        async def quote(self, symbol: Symbol):  # type: ignore[no-untyped-def]
+            entered.set()
+            await asyncio.Event().wait()
+
+    client = IsmetSyncClient([Blocks()])
+    client.open()
+    outcome: list[BaseException] = []
+
+    def call() -> None:
+        try:
+            client.quote("ACME@XMOK")
+        except BaseException as exc:
+            outcome.append(exc)
+
+    thread = threading.Thread(target=call)
+    thread.start()
+    assert entered.wait(10)
+    client.close()
+    thread.join(10)
+    assert not thread.is_alive()
+    assert len(outcome) == 1 and isinstance(outcome[0], ConfigError)
+    assert "closed" in str(outcome[0])

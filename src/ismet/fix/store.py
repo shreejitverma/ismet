@@ -117,6 +117,14 @@ class FixStore(Protocol):
 
     def set_reset_period(self, period: str) -> None: ...
 
+    def inbound_complete(self) -> bool:
+        """Whether the last connection ended with a Logout exchange that left nothing
+        unread. Cleared at each Logon, because from then on the peer may send again.
+        """
+        ...
+
+    def set_inbound_complete(self, value: bool) -> None: ...
+
     def put_order(
         self, client_order_id: str, payload: str, *, is_open: bool = True
     ) -> None: ...
@@ -193,6 +201,7 @@ class MemoryFixStore:
         self._orders: dict[str, str] = {}
         self._open_orders: set[str] = set()
         self._reset_period: str | None = None
+        self._inbound_complete = False
         self._wire: dict[str, str] = {}
         self._executions: dict[tuple[str, str], StoredExecution] = {}
         self._quarantine: list[QuarantinedMessage] = []
@@ -233,6 +242,12 @@ class MemoryFixStore:
 
     def set_reset_period(self, period: str) -> None:
         self._reset_period = period
+
+    def inbound_complete(self) -> bool:
+        return self._inbound_complete
+
+    def set_inbound_complete(self, value: bool) -> None:
+        self._inbound_complete = value
 
     def put_order(
         self, client_order_id: str, payload: str, *, is_open: bool = True
@@ -340,7 +355,8 @@ CREATE TABLE IF NOT EXISTS fix_sequence (
     session TEXT PRIMARY KEY,
     next_out INTEGER NOT NULL,
     next_in INTEGER NOT NULL,
-    reset_period TEXT
+    reset_period TEXT,
+    inbound_complete INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS fix_outbound (
     session TEXT NOT NULL,
@@ -422,6 +438,15 @@ class SqliteFixStore:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=FULL")
             self._conn.executescript(_SCHEMA)
+            columns = {
+                str(row[1])
+                for row in self._conn.execute("PRAGMA table_info(fix_sequence)")
+            }
+            if "inbound_complete" not in columns:  # a store from before the column
+                self._conn.execute(
+                    "ALTER TABLE fix_sequence ADD COLUMN "
+                    "inbound_complete INTEGER NOT NULL DEFAULT 0"
+                )
             self._conn.execute(
                 "INSERT OR IGNORE INTO fix_sequence (session, next_out, next_in) "
                 "VALUES (?, 1, 1)",
@@ -539,6 +564,19 @@ class SqliteFixStore:
             conn.execute(
                 "UPDATE fix_sequence SET reset_period = ? WHERE session = ?",
                 (period, self.session),
+            )
+
+    def inbound_complete(self) -> bool:
+        rows = self._query(
+            "SELECT inbound_complete FROM fix_sequence WHERE session = ?", self.session
+        )
+        return bool(rows[0][0])
+
+    def set_inbound_complete(self, value: bool) -> None:
+        with self._transaction() as conn:
+            conn.execute(
+                "UPDATE fix_sequence SET inbound_complete = ? WHERE session = ?",
+                (int(value), self.session),
             )
 
     def put_order(

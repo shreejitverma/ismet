@@ -7,7 +7,7 @@ appear in reprs or logs.
 Environment convention::
 
     ISMET_PROVIDERS=alpaca,mock
-    ISMET_CONFIG_FILE=/path/to/config.toml      # optional override
+    ISMET_CONFIG_FILE=/path/to/config.toml      # optional override; must exist
     ISMET_ALPACA_API_KEY=...     # provider "alpaca", credential "api_key"
     ISMET_ALPACA_PAPER=true      # provider "alpaca", option "paper"
 
@@ -111,6 +111,14 @@ class Settings(BaseModel):
         path: Path | None = None
         if use_file:
             path = config_file or config_file_path(environ)
+            if (
+                config_file is None
+                and environ.get(f"{ENV_PREFIX}CONFIG_FILE")
+                and not path.is_file()
+            ):
+                raise ConfigError(
+                    f"{ENV_PREFIX}CONFIG_FILE names {path}, which is not a file"
+                )
             layers.append(_read_file(path))
         layers.append(_read_env(environ))
         layers.append(_normalise(dict(explicit or {})))

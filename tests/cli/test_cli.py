@@ -41,7 +41,9 @@ def isolated_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     for name in list(os.environ):
         if name.startswith("ISMET_"):
             monkeypatch.delenv(name)
-    monkeypatch.setenv("ISMET_CONFIG_FILE", str(tmp_path / "absent.toml"))
+    empty = tmp_path / "empty.toml"
+    empty.write_text("", encoding="utf-8")
+    monkeypatch.setenv("ISMET_CONFIG_FILE", str(empty))
 
 
 @pytest.fixture(autouse=True)
@@ -932,6 +934,31 @@ def test_kill_engage_still_works_on_a_broken_chain(capsys, tmp_path: Path) -> No
     assert code == 0 and "kill: engaged" in out
 
 
+def test_kill_engage_keeps_the_evidence_of_a_truncated_journal(
+    capsys, tmp_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    path = str(tmp_path / "j.db")
+    journal = SqliteJournal(path)
+    for value in range(6):
+        journal.append(RecordKind.ANOMALY, json.dumps({"a": value}))
+    journal.close()
+    connection = sqlite3.connect(path)
+    connection.execute("DROP TRIGGER journal_no_delete")
+    connection.execute("DELETE FROM journal WHERE seq > 3")
+    connection.commit()
+    connection.close()
+    code, out = run(capsys, "kill", "engage", "--journal", path, *WHO)
+    assert code == 0 and "kill: engaged" in out
+    assert "broken at record 6" in out and "truncated" in out
+    code, out = run(capsys, "journal", "verify", path)
+    assert code == 1 and "truncated" in out
+    code, out = run(capsys, "kill", "release", "--journal", path, *WHO)
+    assert code == 1 and "failed verification" in out
+    journal = SqliteJournal(path)
+    assert journal.kill_state().engaged
+    journal.close()
+
+
 def adjust(capsys, path: str, delta: str = "10"):  # type: ignore[no-untyped-def]
     return run(
         capsys,
@@ -1130,6 +1157,17 @@ def test_doctor_names_the_config_file_it_read(
     monkeypatch.setenv("ISMET_CONFIG_FILE", str(override))
     _, out = run(capsys, "doctor")
     assert str(override) in out
+
+
+def test_doctor_fails_when_the_config_override_names_no_file(
+    capsys, tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    typo = tmp_path / "typo.toml"
+    monkeypatch.setenv("ISMET_CONFIG_FILE", str(typo))
+    code, out = run(capsys, "doctor")
+    assert code == 1
+    assert "problems: 1" in out
+    assert "fail" in out and "typo.toml" in out
 
 
 def test_home_reports_a_malformed_config_rather_than_no_providers(

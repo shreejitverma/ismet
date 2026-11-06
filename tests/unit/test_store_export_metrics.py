@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib
 import os
 import sqlite3
@@ -155,6 +156,38 @@ async def test_backfill_accounts_for_every_window_and_resumes(store: BarStore) -
     assert calls == [DAY + timedelta(days=1)]
     with pytest.raises(ValidationError):
         await backfill(*args, window=timedelta(0))
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        TimeoutError("timed out"),
+        asyncio.TimeoutError(),
+        ConnectionResetError("reset by peer"),
+        OSError("no route to host"),
+    ],
+    ids=["builtin-timeout", "asyncio-timeout", "connection-reset", "os-error"],
+)
+async def test_backfill_counts_an_untyped_window_failure_and_continues(
+    store: BarStore, failure: Exception
+) -> None:
+    async def fetch(symbol, interval, start, end):  # type: ignore[no-untyped-def]
+        if start == DAY:
+            raise failure
+        return [bar(start)]
+
+    report = await backfill(
+        fetch,
+        store,
+        SYM,
+        Interval.D1,
+        DAY,
+        DAY + timedelta(days=3),
+        window=timedelta(days=1),
+    )
+    assert report.windows_total == 3 and report.windows_failed == 1
+    assert report.windows_fetched == 2 and report.bars_inserted == 2
+    assert report.failures[0][0] == DAY and not report.complete
 
 
 async def test_backfill_never_treats_an_empty_answer_as_final_without_proof(

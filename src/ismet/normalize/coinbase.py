@@ -29,11 +29,13 @@ from ismet.models import (
 )
 from ismet.normalize._common import (
     datetime_from_ms,
+    json_list,
     normalizer,
     parse_iso8601_utc,
     register_asset,
     strict_bool,
     strict_int,
+    text_field,
     venue_source,
 )
 
@@ -77,7 +79,7 @@ def quote_from_book(
     is unknowable, so the payload is refused rather than presented as fresh.
     """
     exchange_ts, exchange_ns = parse_iso8601_utc(payload["time"])
-    bids, asks = payload["bids"], payload["asks"]
+    bids, asks = json_list(payload["bids"]), json_list(payload["asks"])
     best_bid = _level(bids[0]) if bids else None
     best_ask = _level(asks[0]) if asks else None
     return Quote(
@@ -116,8 +118,8 @@ def order_book_from_book(
         received_ts=received,
         sequence=strict_int(payload["sequence"]),
         source=venue_source(PROVIDER, FEED_BOOK),
-        bids=tuple(_level(row) for row in payload["bids"][:depth]),
-        asks=tuple(_level(row) for row in payload["asks"][:depth]),
+        bids=tuple(_level(row) for row in json_list(payload["bids"])[:depth]),
+        asks=tuple(_level(row) for row in json_list(payload["asks"])[:depth]),
         currency=currency,
     )
 
@@ -148,7 +150,7 @@ def bars_from_candles(
     quality = frozenset({QualityFlag.STALE}) if outdated else frozenset()
     source = venue_source(PROVIDER, FEED_CANDLES)
     bars: list[Bar] = []
-    for row in rows:
+    for row in json_list(rows):
         open_seconds = strict_int(row[0])
         if open_seconds % seconds:
             raise ValueError(f"candle time {open_seconds} is off the {seconds}s grid")
@@ -219,6 +221,22 @@ def instrument_from_product(payload: Mapping[str, Any], symbol: Symbol) -> Instr
         status=status,
         active=status is ListingStatus.ACTIVE,
     )
+
+
+@_normalizes
+def listings_from_products(payload: object) -> list[Mapping[str, Any]]:
+    """Every entry of ``GET /products``, each with the text fields a search reads."""
+    listings = json_list(payload)
+    for listing in listings:
+        for key in ("id", "base_currency", "quote_currency"):
+            text_field(listing, key)
+    return listings
+
+
+@_normalizes
+def product_id_of(frame: Mapping[str, Any]) -> str:
+    """The product a feed data frame is about."""
+    return text_field(frame, "product_id")
 
 
 def quote_currency_of(product_id: str) -> str | None:
@@ -313,7 +331,9 @@ __all__ = [
     "bars_from_candles",
     "control_error",
     "instrument_from_product",
+    "listings_from_products",
     "order_book_from_book",
+    "product_id_of",
     "quote_currency_of",
     "quote_from_book",
     "quote_from_ticker",

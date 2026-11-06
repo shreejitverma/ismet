@@ -277,6 +277,46 @@ def test_an_anchor_that_disagrees_with_the_chain_means_the_journal_was_replaced(
     journal.close()
 
 
+def test_appending_after_truncation_keeps_the_evidence(tmp_path: Path) -> None:
+    """An engage on a truncated journal must not move the anchor onto the short one."""
+    path = tmp_path / "j.db"
+    journal = SqliteJournal(path)
+    for value in range(6):
+        journal.append(RecordKind.ANOMALY, json.dumps({"a": value}), ts=TS)
+    journal.close()
+    _tamper(path, "DELETE FROM journal WHERE seq > 3")
+    reopened = SqliteJournal(path)
+    reopened.append(RecordKind.KILL_ENGAGED, '{"reason": "r"}', ts=TS)
+    result = reopened.verify()
+    assert not result.ok and "truncated" in result.detail
+    for value in range(3):  # the chain grows back past where the anchor saw it
+        reopened.append(RecordKind.ANOMALY, json.dumps({"b": value}), ts=TS)
+    reopened.close()
+    restarted = SqliteJournal(path)
+    result = restarted.verify()
+    assert not result.ok and "replaced" in result.detail
+    assert result.first_bad_seq == 6
+    restarted.append(RecordKind.ANOMALY, "{}", ts=TS)
+    assert not restarted.verify().ok
+    restarted.close()
+
+
+def test_reopening_a_journal_whose_triggers_were_dropped_is_logged(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = tmp_path / "j.db"
+    _three_records(path)
+    _tamper(path, "SELECT 1")
+    with caplog.at_level("CRITICAL", logger="ismet.execution"):
+        journal = SqliteJournal(path)
+    journal.close()
+    assert any("append-only trigger" in r.message for r in caplog.records)
+    caplog.clear()
+    with caplog.at_level("CRITICAL", logger="ismet.execution"):
+        SqliteJournal(path).close()
+    assert not caplog.records  # the triggers are back, and that is not news twice
+
+
 def test_unusable_path_raises_journal_error(tmp_path: Path) -> None:
     blocker = tmp_path / "file"
     blocker.write_text("x")
@@ -293,3 +333,34 @@ def test_writing_after_close_raises_journal_error(tmp_path: Path) -> None:
         list(journal.records())
     with pytest.raises(JournalError):
         journal.kill_state()
+
+
+def test_a_narrower_engage_does_not_stop_a_cancel_sweep(journal) -> None:  # type: ignore[no-untyped-def]
+    """Two engages can race, and the later must not undo the earlier one's cancels."""
+    journal.append(
+        RecordKind.KILL_ENGAGED,
+        json.dumps({"reason": "desk", "operator": "ops", "cancel_open": True}),
+    )
+    journal.append(
+        RecordKind.KILL_ENGAGED,
+        json.dumps({"reason": "overfill", "operator": "oms", "cancel_open": False}),
+    )
+    state = journal.kill_state()
+    assert state.engaged and state.cancel_open
+    assert state.reason == "overfill"
+
+
+def test_a_release_ends_the_wider_engage(journal) -> None:  # type: ignore[no-untyped-def]
+    journal.append(
+        RecordKind.KILL_ENGAGED,
+        json.dumps({"reason": "desk", "operator": "ops", "cancel_open": True}),
+    )
+    journal.append(
+        RecordKind.KILL_RELEASED, json.dumps({"reason": "clear", "operator": "ops"})
+    )
+    journal.append(
+        RecordKind.KILL_ENGAGED,
+        json.dumps({"reason": "overfill", "operator": "oms", "cancel_open": False}),
+    )
+    state = journal.kill_state()
+    assert state.engaged and not state.cancel_open

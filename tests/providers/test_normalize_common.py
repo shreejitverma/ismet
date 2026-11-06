@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -16,6 +17,7 @@ from ismet.models import (
     Timeliness,
     Trade,
 )
+from ismet.normalize import binance, coinbase
 from ismet.normalize._common import (
     StreamGate,
     check_range,
@@ -240,3 +242,35 @@ def test_seed_sets_position_without_an_event() -> None:
     assert not gate.is_fresh("K")
     assert gate.admit("K", 10, _trade(10)) is None
     assert gate.admit("K", 11, _trade(11)).quality == frozenset()  # type: ignore[union-attr]
+
+
+NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
+BTC_BINANCE = Symbol(venue="BNCX", ticker="BTCUSDT")
+BTC_COINBASE = Symbol(venue="ZCBS", ticker="BTC-USD")
+BINANCE_BOOK = {"lastUpdateId": 1, "bids": {}, "asks": {}}
+COINBASE_BOOK = {
+    "sequence": 1,
+    "time": "2026-01-01T00:00:00Z",
+    "bids": {},
+    "asks": {},
+}
+
+
+@pytest.mark.parametrize(
+    "read",
+    [
+        lambda: binance.quote_from_depth(BINANCE_BOOK, BTC_BINANCE, NOW, "USDT"),
+        lambda: binance.order_book_from_depth(BINANCE_BOOK, BTC_BINANCE, NOW, "USDT"),
+        lambda: coinbase.quote_from_book(COINBASE_BOOK, BTC_COINBASE, NOW, "USD"),
+        lambda: coinbase.order_book_from_book(
+            COINBASE_BOOK, BTC_COINBASE, NOW, 5, "USD"
+        ),
+    ],
+    ids=["binance-quote", "binance-book", "coinbase-quote", "coinbase-book"],
+)
+def test_a_book_side_that_is_not_a_list_is_not_an_empty_book(
+    read: Callable[[], object],
+) -> None:
+    """An object is iterable, so it would otherwise read as a side with no orders."""
+    with pytest.raises(TransportError, match="unreadable payload"):
+        read()

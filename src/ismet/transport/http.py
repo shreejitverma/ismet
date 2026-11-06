@@ -32,7 +32,10 @@ import logging
 import math
 from collections.abc import Callable, Generator, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from decimal import Decimal
+from email.utils import parsedate_to_datetime
+from functools import partial
 from typing import Any
 
 import httpx
@@ -144,8 +147,25 @@ class RequestInfo:
 Hook = Callable[[RequestInfo], None]
 
 
-def retry_after_seconds(headers: Mapping[str, str]) -> float | None:
+def _http_date(text: str | None) -> datetime | None:
+    if text is None:
+        return None
+    try:
+        moment = parsedate_to_datetime(text)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+
+
+def retry_after_seconds(
+    headers: Mapping[str, str], *, clock: Clock = SYSTEM_CLOCK
+) -> float | None:
     """``Retry-After`` in seconds, or ``None`` if absent or unreadable.
+
+    RFC 9110 allows seconds or an HTTP-date. A date is read against the response's own
+    ``Date``, so a host clock that is off cannot change the wait, or against ``clock``
+    when that is missing or unreadable. A date already past means no wait. No recorded
+    venue response here uses the date form.
 
     ``headers`` must look names up without regard to case, as ``httpx`` headers do.
     """
@@ -155,12 +175,20 @@ def retry_after_seconds(headers: Mapping[str, str]) -> float | None:
     try:
         seconds = float(value)
     except ValueError:
-        return None
+        until = _http_date(value)
+        if until is None:
+            return None
+        now = _http_date(headers.get("date")) or clock.now()
+        return max(0.0, (until - now).total_seconds())
     return max(0.0, seconds) if math.isfinite(seconds) else None
 
 
 def map_response_error(
-    status: int, body: bytes, headers: Mapping[str, str]
+    status: int,
+    body: bytes,
+    headers: Mapping[str, str],
+    *,
+    clock: Clock = SYSTEM_CLOCK,
 ) -> IsmetError:
     """Map a non-2xx response to the ismet error hierarchy."""
     text = body.decode("utf-8", errors="replace")[:500]
@@ -176,7 +204,7 @@ def map_response_error(
         return AuthError(f"HTTP {status}: {text}", status=status)
     if status == 429:
         return RateLimited(
-            f"HTTP 429: {text}", retry_after=retry_after_seconds(headers)
+            f"HTTP 429: {text}", retry_after=retry_after_seconds(headers, clock=clock)
         )
     if status >= 500:
         return TransportError(f"HTTP {status}: {text}", retryable=True, status=status)
@@ -220,7 +248,7 @@ class HttpTransport:
         hooks: list[Hook] | None = None,
         clock: Clock = SYSTEM_CLOCK,
         transport: httpx.AsyncBaseTransport | None = None,
-        map_error: ErrorMapper = map_response_error,
+        map_error: ErrorMapper | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
@@ -229,7 +257,9 @@ class HttpTransport:
         self.breaker = breaker
         self.hooks: list[Hook] = list(hooks or [])
         self._clock = clock
-        self._map_error = map_error
+        self._map_error: ErrorMapper = map_error or partial(
+            map_response_error, clock=clock
+        )
         self._auth = auth
         self._headers = dict(headers or {})
         self._httpx_transport = transport

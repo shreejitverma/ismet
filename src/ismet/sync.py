@@ -155,16 +155,22 @@ class IsmetSyncClient:
 
     def _run(self, coroutine: Coroutine[Any, Any, T], *, closing: bool = False) -> T:
         with self._lock:
-            if self._loop is None or (self._closing and not closing):
+            loop = self._loop
+            if loop is None or (self._closing and not closing):
                 coroutine.close()
                 raise ConfigError("client is not open; use it in a 'with' block")
-            future = asyncio.run_coroutine_threadsafe(coroutine, self._loop)
+            future = asyncio.run_coroutine_threadsafe(coroutine, loop)
         try:
             # Short waits in a loop, because on Windows an unbounded wait cannot be
             # interrupted by Ctrl-C.
             while not future.done():
                 concurrent.futures.wait([future], timeout=_POLL_SECONDS)
             return future.result()
+        except concurrent.futures.CancelledError as exc:
+            # A close cancels what is left on the loop, and may have finished by now.
+            if self._closing or self._loop is not loop:
+                raise ConfigError("the client was closed during this call") from exc
+            raise
         except BaseException:
             future.cancel()
             raise

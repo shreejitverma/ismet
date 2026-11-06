@@ -93,3 +93,24 @@ def test_malformed_file_and_shapes_raise_config_error(tmp_path: Path) -> None:
         Settings.load(
             env={}, use_file=False, explicit={"provider": {"x": {"credentials": 1}}}
         )
+
+
+def test_a_config_override_naming_no_file_is_refused(tmp_path: Path) -> None:
+    typo = tmp_path / "typo.toml"
+    with pytest.raises(ConfigError, match=r"ISMET_CONFIG_FILE.*typo\.toml"):
+        Settings.load(env={"ISMET_CONFIG_FILE": str(typo)})
+    with pytest.raises(ConfigError, match="ISMET_CONFIG_FILE"):
+        Settings.load(env={"ISMET_CONFIG_FILE": str(tmp_path)})
+
+
+def test_only_the_override_must_exist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    absent = tmp_path / "absent" / "config.toml"
+    monkeypatch.setattr("ismet.config.default_config_path", lambda: absent)
+    assert Settings.load(env={}).providers == ()
+    assert Settings.load(env={"ISMET_CONFIG_FILE": ""}).config_path == absent
+    # An explicit argument outranks the variable, so the variable is never read.
+    typo = {"ISMET_CONFIG_FILE": str(tmp_path / "typo.toml")}
+    assert Settings.load(env=typo, config_file=absent).config_path == absent
+    assert Settings.load(env=typo, use_file=False).config_path is None

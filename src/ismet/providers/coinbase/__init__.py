@@ -44,7 +44,12 @@ adapter reports the gap and a consumer that needs every trade should act on it.
 
 Outages. Reconnects never stop by default, since a long-lived stream should survive a
 network outage. Each one is logged at WARNING; pass ``ws_on_state`` to watch them, or
-``ws_max_reconnects`` to fail instead. Only data frames count as progress.
+``ws_max_reconnects`` to fail instead. Only data frames count as progress. A handshake
+refused with a stated wait of over 20 seconds is not an outage to sit through unless the
+stream is told to: a new stream or one with ``ws_max_reconnects`` raises
+:class:`~ismet.errors.RateLimited` with that ``retry_after``, while any other stream
+logs the wait at WARNING and waits. Whether Coinbase answers handshakes this way has not
+been checked.
 
 Vendor quirks:
 
@@ -82,7 +87,7 @@ from urllib.parse import quote as url_quote
 import httpx
 
 from ismet.config import ProviderSettings
-from ismet.errors import TransportError, ValidationError
+from ismet.errors import IsmetError, RateLimited, TransportError, ValidationError
 from ismet.models import (
     Bar,
     Instrument,
@@ -108,7 +113,12 @@ from ismet.transport.backoff import (
 )
 from ismet.transport.circuit import CircuitBreaker
 from ismet.transport.clock import SYSTEM_CLOCK, Clock
-from ismet.transport.http import Hook, HttpTransport, loads_decimal
+from ismet.transport.http import (
+    Hook,
+    HttpTransport,
+    loads_decimal,
+    map_response_error,
+)
 from ismet.transport.ratelimit import RateLimiter, RateLimitSpec
 from ismet.transport.ws import (
     DEFAULT_WS_BACKOFF,
@@ -126,6 +136,8 @@ WS_URL = "wss://ws-feed.exchange.coinbase.com"
 MAX_CANDLES_PER_REQUEST = 300
 MAX_BARS = 100_000
 DEFAULT_TIMEOUT = 30.0
+# Under the 30 seconds a stream's start allows, so a wait and its handshake both fit.
+_LONGEST_STREAM_WAIT_SECONDS = 20.0
 
 _PUBLIC = "public"
 _WS_SUBSCRIBE = "ws_subscribe"
@@ -407,6 +419,19 @@ class CoinbaseProvider(Provider):
         async def before_connect() -> None:
             await self._limiter.acquire(_WS_SUBSCRIBE)
 
+        def on_rejected(
+            status: int, body: bytes, headers: Mapping[str, str]
+        ) -> IsmetError | None:
+            error = map_response_error(status, body, headers, clock=self.clock)
+            if not isinstance(error, RateLimited) or error.retry_after is None:
+                return None
+            # A consumer still waiting to start, or one that asked to fail rather than
+            # sit through an outage, should not block for the whole of a long wait.
+            outlasts_stream = error.retry_after > _LONGEST_STREAM_WAIT_SECONDS and (
+                generation == 0 or self._ws_max_reconnects is not None
+            )
+            return error if outlasts_stream else None
+
         async def on_connect(ws: WebSocketTransport) -> None:
             nonlocal generation
             generation += 1
@@ -416,6 +441,7 @@ class CoinbaseProvider(Provider):
             self._ws_url,
             on_connect=on_connect,
             before_connect=before_connect,
+            on_rejected=on_rejected,
             on_state=self._ws_on_state,
             backoff=self._ws_backoff,
             max_reconnects=self._ws_max_reconnects,
@@ -423,6 +449,7 @@ class CoinbaseProvider(Provider):
             backpressure=self._ws_backpressure,
             decode=decode,
             is_data=lambda item: item[3].get("type") in data_types,
+            clock=self.clock,
         )
         gate = StreamGate(contiguous=contiguous)
         seen_generation = 1
@@ -445,7 +472,7 @@ class CoinbaseProvider(Provider):
                     if error is not None:
                         raise error
                     continue
-                ticker = frame["product_id"]
+                ticker = normalize.product_id_of(frame)
                 symbol = by_ticker.get(ticker)
                 if symbol is None:
                     logger.warning("frame for unsubscribed %s ignored", ticker)
@@ -477,7 +504,9 @@ class CoinbaseProvider(Provider):
             self._all_products is None
             or now - self._all_products_at >= self._search_cache_seconds
         ):
-            self._all_products = await self._get("/products")
+            self._all_products = normalize.listings_from_products(
+                await self._get("/products")
+            )
             self._all_products_at = now
         return self._all_products
 

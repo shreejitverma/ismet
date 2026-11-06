@@ -30,7 +30,8 @@ consumer already waiting in ``messages`` keeps receiving across restarts.
 ``before_connect`` runs before every handshake, whether or not the handshake then
 succeeds, so a provider can charge a connection budget there. ``on_rejected`` sees the
 status, body and lower-cased headers of each refused handshake, and an error it returns
-ends the stream with that error. A 429 rejection waits at least its ``Retry-After``.
+ends the stream with that error. A 429 rejection waits at least its ``Retry-After``, and
+the reconnect log line states the wait.
 Under a dropping policy only data messages are dropped: a message ``is_data`` rejects,
 such as a venue's refusal, evicts the oldest instead, and the first drop is logged at
 WARNING. ``stats.dropped`` counts every message lost, and :meth:`lost_before` says where
@@ -54,6 +55,7 @@ from websockets.asyncio.client import ClientConnection, connect
 
 from ismet.errors import AuthError, IsmetError, RateLimited, TransportError
 from ismet.transport.backoff import ExponentialBackoff
+from ismet.transport.clock import SYSTEM_CLOCK, Clock
 from ismet.transport.http import retry_after_seconds
 
 logger = logging.getLogger("ismet.transport.ws")
@@ -230,6 +232,7 @@ class WebSocketTransport:
         decode: Callable[[str | bytes], Any] | None = None,
         is_data: Callable[[Any], bool] | None = None,
         connect_kwargs: dict[str, Any] | None = None,
+        clock: Clock = SYSTEM_CLOCK,
     ) -> None:
         self.url = url
         self.stats = WsStats()
@@ -246,6 +249,7 @@ class WebSocketTransport:
         self._decode = decode or (lambda raw: json.loads(raw, parse_float=Decimal))
         self._is_data = is_data
         self._connect_kwargs = connect_kwargs or {}
+        self._clock = clock
         self._queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=queue_size)
         self._conn: ClientConnection | None = None
         self._task: asyncio.Task[None] | None = None
@@ -388,16 +392,20 @@ class WebSocketTransport:
 
         ``stamped`` is ``stats.dropped`` read when this message was decoded. Call once
         per message, in delivery order. A newest-dropping queue discards only what
-        arrives after everything queued, so the stamp places the loss exactly, unless a
-        message was evicted from the front: then what is left of the queue follows it.
+        arrives after everything queued, so the stamp places the loss exactly. A message
+        evicted from the front is reported on the next one delivered, and the stamp
+        still places any drop after that. A later stamp also counts the eviction, so a
+        message can be told of a loss already reported, which is safer than missing one.
         """
         evicted = self.stats.evicted != self._told_evicted
         self._told_evicted = self.stats.evicted
-        newest_only = self._policy is BackpressurePolicy.DROP_NEWEST and not evicted
-        dropped = stamped if newest_only else self.stats.dropped
-        if dropped <= self._told_dropped:
+        if self._policy is BackpressurePolicy.DROP_NEWEST:
+            lost = evicted or stamped > self._told_dropped
+            self._told_dropped = max(self._told_dropped, stamped)
+            return lost
+        if self.stats.dropped <= self._told_dropped:
             return False
-        self._told_dropped = dropped
+        self._told_dropped = self.stats.dropped
         return True
 
     def _count_drop(self) -> None:
@@ -441,7 +449,7 @@ class WebSocketTransport:
         return {name.lower(): v for name, v in exc.response.headers.raw_items()}
 
     def _stated_wait(self, exc: websockets.exceptions.InvalidStatus) -> float:
-        return retry_after_seconds(self._headers(exc)) or 0.0
+        return retry_after_seconds(self._headers(exc), clock=self._clock) or 0.0
 
     def _rejected(self, exc: websockets.exceptions.InvalidStatus) -> IsmetError | None:
         if self._on_rejected is None:
@@ -547,13 +555,15 @@ class WebSocketTransport:
             if fatal is not None:
                 self._fail(fatal)
                 break
+            delay = max(self._backoff.delay(attempt - 1), stated_wait)
             logger.warning(
-                "websocket %s lost (%s); reconnect attempt %d",
+                "websocket %s lost (%s); reconnect attempt %d in %.1fs",
                 self.url,
                 reason,
                 attempt,
+                delay,
             )
-            await asyncio.sleep(max(self._backoff.delay(attempt - 1), stated_wait))
+            await asyncio.sleep(delay)
         self._enqueue(_CLOSED, force=True)
 
 

@@ -1342,6 +1342,114 @@ class TestResetOnLogonHappensOncePerPeriod:
         store.close()
 
 
+class TestOurResetReportsUnreadNumbers:
+    """Our own reset makes the prior period's numbers unrequestable, like a peer's.
+
+    It is reported unless the previous connection ended with a Logout exchange that
+    left inbound fully read, which is what a clean daily reset looks like.
+    """
+
+    @staticmethod
+    def _lose_a_message_while_away(acceptor: FixAcceptor) -> None:
+        lost = acceptor.next_out
+        acceptor.next_out += 1
+        acceptor.sent[lost] = ("8", [(58, "while away")], acceptor._now())
+
+    async def test_a_reset_after_an_unclean_end_reports_the_unread_numbers(
+        self, acceptor: FixAcceptor, make_session: SessionFactory
+    ) -> None:
+        period = ["day-1"]
+        session, listener = await make_session(
+            reset_on_logon=True, session_period=lambda _: period[0]
+        )
+        unread_from = session.next_inbound
+        period[0] = "day-2"
+        await acceptor.drop_connection()
+        self._lose_a_message_while_away(acceptor)
+        await acceptor.wait_until(lambda: len(acceptor.logons) == 2)
+        await session.wait_ready(5.0)
+        assert listener.unread_before_reset == [unread_from]
+        assert listener.resets == 2
+
+    async def test_a_reset_after_a_clean_logout_reports_nothing(
+        self, acceptor: FixAcceptor, make_session: SessionFactory
+    ) -> None:
+        period = ["day-1"]
+        session, listener = await make_session(
+            reset_on_logon=True, session_period=lambda _: period[0]
+        )
+        await session.stop()
+        assert acceptor.logout_text is not None
+        period[0] = "day-2"
+        await session.start()
+        await session.wait_ready(5.0)
+        assert listener.unread_before_reset == []
+        assert listener.resets == 2
+
+    async def test_the_first_reset_of_a_new_store_reports_nothing(
+        self, acceptor: FixAcceptor, make_session: SessionFactory
+    ) -> None:
+        _, listener = await make_session(reset_on_logon=True)
+        assert listener.unread_before_reset == []
+        assert listener.resets == 1
+
+    async def test_a_clean_end_is_remembered_across_a_restart(
+        self, acceptor: FixAcceptor, make_session: SessionFactory, tmp_path: Path
+    ) -> None:
+        store = SqliteFixStore(tmp_path / "fix.db", "s")
+        first, _ = await make_session(
+            store=store, reset_on_logon=True, session_period=lambda _: "day-1"
+        )
+        await first.stop()
+        second, listener = await make_session(
+            store=store, reset_on_logon=True, session_period=lambda _: "day-2"
+        )
+        assert acceptor.logons[-1].get(141) == "Y"
+        assert listener.unread_before_reset == []
+        await second.stop()
+        store.close()
+
+    async def test_an_unclean_end_is_remembered_across_a_restart(
+        self, acceptor: FixAcceptor, make_session: SessionFactory, tmp_path: Path
+    ) -> None:
+        store = SqliteFixStore(tmp_path / "fix.db", "s")
+        first, _ = await make_session(
+            store=store, reset_on_logon=True, session_period=lambda _: "day-1"
+        )
+        unread_from = first.next_inbound
+        acceptor.faults.ignore_logon = True
+        await acceptor.drop_connection()
+        self._lose_a_message_while_away(acceptor)
+        await acceptor.wait_until(lambda: len(acceptor.logons) == 2)
+        await first.stop()
+        acceptor.faults.ignore_logon = False
+        second, listener = await make_session(
+            store=store, reset_on_logon=True, session_period=lambda _: "day-2"
+        )
+        assert listener.unread_before_reset == [unread_from]
+        await second.stop()
+        store.close()
+
+    async def test_a_connection_after_a_clean_logout_forgets_it(
+        self, acceptor: FixAcceptor, make_session: SessionFactory
+    ) -> None:
+        """The peer can send again once we log on, so the clean end no longer holds."""
+        period = ["day-1"]
+        session, listener = await make_session(
+            reset_on_logon=True, session_period=lambda _: period[0]
+        )
+        await session.stop()
+        await session.start()
+        await session.wait_ready(5.0)
+        unread_from = session.next_inbound
+        period[0] = "day-2"
+        await acceptor.drop_connection()
+        self._lose_a_message_while_away(acceptor)
+        await acceptor.wait_until(lambda: len(acceptor.logons) == 3)
+        await session.wait_ready(5.0)
+        assert listener.unread_before_reset == [unread_from]
+
+
 class TestPeerResets:
     async def test_the_answer_to_a_reset_carries_the_whole_logon(
         self, versioned_acceptor: FixAcceptor, begin_string: str

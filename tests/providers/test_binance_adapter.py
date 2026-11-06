@@ -1338,3 +1338,153 @@ async def test_a_dropped_newest_frame_flags_the_frame_after_it_and_no_earlier() 
         False,
         True,
     ]
+
+
+async def test_a_date_form_retry_after_holds_like_seconds_do() -> None:
+    limited = httpx.Response(
+        429,
+        headers={
+            "Retry-After": "Sun, 01 Nov 2026 23:00:00 GMT",
+            "Date": "Sun, 01 Nov 2026 22:55:00 GMT",
+        },
+        json=TOO_MUCH_WEIGHT,
+    )
+    transport, seen = _serving(limited)
+    provider = BinanceProvider(http_transport=transport, retry_policy=NO_RETRY)
+    provider._currencies["BTCUSDT"] = "USDT"
+    async with provider:
+        with pytest.raises(RateLimited) as caught:
+            await provider.order_book(BTC, 5)
+        assert caught.value.retry_after == 300
+        with pytest.raises(RateLimited, match="not sending"):
+            await provider.order_book(BTC, 5)
+    assert len(seen) == 1
+
+
+async def test_a_retry_after_date_in_the_past_means_no_wait() -> None:
+    limited = httpx.Response(
+        429,
+        headers={
+            "Retry-After": "Sun, 01 Nov 2026 22:00:00 GMT",
+            "Date": "Sun, 01 Nov 2026 22:55:00 GMT",
+        },
+        json=TOO_MUCH_WEIGHT,
+    )
+    ok = httpx.Response(200, json=body("binance", "conformance", "depth"))
+    transport, seen = _serving(limited, ok)
+    provider = BinanceProvider(http_transport=transport)
+    provider._currencies["BTCUSDT"] = "USDT"
+    async with provider:
+        assert await provider.order_book(BTC, 5)
+    assert len(seen) == 2
+
+
+async def test_a_ban_reads_a_date_form_retry_after_against_the_injected_clock() -> None:
+    clock = ManualClock(datetime(2026, 11, 1, 22, 0, tzinfo=UTC))
+    ban = httpx.Response(
+        418, headers={"Retry-After": "Sun, 01 Nov 2026 23:00:00 GMT"}, content=b""
+    )
+    transport, _ = _serving(ban)
+    provider = BinanceProvider(http_transport=transport, clock=clock)
+    provider._currencies["BTCUSDT"] = "USDT"
+    async with provider:
+        with pytest.raises(RateLimited) as caught:
+            await provider.order_book(BTC, 5)
+    assert caught.value.retry_after == 3600
+
+
+def _answering(payload: object) -> BinanceProvider:
+    return BinanceProvider(
+        http_transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, content=json.dumps(payload))
+        ),
+        retry_policy=NO_RETRY,
+    )
+
+
+WRONG_SHAPES = [{}, [], "blocked", 5, None, {"msg": "blocked"}, {"symbols": 5}]
+WRONG_SYMBOL_ROWS = [{"symbols": [{}]}, {"symbols": [5]}, {"symbols": [{"symbol": 1}]}]
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda p: p.quote(BTC),
+        lambda p: p.order_book(BTC, 5),
+        lambda p: p.instrument(BTC),
+        lambda p: p.bars(
+            BTC,
+            Interval.M1,
+            datetime(2026, 1, 1, tzinfo=UTC),
+            datetime(2026, 1, 1, 0, 5, tzinfo=UTC),
+        ),
+    ],
+    ids=["quote", "order_book", "instrument", "bars"],
+)
+@pytest.mark.parametrize(
+    "payload", [*WRONG_SHAPES, {"symbols": []}, *WRONG_SYMBOL_ROWS], ids=repr
+)
+async def test_a_200_with_unexpected_json_stays_in_the_hierarchy(call, payload) -> None:  # type: ignore[no-untyped-def]
+    async with _answering(payload) as provider:
+        with pytest.raises(TransportError) as caught:
+            await call(provider)
+    assert caught.value.retryable is False
+
+
+@pytest.mark.parametrize("payload", [*WRONG_SHAPES, *WRONG_SYMBOL_ROWS], ids=repr)
+async def test_search_on_unexpected_json_is_a_protocol_error(payload: object) -> None:
+    async with _answering(payload) as provider:
+        with pytest.raises(TransportError, match="unreadable payload") as caught:
+            await provider.search("BTC")
+    assert caught.value.retryable is False
+
+
+@pytest.mark.parametrize("rows", [{}, "blocked", 5, None], ids=repr)
+async def test_klines_that_are_not_a_list_are_refused(rows: object) -> None:
+    provider = _answering(rows)
+    provider._currencies["BTCUSDT"] = "USDT"
+    async with provider:
+        with pytest.raises(TransportError, match="unreadable payload"):
+            await provider.bars(
+                BTC,
+                Interval.M1,
+                datetime(2026, 1, 1, tzinfo=UTC),
+                datetime(2026, 1, 1, 0, 5, tzinfo=UTC),
+            )
+
+
+async def test_a_refused_exchange_info_is_not_cached() -> None:
+    answers = [{"symbols": [{}]}, body("binance", "instruments", "exchangeInfo")]
+
+    def respond(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json=json.loads(json.dumps(answers.pop(0), default=str))
+        )
+
+    provider = BinanceProvider(http_transport=httpx.MockTransport(respond))
+    async with provider:
+        with pytest.raises(TransportError):
+            await provider.search("BTC")
+        assert await provider.search("NEOBTC")
+
+
+@pytest.mark.parametrize(
+    "frame",
+    ['{"t":1}', '{"t":1,"s":["BTCUSDT"]}', "[1]", '"text"', "5"],
+    ids=["no-symbol", "symbol-not-text", "list", "text", "number"],
+)
+async def test_a_stream_frame_of_the_wrong_shape_stays_in_the_hierarchy(
+    frame: str,
+) -> None:
+    async def handler(conn: ServerConnection) -> None:
+        await conn.recv()
+        await conn.send(frame)
+        await conn.wait_closed()
+
+    transport, _ = _serving(httpx.Response(200, json={}))
+    async with serve(handler, "127.0.0.1", 0) as server:
+        port = next(iter(server.sockets)).getsockname()[1]
+        async with _ws_provider(port, transport) as provider:
+            with pytest.raises(TransportError) as caught:
+                await asyncio.wait_for(take(provider.stream_trades([BTC]), 1), 10)
+    assert caught.value.retryable is False

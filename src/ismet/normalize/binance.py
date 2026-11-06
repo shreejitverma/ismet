@@ -29,10 +29,12 @@ from ismet.models import (
 from ismet.models.types import to_decimal
 from ismet.normalize._common import (
     datetime_from_ms,
+    json_list,
     normalizer,
     register_asset,
     strict_bool,
     strict_int,
+    text_field,
     venue_source,
 )
 
@@ -89,7 +91,7 @@ def quote_from_depth(
     zero by construction. See the adapter docstring for why no timestamped endpoint
     is used instead. An empty side is ``None``.
     """
-    bids, asks = payload["bids"], payload["asks"]
+    bids, asks = json_list(payload["bids"]), json_list(payload["asks"])
     best_bid = _level(bids[0]) if bids else None
     best_ask = _level(asks[0]) if asks else None
     return Quote(
@@ -124,8 +126,8 @@ def order_book_from_depth(
         received_ts=received,
         sequence=strict_int(payload["lastUpdateId"]),
         source=venue_source(PROVIDER, FEED_DEPTH),
-        bids=tuple(_level(row) for row in payload["bids"]),
-        asks=tuple(_level(row) for row in payload["asks"]),
+        bids=tuple(_level(row) for row in json_list(payload["bids"])),
+        asks=tuple(_level(row) for row in json_list(payload["asks"])),
         currency=currency,
     )
 
@@ -152,7 +154,7 @@ def bars_from_klines(
     """
     source = venue_source(PROVIDER, FEED_KLINES)
     bars: list[Bar] = []
-    for row in rows:
+    for row in json_list(rows):
         open_ms, close_ms = strict_int(row[0]), strict_int(row[6])
         _check_kline_span(open_ms, close_ms, interval)
         if datetime_from_ms(close_ms) >= as_of:
@@ -242,6 +244,32 @@ def instrument_from_symbol_info(
     )
 
 
+@_normalizes
+def symbol_info_from_exchange_info(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    """The first ``symbols`` entry of ``GET /api/v3/exchangeInfo?symbol=``."""
+    info: Mapping[str, Any] = payload["symbols"][0]
+    return info
+
+
+@_normalizes
+def listings_from_exchange_info(
+    payload: Mapping[str, Any],
+) -> list[Mapping[str, Any]]:
+    """Every ``symbols`` entry, each with the text fields a search reads."""
+    listings = json_list(payload["symbols"])
+    for listing in listings:
+        for key in ("symbol", "baseAsset", "quoteAsset"):
+            text_field(listing, key)
+    return listings
+
+
+@_normalizes
+def ticker_of(frame: Mapping[str, Any]) -> str:
+    """The native symbol a stream data frame is about."""
+    return text_field(frame, "s")
+
+
+@_normalizes
 def quote_asset_of(payload: Mapping[str, Any]) -> str | None:
     """The market data currency for a symbol, ``None`` if not representable."""
     return register_asset(payload["quoteAsset"])
@@ -307,6 +335,7 @@ def trade_from_frame(
     )
 
 
+@_normalizes
 def control_error(frame: Mapping[str, Any]) -> VenueError | None:
     """The error in a control frame, if it is one.
 
@@ -335,10 +364,13 @@ __all__ = [
     "bars_from_klines",
     "control_error",
     "instrument_from_symbol_info",
+    "listings_from_exchange_info",
     "next_kline_start",
     "order_book_from_depth",
     "quote_asset_of",
     "quote_from_book_ticker",
     "quote_from_depth",
+    "symbol_info_from_exchange_info",
+    "ticker_of",
     "trade_from_frame",
 ]

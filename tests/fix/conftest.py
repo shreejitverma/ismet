@@ -49,6 +49,7 @@ class RecordingListener:
         self.discarded: list[tuple[FixMessage, str]] = []
         self.resets = 0
         self.possible_losses: list[tuple[int, int | None, str]] = []
+        self.unread_before_reset: list[int] = []
         self.ready = 0
         self.downs: list[str] = []
         self.failures: list[Exception] = []
@@ -74,6 +75,9 @@ class RecordingListener:
         self, first_seq: int, last_seq: int | None, reason: str
     ) -> None:
         self.possible_losses.append((first_seq, last_seq, reason))
+
+    async def on_reset_discarding_unread(self, first_seq: int) -> None:
+        self.unread_before_reset.append(first_seq)
 
     def on_sequence_reset(self) -> None:
         self.resets += 1

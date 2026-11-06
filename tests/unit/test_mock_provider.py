@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -9,7 +10,7 @@ from pydantic import SecretStr
 from ismet.capabilities import Capability
 from ismet.config import ProviderSettings
 from ismet.errors import ConfigError, NotSupported, ValidationError, VenueError
-from ismet.models import Interval, Symbol
+from ismet.models import Bar, Interval, Symbol
 from ismet.providers.mock import MAX_DEPTH, TICK, MockProvider
 from ismet.transport.clock import ManualClock
 
@@ -229,15 +230,162 @@ async def test_trade_ids_stay_unique_across_streams_on_one_ticker() -> None:
     assert len(set(ids)) == 4
 
 
-async def test_a_restarted_or_concurrent_stream_keeps_the_seeded_prices() -> None:
-    symbol = Symbol(venue="XMOK", ticker="ACME")
+ACME = Symbol(venue="XMOK", ticker="ACME")
 
-    async def take_prices(provider: MockProvider) -> list[Decimal]:
-        stream = provider.stream_quotes([symbol])
-        prices = [(await stream.__anext__()).last for _ in range(3)]  # type: ignore[attr-defined]
-        await stream.aclose()  # type: ignore[attr-defined]
-        return prices
 
-    assert await take_prices(MockProvider(tick_interval=0)) == await take_prices(
+async def _first_prices(provider: MockProvider, count: int = 5) -> list[Decimal]:
+    stream = provider.stream_quotes([ACME])
+    prices = [(await stream.__anext__()).last for _ in range(count)]  # type: ignore[attr-defined]
+    await stream.aclose()  # type: ignore[attr-defined]
+    return prices
+
+
+async def test_fresh_providers_with_one_seed_stream_the_same_prices() -> None:
+    assert await _first_prices(MockProvider(tick_interval=0)) == await _first_prices(
         MockProvider(tick_interval=0)
     )
+
+
+async def test_a_concurrent_stream_on_one_provider_keeps_the_seeded_prices() -> None:
+    solo = await _first_prices(MockProvider(tick_interval=0))
+    provider = MockProvider(tick_interval=0)
+    order: list[str] = []
+
+    async def take(name: str, stream) -> list[Decimal]:  # type: ignore[no-untyped-def]
+        prices = []
+        async for event in stream:
+            order.append(name)
+            prices.append(event.last if name != "trades" else event.price)
+            if len(prices) == 5:
+                break
+        await stream.aclose()
+        return prices
+
+    first, _, _ = await asyncio.gather(
+        take("first", provider.stream_quotes([ACME])),
+        take("second", provider.stream_quotes([ACME])),
+        take("trades", provider.stream_trades([ACME])),
+    )
+    assert order[:3] == ["first", "second", "trades"]  # They really did interleave.
+    assert order[3:6] == ["first", "second", "trades"]
+    assert first == solo
+
+
+async def test_a_snapshot_during_a_stream_leaves_its_prices_alone() -> None:
+    solo = await _first_prices(MockProvider(tick_interval=0))
+    provider = MockProvider(tick_interval=0)
+    stream = provider.stream_quotes([ACME])
+    prices = []
+    for _ in range(5):
+        prices.append((await stream.__anext__()).last)  # type: ignore[attr-defined]
+        await provider.quote(ACME)
+        await provider.order_book(ACME, 3)
+    await stream.aclose()  # type: ignore[attr-defined]
+    assert prices == solo
+
+
+async def test_a_restarted_stream_starts_over_from_the_seed() -> None:
+    provider = MockProvider(tick_interval=0)
+    assert await _first_prices(provider) == await _first_prices(provider)
+
+
+async def test_trade_streams_keep_their_own_prices_too() -> None:
+    async def trades(provider: MockProvider) -> list[tuple[Decimal, Decimal]]:
+        stream = provider.stream_trades([ACME])
+        seen = [await stream.__anext__() for _ in range(4)]  # type: ignore[attr-defined]
+        await stream.aclose()  # type: ignore[attr-defined]
+        return [(t.price, t.size) for t in seen]
+
+    solo = await trades(MockProvider(tick_interval=0))
+    provider = MockProvider(tick_interval=0)
+    other = provider.stream_trades([ACME])
+    await other.__anext__()  # type: ignore[attr-defined]
+    assert await trades(provider) == solo
+    await other.aclose()  # type: ignore[attr-defined]
+
+
+EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+async def _opens(
+    provider: MockProvider, start: float, end: float, interval: Interval = Interval.M1
+) -> list[float]:
+    bars = await provider.bars(
+        ACME,
+        interval,
+        EPOCH + timedelta(seconds=start),
+        EPOCH + timedelta(seconds=end),
+    )
+    return [(b.exchange_ts - EPOCH).total_seconds() for b in bars]
+
+
+async def test_bars_cover_every_open_time_in_the_range() -> None:
+    p = MockProvider()
+    assert await _opens(p, 0, 90) == [0, 60]
+    assert await _opens(p, 0, 60) == [0]
+    assert await _opens(p, 0, 60.5) == [0, 60]
+
+
+async def test_bars_open_on_the_interval_grid_whatever_the_start() -> None:
+    p = MockProvider()
+    assert await _opens(p, 30, 90) == [60]
+    assert await _opens(p, 90, 180) == [120]
+    assert await _opens(p, 61, 119) == []
+
+
+async def test_a_bar_is_the_same_however_the_range_is_paged() -> None:
+    p = MockProvider()
+    start = datetime(2026, 1, 5, 9, 30, tzinfo=UTC)
+
+    async def rows(lo: int, hi: int) -> list[Bar]:
+        return await p.bars(
+            ACME,
+            Interval.M1,
+            start + timedelta(minutes=lo),
+            start + timedelta(minutes=hi),
+        )
+
+    def prices(bars: list[Bar]) -> list[tuple[datetime, Decimal, Decimal, Decimal]]:
+        return [(b.exchange_ts, b.open, b.high, b.close) for b in bars]
+
+    whole = prices(await rows(0, 10))
+    assert prices(await rows(0, 5)) + prices(await rows(5, 10)) == whole
+    assert prices(await rows(3, 7)) == whole[3:7]
+    assert len({row[1:] for row in whole}) > 1  # Not one bar repeated.
+
+
+async def test_bar_prices_stay_near_one_level() -> None:
+    bars = await MockProvider().bars(
+        ACME,
+        Interval.M1,
+        datetime(2026, 1, 5, tzinfo=UTC),
+        datetime(2026, 1, 5, 3, tzinfo=UTC),
+    )
+    assert max(b.high for b in bars) - min(b.low for b in bars) < 100 * TICK * 10
+
+
+async def test_the_bar_limit_counts_the_bars_that_would_be_returned() -> None:
+    p = MockProvider()
+    start = datetime(2026, 1, 5, tzinfo=UTC)
+    assert (
+        len(await p.bars(ACME, Interval.S1, start, start + timedelta(seconds=100_000)))
+        == 100_000
+    )
+    with pytest.raises(ValidationError, match="100001 bars"):
+        await p.bars(
+            ACME, Interval.S1, start, start + timedelta(seconds=100_000, milliseconds=1)
+        )
+
+
+async def test_bars_stop_at_the_last_closed_bar(sym: Symbol) -> None:
+    now = datetime(2026, 1, 5, 9, 30, 40, tzinfo=UTC)
+    p = MockProvider(clock=ManualClock(now))
+    bars = await p.bars(
+        sym, Interval.M1, now - timedelta(minutes=3), now + timedelta(hours=1)
+    )
+    assert [b.exchange_ts for b in bars] == [
+        datetime(2026, 1, 5, 9, 28, tzinfo=UTC),
+        datetime(2026, 1, 5, 9, 29, tzinfo=UTC),
+    ]
+    assert all(b.exchange_ts + timedelta(minutes=1) <= now for b in bars)
+    assert await p.bars(sym, Interval.M1, now, now + timedelta(hours=1)) == []

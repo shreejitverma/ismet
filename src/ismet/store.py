@@ -12,6 +12,7 @@ This is the system of record rather than a columnar analytics engine.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -463,7 +464,15 @@ async def _backfill_window(
             return
         store.mark_window_done(symbol, interval, start, end, len(bars))
     # ValueError: a stored row that no longer parses is this window's failure.
-    except (IsmetError, sqlite3.Error, ValueError) as exc:
+    # OSError and asyncio.TimeoutError: a caller's fetch need not raise ismet errors,
+    # and on Python 3.10 asyncio.TimeoutError is not an OSError.
+    except (
+        IsmetError,
+        sqlite3.Error,
+        ValueError,
+        OSError,
+        asyncio.TimeoutError,
+    ) as exc:
         logger.warning("backfill window %s failed: %s", start, exc)
         report.windows_failed += 1
         report.failures.append((start, repr(exc)))

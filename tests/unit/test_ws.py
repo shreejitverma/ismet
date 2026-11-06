@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
+from datetime import datetime, timezone
 from decimal import Decimal
 
 import pytest
@@ -13,6 +15,7 @@ from websockets.http11 import Request, Response
 
 from ismet.errors import AuthError, RateLimited, TransportError
 from ismet.transport.backoff import ExponentialBackoff
+from ismet.transport.clock import ManualClock
 from ismet.transport.ws import (
     BackpressurePolicy,
     ConnectionState,
@@ -520,3 +523,71 @@ async def test_a_failing_on_rejected_leaves_the_normal_handling_in_place(
         with pytest.raises(TransportError, match="404"):
             await ws.start()
     assert attempts == 1 and "on_rejected" in caplog.text
+
+
+async def _wait_for(condition) -> None:  # type: ignore[no-untyped-def]
+    """Wait for a condition another task will make true; the bound only fails a bug."""
+    deadline = time.monotonic() + 10
+    while not condition():
+        assert time.monotonic() < deadline, "the condition never became true"
+        await asyncio.sleep(0.005)
+
+
+async def test_the_reconnect_log_states_the_wait_a_handshake_was_told(
+    server_factory, caplog: pytest.LogCaptureFixture
+) -> None:  # type: ignore[no-untyped-def]
+    def process_request(conn: ServerConnection, request: Request) -> Response:
+        response = conn.respond(429, "slow down")
+        response.headers["Retry-After"] = "300"
+        return response
+
+    url = await server_factory(idle, process_request=process_request)
+    ws = make(url)
+    with caplog.at_level(logging.WARNING, logger="ismet.transport.ws"):
+        await ws.start(wait_connected=False)
+        await _wait_for(lambda: "in 300.0s" in caplog.text)
+    await ws.close()
+
+
+async def test_a_handshake_date_form_retry_after_uses_the_injected_clock(
+    server_factory, caplog: pytest.LogCaptureFixture
+) -> None:  # type: ignore[no-untyped-def]
+    def process_request(conn: ServerConnection, request: Request) -> Response:
+        response = conn.respond(429, "slow down")
+        del response.headers["Date"]
+        response.headers["Retry-After"] = "Sun, 01 Nov 2026 23:00:00 GMT"
+        return response
+
+    url = await server_factory(idle, process_request=process_request)
+    clock = ManualClock(datetime(2026, 11, 1, 22, 55, tzinfo=timezone.utc))
+    ws = make(url, clock=clock)
+    with caplog.at_level(logging.WARNING, logger="ismet.transport.ws"):
+        await ws.start(wait_connected=False)
+        await _wait_for(lambda: "in 300.0s" in caplog.text)
+    await ws.close()
+
+
+async def test_a_control_frame_eviction_does_not_swallow_a_newest_drop() -> None:
+    ws = make(
+        "ws://127.0.0.1:1", queue_size=3, backpressure=BackpressurePolicy.DROP_NEWEST
+    )
+
+    async def arrive(name: str, *, is_data: bool = True) -> None:
+        await ws._put((name, ws.stats.dropped), is_data=is_data)
+
+    for name in "ABCD":  # D finds the queue full and is dropped.
+        await arrive(name)
+    await arrive("control", is_data=False)  # Evicts A.
+    assert ws.stats.dropped == 2 and ws.stats.evicted == 1
+
+    told: dict[str, bool] = {}
+    for _ in range(3):
+        name, stamped = ws._queue.get_nowait()
+        told[name] = ws.lost_before(stamped)
+    await arrive("E")
+    name, stamped = ws._queue.get_nowait()
+    told[name] = ws.lost_before(stamped)
+
+    assert told["B"] is True  # A was evicted ahead of it.
+    assert told["C"] is False  # Nothing was lost between B and C.
+    assert told["control"] or told["E"]  # D was lost, and something must say so.

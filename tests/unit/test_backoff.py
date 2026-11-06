@@ -118,7 +118,7 @@ async def test_retry_does_not_retry_non_retryable() -> None:
     assert calls == 1
 
 
-async def test_retry_honours_retry_after_capped() -> None:
+async def test_retry_waits_each_stated_retry_after_within_the_cap() -> None:
     slept: list[float] = []
     calls = 0
 

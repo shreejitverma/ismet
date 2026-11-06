@@ -8,7 +8,7 @@ from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from functools import wraps
-from typing import ParamSpec, TypeVar
+from typing import Any, ParamSpec, TypeVar
 
 from ismet.errors import TransportError, ValidationError
 from ismet.models import (
@@ -83,6 +83,24 @@ def strict_int(value: object) -> int:
     """``value`` if it is a JSON integer; anything else is an unreadable payload."""
     if isinstance(value, bool) or not isinstance(value, int):
         raise TypeError(f"expected an integer, got {value!r}")
+    return value
+
+
+def text_field(payload: Mapping[str, object], key: str) -> str:
+    """``payload[key]`` if it is a JSON string; anything else is unreadable."""
+    value = payload[key]
+    if not isinstance(value, str):
+        raise TypeError(f"expected text at {key!r}, got {value!r}")
+    return value
+
+
+def json_list(value: object) -> list[Any]:
+    """``value`` if it is a JSON array; anything else is an unreadable payload.
+
+    An object is iterable too, so an empty one would otherwise read as no rows.
+    """
+    if not isinstance(value, list):
+        raise TypeError(f"expected a list, got {value!r}"[:200])
     return value
 
 
@@ -251,6 +269,7 @@ __all__ = [
     "check_range",
     "copy_made_at",
     "datetime_from_ms",
+    "json_list",
     "merge_bars",
     "normalizer",
     "parse_iso8601_utc",
@@ -258,5 +277,6 @@ __all__ = [
     "search_rank",
     "strict_bool",
     "strict_int",
+    "text_field",
     "venue_source",
 ]

@@ -63,7 +63,7 @@ class TickBand(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    from_price: Decimal
+    from_price: Price
     tick: PositiveDecimal
 
 

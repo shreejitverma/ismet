@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import json
 import logging
@@ -13,6 +14,8 @@ from urllib.parse import parse_qs, urlsplit
 import httpx
 import pytest
 from websockets.asyncio.server import ServerConnection, serve
+from websockets.http11 import Request
+from websockets.http11 import Response as WsResponse
 
 from ismet.capabilities import Capability
 from ismet.config import ProviderSettings
@@ -833,3 +836,226 @@ async def test_events_queued_behind_a_forced_eviction_are_flagged() -> None:
     assert QualityFlag.AFTER_GAP in behind.flags
     assert QualityFlag.AFTER_GAP not in after.flags
     assert behind.sequence == json.loads(recorded[2])["sequence"]
+
+
+def _refusing_after(accepted: int, retry_after: str):  # type: ignore[no-untyped-def]
+    """Accept ``accepted`` handshakes, then answer 429 with ``retry_after``."""
+    handshakes: list[int] = []
+
+    def process_request(conn: ServerConnection, request: Request) -> WsResponse | None:
+        handshakes.append(1)
+        if len(handshakes) <= accepted:
+            return None
+        response = conn.respond(429, "slow down")
+        response.headers["Retry-After"] = retry_after
+        return response
+
+    return process_request, handshakes
+
+
+def _ws_provider(port: int, **options) -> CoinbaseProvider:  # type: ignore[no-untyped-def]
+    return CoinbaseProvider(ws_url=f"ws://127.0.0.1:{port}", **options)
+
+
+async def _until(condition) -> None:  # type: ignore[no-untyped-def]
+    """Wait for a condition another task will make true; the bound only fails a bug."""
+    deadline = time.monotonic() + 10
+    while not condition():
+        assert time.monotonic() < deadline, "the condition never became true"
+        await asyncio.sleep(0.005)
+
+
+async def test_a_bounded_stream_fails_on_a_long_stated_wait() -> None:
+    process_request, handshakes = _refusing_after(1, "300")
+    drop = asyncio.Event()
+
+    async def handler(conn: ServerConnection) -> None:
+        await conn.recv()
+        await conn.send(session("coinbase", "matches").frames[1])
+        await drop.wait()
+
+    async with serve(
+        handler, "127.0.0.1", 0, process_request=process_request
+    ) as server:
+        port = next(iter(server.sockets)).getsockname()[1]
+        async with _ws_provider(
+            port, ws_max_reconnects=3, ws_backoff=FAST_BACKOFF
+        ) as provider:
+            stream = provider.stream_trades([BTC])
+            await asyncio.wait_for(stream.__anext__(), 10)  # type: ignore[attr-defined]
+            drop.set()
+            with pytest.raises(RateLimited) as caught:
+                await asyncio.wait_for(stream.__anext__(), 10)  # type: ignore[attr-defined]
+    assert caught.value.retry_after == 300
+    assert len(handshakes) == 2
+
+
+async def test_a_new_stream_told_to_wait_long_says_so_at_once() -> None:
+    process_request, _ = _refusing_after(0, "300")
+
+    async def handler(conn: ServerConnection) -> None:
+        await conn.wait_closed()
+
+    async with serve(
+        handler, "127.0.0.1", 0, process_request=process_request
+    ) as server:
+        port = next(iter(server.sockets)).getsockname()[1]
+        async with _ws_provider(port) as provider:
+            with pytest.raises(RateLimited) as caught:
+                await asyncio.wait_for(take(provider.stream_trades([BTC]), 1), 10)
+    assert caught.value.retry_after == 300
+
+
+async def test_an_unbounded_stream_waits_out_a_long_wait_and_logs_it(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    process_request, handshakes = _refusing_after(1, "300")
+    drop = asyncio.Event()
+
+    async def handler(conn: ServerConnection) -> None:
+        await conn.recv()
+        await conn.send(session("coinbase", "matches").frames[1])
+        await drop.wait()
+
+    async with serve(
+        handler, "127.0.0.1", 0, process_request=process_request
+    ) as server:
+        port = next(iter(server.sockets)).getsockname()[1]
+        async with _ws_provider(port, ws_backoff=FAST_BACKOFF) as provider:
+            stream = provider.stream_trades([BTC])
+            await asyncio.wait_for(stream.__anext__(), 10)  # type: ignore[attr-defined]
+            pending = asyncio.ensure_future(stream.__anext__())  # type: ignore[attr-defined]
+            with caplog.at_level(logging.WARNING, logger="ismet.transport.ws"):
+                drop.set()
+                await _until(lambda: "in 300.0s" in caplog.text)
+            assert len(handshakes) == 2 and not pending.done()
+            pending.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await pending
+
+
+async def test_a_short_stated_wait_is_not_fatal_on_a_bounded_stream() -> None:
+    process_request, handshakes = _refusing_after(1, "0")
+    drop = asyncio.Event()
+
+    async def handler(conn: ServerConnection) -> None:
+        await conn.recv()
+        await conn.send(session("coinbase", "matches").frames[1])
+        await drop.wait()
+
+    async with serve(
+        handler, "127.0.0.1", 0, process_request=process_request
+    ) as server:
+        port = next(iter(server.sockets)).getsockname()[1]
+        async with _ws_provider(
+            port, ws_max_reconnects=2, ws_backoff=FAST_BACKOFF
+        ) as provider:
+            stream = provider.stream_trades([BTC])
+            await asyncio.wait_for(stream.__anext__(), 10)  # type: ignore[attr-defined]
+            drop.set()
+            with pytest.raises(TransportError, match="after 2 reconnects"):
+                await asyncio.wait_for(stream.__anext__(), 10)  # type: ignore[attr-defined]
+    assert len(handshakes) == 3
+
+
+async def test_a_date_form_retry_after_is_honoured_not_retried_through() -> None:
+    seen = 0
+
+    def respond(_: httpx.Request) -> httpx.Response:
+        nonlocal seen
+        seen += 1
+        return httpx.Response(
+            429,
+            headers={
+                "Retry-After": "Sun, 01 Nov 2026 23:00:00 GMT",
+                "Date": "Sun, 01 Nov 2026 22:55:00 GMT",
+            },
+        )
+
+    provider = CoinbaseProvider(http_transport=httpx.MockTransport(respond))
+    async with provider:
+        with pytest.raises(RateLimited) as caught:
+            await provider.quote(BTC)
+    assert caught.value.retry_after == 300
+    assert seen == 1
+
+
+def _answering(payload: object) -> CoinbaseProvider:
+    return CoinbaseProvider(
+        http_transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, content=json.dumps(payload))
+        ),
+        retry_policy=NO_RETRY,
+    )
+
+
+# An empty list is not here: it is what a window with no trades looks like.
+WRONG_SHAPES = [{}, "blocked", 5, None, {"message": "blocked"}, [5], [{}]]
+
+
+@pytest.mark.parametrize("payload", WRONG_SHAPES, ids=repr)
+async def test_search_on_unexpected_json_is_a_protocol_error(payload: object) -> None:
+    async with _answering(payload) as provider:
+        with pytest.raises(TransportError, match="unreadable payload") as caught:
+            await provider.search("BTC")
+    assert caught.value.retryable is False
+
+
+async def test_a_refused_listing_is_not_cached() -> None:
+    product = body("coinbase", "instruments", "products/ZRX-BTC")
+    answers = [{"message": "blocked"}, [product]]
+
+    def respond(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json=json.loads(json.dumps(answers.pop(0), default=str))
+        )
+
+    provider = CoinbaseProvider(http_transport=httpx.MockTransport(respond))
+    async with provider:
+        with pytest.raises(TransportError):
+            await provider.search("BTC")
+        assert await provider.search("ZRX-BTC")
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda p: p.quote(BTC),
+        lambda p: p.order_book(BTC, 5),
+        lambda p: p.instrument(BTC),
+        lambda p: p.bars(
+            BTC,
+            Interval.M1,
+            datetime(2026, 1, 1, tzinfo=UTC),
+            datetime(2026, 1, 1, 0, 5, tzinfo=UTC),
+        ),
+    ],
+    ids=["quote", "order_book", "instrument", "bars"],
+)
+@pytest.mark.parametrize("payload", WRONG_SHAPES, ids=repr)
+async def test_a_200_with_unexpected_json_stays_in_the_hierarchy(call, payload) -> None:  # type: ignore[no-untyped-def]
+    async with _answering(payload) as provider:
+        with pytest.raises(TransportError) as caught:
+            await call(provider)
+    assert caught.value.retryable is False
+
+
+@pytest.mark.parametrize(
+    "frame",
+    ['{"type":"match"}', '{"type":"match","product_id":["BTC-USD"]}', "[1]", "5"],
+    ids=["no-product", "product-not-text", "list", "number"],
+)
+async def test_a_stream_frame_of_the_wrong_shape_stays_in_the_hierarchy(
+    frame: str,
+) -> None:
+    async def handler(conn: ServerConnection) -> None:
+        await conn.recv()
+        await conn.send(frame)
+        await conn.wait_closed()
+
+    async with serve(handler, "127.0.0.1", 0) as server:
+        port = next(iter(server.sockets)).getsockname()[1]
+        async with _ws_provider(port, ws_backoff=FAST_BACKOFF) as provider:
+            with pytest.raises(TransportError) as caught:
+                await asyncio.wait_for(take(provider.stream_trades([BTC]), 1), 10)
+    assert caught.value.retryable is False
