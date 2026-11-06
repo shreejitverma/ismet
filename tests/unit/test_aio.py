@@ -7,8 +7,8 @@ That hung the suite for days on 3.10, with a cancelled stream waiting for a mess
 
 from __future__ import annotations
 
+import ast
 import asyncio
-import re
 from pathlib import Path
 
 import pytest
@@ -110,11 +110,52 @@ async def test_an_operation_that_ignores_its_cancel_on_timeout_keeps_its_result(
     assert await _aio.wait_for(stubborn(), 0.01) == "finished anyway"
 
 
+def direct_wait_for_uses(source: str) -> list[int]:
+    """Lines that reach ``asyncio.wait_for`` without the helper, however it is named."""
+    tree = ast.parse(source)
+    modules = {"asyncio"}
+    found = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules.update(
+                a.asname or a.name for a in node.names if a.name == "asyncio"
+            )
+        elif isinstance(node, ast.ImportFrom) and (node.module or "").startswith(
+            "asyncio"
+        ):
+            found.extend(node.lineno for a in node.names if a.name == "wait_for")
+    found.extend(
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and node.attr == "wait_for"
+        and isinstance(node.value, ast.Name)
+        and node.value.id in modules
+    )
+    return sorted(found)
+
+
+@pytest.mark.parametrize(
+    ("source", "lines"),
+    [
+        ("import asyncio\nasyncio.wait_for(x, 1)\n", [2]),
+        ("import asyncio as aio\naio.wait_for(x, 1)\n", [2]),
+        ("from asyncio import wait_for as w\nw(x, 1)\n", [1]),
+        ("from asyncio.tasks import wait_for\n", [1]),
+        ("import asyncio\nasyncio.wait_for (x, 1)\n", [2]),
+        ("# asyncio.wait_for(x, 1)\nfrom ismet import _aio\n_aio.wait_for(x, 1)\n", []),
+    ],
+    ids=["call", "module-alias", "from-import", "submodule", "spaced", "helper-only"],
+)
+def test_the_checker_finds_every_spelling(source: str, lines: list[int]) -> None:
+    assert direct_wait_for_uses(source) == lines
+
+
 def test_the_source_never_calls_asyncio_wait_for_directly() -> None:
-    callers = [
-        str(path.relative_to(SRC))
+    callers = {
+        str(path.relative_to(SRC)): uses
         for path in SRC.rglob("*.py")
         if path.name != "_aio.py"
-        and re.search(r"asyncio\.wait_for\(", path.read_text(encoding="utf-8"))
-    ]
-    assert callers == []
+        and (uses := direct_wait_for_uses(path.read_text(encoding="utf-8")))
+    }
+    assert callers == {}

@@ -857,6 +857,10 @@ class OrderManager:
                 current = before
             else:
                 current = await self._durable_kill(before)
+                if self._kill_unrecorded is not None or self._kill.seq > current.seq:
+                    # Another engage or a release in this process decided while we
+                    # read, so memory is newer than what we read and starts from there.
+                    current = self._kill
             if current.engaged and (current.cancel_open or not cancel_open):
                 if pending is None:
                     self._kill = current  # on record already, at least as wide

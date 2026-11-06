@@ -289,6 +289,56 @@ async def test_a_halt_racing_a_wider_engage_ends_up_cancelling(
         await oms.abort()
 
 
+@pytest.mark.parametrize(
+    "journal_up", [True, False], ids=["journal-up", "journal-down"]
+)
+async def test_a_halt_cannot_narrow_a_wider_engage_decided_while_it_read(
+    make_manager: Factory, venue: SimVenue, journal: SqliteJournal, journal_up: bool
+) -> None:
+    """In one process: a halt reads the journal, an operator's wider engage decides
+    before the halt resumes, and the halt's stale read must not narrow memory or
+    replace the operator's record. With the journal down, the operator's record is the
+    one left to retry, so the cancel request survives the outage.
+    """
+    oms = make_manager(kill_poll_interval=3600)
+    await oms.start()
+    try:
+        await venue.drain()
+        real_read = oms._durable_kill
+        halt_has_read, halt_may_go = asyncio.Event(), asyncio.Event()
+        reads = 0
+
+        async def read_then_stall_once(memory: KillState) -> KillState:
+            nonlocal reads
+            reads += 1
+            found = await real_read(memory)
+            if reads == 1:
+                halt_has_read.set()
+                await halt_may_go.wait()
+            return found
+
+        def journal_down(*_: object, **__: object) -> JournalRecord:
+            raise OSError("disk gone")
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(oms, "_durable_kill", read_then_stall_once)
+            if not journal_up:
+                patch.setattr(journal, "append", journal_down)
+            halt = asyncio.ensure_future(oms._halt("overfill"))
+            await halt_has_read.wait()
+            await oms.engage_kill("desk pull", operator="desk", cancel_open=True)
+            halt_may_go.set()
+            await halt
+            assert oms.kill_state.engaged and oms.kill_state.cancel_open
+            if not journal_up:
+                pending = oms._kill_unrecorded
+                assert pending is not None and pending["cancel_open"] is True
+        if journal_up:
+            assert journal.kill_state().cancel_open
+    finally:
+        await oms.abort()
+
+
 # amend-sent-after-kill
 
 
