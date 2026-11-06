@@ -34,7 +34,7 @@ dependencies = [
   "websockets>=13.0",
   "pydantic>=2.6.0",
   "platformdirs>=4.0.0",
-  "tzdata>=2024.1",
+  "tzdata>=2026.6",
   "tomli>=2.0.0; python_version < '3.11'",
 ]
 
