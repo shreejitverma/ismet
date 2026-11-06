@@ -18,7 +18,7 @@ from typing import Any
 
 import pytest
 
-from ismet.errors import JournalError, KillSwitchEngaged
+from ismet.errors import JournalError, KillSwitchEngaged, VenueError
 from ismet.execution import (
     MemoryJournal,
     OrderManager,
@@ -568,6 +568,57 @@ async def test_an_amend_overtaken_while_it_reads_the_kill_switch_is_not_sent(
             for e in events_of(journal)
             if e.client_order_id == "KA4" and isinstance(e, OutcomeUnknown)
         ]
+    finally:
+        await oms.abort()
+
+
+async def test_an_amend_overtaken_by_a_cancel_the_venue_refuses_leaves_no_terms(
+    venue: SimVenue, clock: ManualClock
+) -> None:
+    """The cancel lands while the amend reads the kill switch, and the venue refuses it
+    only after the amend has given up. The amendment was never sent, so the order is
+    working on its old terms, not waiting on a replace no venue will answer."""
+    journal = MemoryJournal()
+    oms = manager_over(venue, journal, clock)
+    await oms.start()
+    try:
+        await venue.drain()
+        await oms.submit(order("KA5", price="9.50"))
+        await venue.drain()
+        amends: list[str] = []
+        cancel_may_answer = asyncio.Event()
+
+        async def amend_order(cid: str, *_: object, **__: object) -> None:
+            amends.append(cid)
+
+        async def cancel_order(*_: object, **__: object) -> None:
+            await cancel_may_answer.wait()
+            raise VenueError("cancel refused", code="CANCEL_REFUSED")
+
+        real_merge = oms._merge_kill
+        reads = 0
+        cancel: asyncio.Task[Any] | None = None
+
+        async def cancel_during_read(durable: KillState) -> None:
+            nonlocal reads, cancel
+            reads += 1
+            if reads == 2:
+                cancel = asyncio.create_task(oms.cancel("KA5"))
+                await until(lambda: oms.order("KA5").status is S.PENDING_CANCEL)
+            await real_merge(durable)
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(venue, "amend_order", amend_order)
+            patch.setattr(venue, "cancel_order", cancel_order)
+            patch.setattr(oms, "_merge_kill", cancel_during_read)
+            await oms.amend("KA5", quantity=D(50))
+            assert cancel is not None
+            cancel_may_answer.set()
+            await cancel
+        state = oms.order("KA5")
+        assert amends == []
+        assert state.status is S.ACCEPTED and state.quantity == 100
+        assert state.pending_quantity is None and state.pending_limit_price is None
     finally:
         await oms.abort()
 
