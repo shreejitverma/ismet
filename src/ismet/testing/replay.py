@@ -28,6 +28,8 @@ from websockets.asyncio.client import connect
 from websockets.asyncio.server import Server, ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 
+from ismet import _aio
+
 ALLOWED_RESPONSE_HEADERS = frozenset(
     {
         "age",
@@ -338,7 +340,7 @@ async def record_session(
                     controls.append(text)
 
     with contextlib.suppress(asyncio.TimeoutError):
-        await asyncio.wait_for(capture(), timeout)
+        await _aio.wait_for(capture(), timeout)
     return RecordedSession(url, tuple(sent), tuple(controls), tuple(captured))
 
 

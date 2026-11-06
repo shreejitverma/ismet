@@ -4,6 +4,8 @@ Rules callers depend on that are easy to miss in the API reference.
 
 ## Orders and risk
 
+- Every ismet timeout now keeps a caller's cancel on Python 3.10 and 3.11: `asyncio.wait_for` there hands a cancelled caller the result when the awaited operation finishes in the same loop turn (CPython gh-86296), so a cancelled task could carry on.
+  `ismet._aio.wait_for` applies the 3.12 rule on every version.
 - `RiskConfig.limit_currency` declares the currency of notional limits, and an order in another currency is refused with check `limit_currency`.
 - Without it, an order's notional limits read in its own instrument's currency.
 - A gross limit fails closed when holdings are unknown, a mark or multiplier is missing, or exposure spans currencies.

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -29,6 +30,9 @@ from ismet.fix.message import (
 FieldList = list[tuple[int, str]]
 ADMIN = {"0", "1", "2", "3", "4", "5", "A"}
 CLOSED = {"2", "4", "8", "C"}
+
+
+logger = logging.getLogger("tests.fix.acceptor")
 
 
 @dataclass
@@ -263,6 +267,13 @@ class FixAcceptor:
         assert task is not None
         self._tasks.add(task)
         self.connections += 1
+        if self._writer is not None:
+            # A second client on one port is a leaked session from somewhere else.
+            logger.warning(
+                "acceptor on port %s: connection %d replaces a live one",
+                self.port,
+                self.connections,
+            )
         self._writer = writer
         parser = FixStreamParser()
         try:
@@ -286,6 +297,9 @@ class FixAcceptor:
                         return
         except (ConnectionError, OSError):
             pass
+        except Exception:
+            logger.exception("acceptor on port %s failed handling a message", self.port)
+            raise
         finally:
             self.disconnects += 1
             self._logged_on = False

@@ -45,6 +45,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any, TypeVar, cast
 
+from ismet import _aio
 from ismet.calendars import TradingCalendar, get_calendar
 from ismet.capabilities import (
     AccountCapability,
@@ -801,7 +802,7 @@ class OrderManager:
                 return self.order(client_order_id)
 
         try:
-            return await asyncio.wait_for(waiter(), timeout)
+            return await _aio.wait_for(waiter(), timeout)
         except asyncio.TimeoutError:
             # On Python 3.10 this is not the builtin TimeoutError.
             raise TimeoutError(

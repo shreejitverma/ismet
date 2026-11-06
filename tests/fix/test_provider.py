@@ -2913,7 +2913,9 @@ class TestOurOwnResetWithWorkingOrders:
         stream = Stream(provider)
         await provider.place_order(order(time_in_force=TimeInForce.GTC))
         await eventually(lambda: bool(stream.of(Acknowledged)))
-        unread_from = provider.session.next_inbound
+        # The venue numbers the report it sends while we are away; our own counter
+        # may still be catching up with the ack the stream has already seen.
+        unread_from = acceptor.next_out
         period[0] = "day-2"
         await acceptor.drop_connection()
         self._fills_while_away(acceptor)
@@ -2923,6 +2925,8 @@ class TestOurOwnResetWithWorkingOrders:
         assert [(q.msg_type, q.seq, q.halted) for q in rows] == [
             ("*", unread_from, True)
         ]
+        # Once the session is back, the refusal must come from the quarantine.
+        await provider.session.wait_ready(5.0)
         with pytest.raises(ReportQuarantinedError):
             await provider.place_order(order("C2"))
         assert "C2" not in acceptor.orders

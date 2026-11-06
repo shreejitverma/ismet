@@ -35,6 +35,7 @@ from collections.abc import Callable, Coroutine
 from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 
+from ismet import _aio
 from ismet.capabilities import AccountCapability, Capability, TradingCapability
 from ismet.errors import (
     AmbiguousOutcome,
@@ -96,7 +97,7 @@ async def run_trading_conformance(
 
     async def step(name: str, call: Coroutine[Any, Any, Any]) -> tuple[bool, Any]:
         try:
-            result = await asyncio.wait_for(call, timeout)
+            result = await _aio.wait_for(call, timeout)
         except Exception as exc:
             add(Check(_CAP, name, False, f"{type(exc).__name__}: {exc}"))
             return False, None
@@ -158,7 +159,7 @@ async def run_trading_conformance(
             )
 
     try:
-        missing = await asyncio.wait_for(
+        missing = await _aio.wait_for(
             venue.order_status(f"{id_prefix}-never-sent", symbol), timeout
         )
     except Exception as exc:
@@ -185,7 +186,7 @@ async def run_trading_conformance(
     else:
         arm_status_failure()
         try:
-            answer = await asyncio.wait_for(venue.order_status(cid, symbol), timeout)
+            answer = await _aio.wait_for(venue.order_status(cid, symbol), timeout)
         except Exception as exc:
             add(Check(_CAP, "failed_status_query_raises", True, type(exc).__name__))
         else:
@@ -262,7 +263,7 @@ async def run_trading_conformance(
         # anything but VenueError from a cancel as "unknown whether applied" and marks
         # the order UNKNOWN, so a closed order must refuse with VenueError.
         try:
-            await asyncio.wait_for(venue.cancel_order(cid, symbol), timeout)
+            await _aio.wait_for(venue.cancel_order(cid, symbol), timeout)
         except VenueError:
             add(Check(_CAP, "cancel_of_closed_is_venue_error", True))
         except Exception as exc:
@@ -317,7 +318,7 @@ async def _check_duplicate_refused(
         add(Check(_CAP, "duplicate_client_id_refused", False, "second order accepted"))
     # The exception alone does not show that nothing was created.
     try:
-        listed = await asyncio.wait_for(venue.open_orders(request.symbol), timeout)
+        listed = await _aio.wait_for(venue.open_orders(request.symbol), timeout)
     except Exception as exc:
         add(Check(_CAP, "duplicate_leaves_one_order", False, repr(exc)))
         return
@@ -364,8 +365,8 @@ async def _check_ambiguous_outcome(
             )
         )
     try:
-        await asyncio.wait_for(venue.cancel_order(cid, symbol), timeout)
-        after = await asyncio.wait_for(venue.order_status(cid, symbol), timeout)
+        await _aio.wait_for(venue.cancel_order(cid, symbol), timeout)
+        after = await _aio.wait_for(venue.order_status(cid, symbol), timeout)
     except Exception as exc:
         add(
             Check(
@@ -400,8 +401,8 @@ async def _check_stop_limit(
     cid, symbol = request.client_order_id, request.symbol
     try:
         try:
-            await asyncio.wait_for(venue.place_order(request), timeout)
-            snapshot = await asyncio.wait_for(venue.order_status(cid, symbol), timeout)
+            await _aio.wait_for(venue.place_order(request), timeout)
+            snapshot = await _aio.wait_for(venue.order_status(cid, symbol), timeout)
         except Exception as exc:
             add(
                 Check(
@@ -445,7 +446,7 @@ async def _check_stream_reports(
     await asyncio.sleep(0)
     try:
         await venue.place_order(request)
-        await asyncio.wait_for(received, timeout)
+        await _aio.wait_for(received, timeout)
     except Exception as exc:
         report.checks.append(
             Check(
@@ -480,7 +481,7 @@ async def _check_fill_reporting(
     add = report.checks.append
     try:
         await venue.place_order(request)
-        streamed = await asyncio.wait_for(collected, timeout)
+        streamed = await _aio.wait_for(collected, timeout)
     except Exception as exc:
         add(Check(_CAP, "stream_reports_fill", False, f"{type(exc).__name__}: {exc}"))
         return
@@ -490,9 +491,7 @@ async def _check_fill_reporting(
             await collected
     add(Check(_CAP, "stream_reports_fill", True, streamed.fill_id))
     try:
-        fills = await asyncio.wait_for(
-            venue.fills_since(started, request.symbol), timeout
-        )
+        fills = await _aio.wait_for(venue.fills_since(started, request.symbol), timeout)
     except Exception as exc:
         add(Check(_CAP, "fills_since_reports_fill", False, repr(exc)))
         return
@@ -520,7 +519,7 @@ async def _check_fill_reporting(
             )
             break
     try:
-        everything = await asyncio.wait_for(venue.fills_since(started), timeout)
+        everything = await _aio.wait_for(venue.fills_since(started), timeout)
     except Exception as exc:
         add(Check(_CAP, "fills_since_reports_fill_without_symbol", False, repr(exc)))
         return
@@ -543,7 +542,7 @@ async def _check_fill_reporting(
         ("fills_since_excludes_fill_before_since", later, False),
     ):
         try:
-            answer = await asyncio.wait_for(
+            answer = await _aio.wait_for(
                 venue.fills_since(since, request.symbol), timeout
             )
         except Exception as exc:

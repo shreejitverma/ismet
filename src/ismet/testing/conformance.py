@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import TypeVar, cast
 
+from ismet import _aio
 from ismet.capabilities import (
     PROTOCOLS,
     Capability,
@@ -322,7 +323,7 @@ async def _check_stream(
                     await aclose()
 
     try:
-        await asyncio.wait_for(drain(), timeout)
+        await _aio.wait_for(drain(), timeout)
     except asyncio.TimeoutError:
         return Check(
             Capability.STREAMING,
@@ -395,7 +396,7 @@ async def _timed(
     timeout: float,
 ) -> T | None:
     try:
-        result = await asyncio.wait_for(fn(), timeout)
+        result = await _aio.wait_for(fn(), timeout)
     except asyncio.TimeoutError:
         report.checks.append(Check(cap_, name, False, f"timed out after {timeout}s"))
         return None

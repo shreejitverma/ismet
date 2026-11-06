@@ -69,6 +69,7 @@ from typing import NoReturn, Protocol, TypeVar
 
 from pydantic import SecretStr
 
+from ismet import _aio
 from ismet.errors import AmbiguousOutcome, AuthError, ConfigError, TransportError
 from ismet.fix.message import (
     DEFAULT_MAX_BODY_LENGTH,
@@ -423,7 +424,7 @@ class FixSession:
                 )
             # The state can change again before a woken waiter runs, so recheck it.
             with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(self._settled.wait(), remaining)
+                await _aio.wait_for(self._settled.wait(), remaining)
 
     async def stop(self) -> None:
         """Log out if connected and stop. Sequence numbers remain. Idempotent."""
@@ -473,7 +474,7 @@ class FixSession:
             self._set_state(SessionState.CONNECTING)
             was_ready = False
             try:
-                reader, writer = await asyncio.wait_for(
+                reader, writer = await _aio.wait_for(
                     asyncio.open_connection(cfg.host, cfg.port, ssl=cfg.ssl),
                     cfg.connect_timeout,
                 )
@@ -525,7 +526,7 @@ class FixSession:
     async def _close_writer(writer: asyncio.StreamWriter) -> None:
         writer.close()
         with contextlib.suppress(Exception):
-            await asyncio.wait_for(writer.wait_closed(), 2.0)
+            await _aio.wait_for(writer.wait_closed(), 2.0)
 
     async def _serve(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -674,7 +675,7 @@ class FixSession:
             raise _DisconnectError("connection is closed")
         try:
             writer.write(frame)
-            await asyncio.wait_for(writer.drain(), self.config.write_timeout)
+            await _aio.wait_for(writer.drain(), self.config.write_timeout)
         except (OSError, asyncio.TimeoutError) as exc:
             raise _DisconnectError(f"write failed: {type(exc).__name__}") from exc
         self._last_sent = self._clock.monotonic()

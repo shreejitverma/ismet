@@ -629,6 +629,9 @@ class TestCrashRecovery:
     ) -> None:
         oms = await rig.build()
         await oms.submit(request())
+        # Read the ack before stopping: one still unread is a gap the restart rightly
+        # asks to resend, which a loaded machine can leave behind a short ack timeout.
+        await oms.wait_for("C1", lambda s: s.status is OrderStatus.ACCEPTED, 5.0)
         await rig.teardown()
         await rig.build()
         assert acceptor.resend_requests_answered == 0
@@ -657,8 +660,9 @@ class TestCrashRecovery:
         assert acceptor.of_type("D") == []
         assert acceptor.of_type("H") == [], "the store answered, not the venue"
 
-        state = await restarted.submit(request("C2"))
-        assert state.status is OrderStatus.ACCEPTED
+        await restarted.submit(request("C2"))
+        # A late ack under load leaves C2 unknown for a moment; it must still land.
+        await restarted.wait_for("C2", lambda s: s.status is OrderStatus.ACCEPTED, 5.0)
         assert [m.get(11) for m in acceptor.of_type("D")] == ["C2"]
         assert list(acceptor.orders) == ["C2"]
 

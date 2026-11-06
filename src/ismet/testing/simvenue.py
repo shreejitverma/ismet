@@ -20,6 +20,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import ClassVar
 
+from ismet import _aio
 from ismet.errors import (
     AmbiguousOutcome,
     AuthError,
@@ -305,7 +306,7 @@ class SimVenue(Provider):
             for queue in list(self._subscribers):
                 await queue.join()
 
-        await asyncio.wait_for(wait(), timeout)
+        await _aio.wait_for(wait(), timeout)
 
     def disconnect_stream(self) -> None:
         """Break every execution stream."""

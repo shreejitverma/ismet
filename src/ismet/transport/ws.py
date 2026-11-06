@@ -53,6 +53,7 @@ from typing import Any
 import websockets
 from websockets.asyncio.client import ClientConnection, connect
 
+from ismet import _aio
 from ismet.errors import AuthError, IsmetError, RateLimited, TransportError
 from ismet.transport.backoff import ExponentialBackoff
 from ismet.transport.clock import SYSTEM_CLOCK, Clock
@@ -307,7 +308,7 @@ class WebSocketTransport:
 
     async def wait_connected(self, timeout: float = 30.0) -> None:
         try:
-            await asyncio.wait_for(self._connected.wait(), timeout)
+            await _aio.wait_for(self._connected.wait(), timeout)
         except asyncio.TimeoutError as exc:
             if self._failure is not None:
                 raise self._failure from self._failure.__cause__

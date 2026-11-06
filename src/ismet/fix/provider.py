@@ -104,6 +104,7 @@ from typing import Any, ClassVar, TypeVar
 import pydantic
 from pydantic import BaseModel, ConfigDict
 
+from ismet import _aio
 from ismet.config import ProviderSettings
 from ismet.errors import (
     AmbiguousOutcome,
@@ -1696,7 +1697,7 @@ class FixProvider(Provider):
             await self._store_call(remember)
         pending = self._new_pending(_Kind.NEW, cid, cid, cid)
         try:
-            result = await asyncio.wait_for(
+            result = await _aio.wait_for(
                 self._send_and_wait(pending, "D", fields), self._ack_timeout
             )
         except (SessionDownError, SessionFailedError, FixStoreError) as exc:
@@ -1751,7 +1752,7 @@ class FixProvider(Provider):
     ) -> None:
         pending = self._new_pending(kind, root, wire_id, wire_id)
         try:
-            await asyncio.wait_for(
+            await _aio.wait_for(
                 self._send_and_wait(pending, msg_type, fields), self._ack_timeout
             )
         except asyncio.TimeoutError:
@@ -1837,7 +1838,7 @@ class FixProvider(Provider):
             fields.append((_TAG_ORD_STATUS_REQ_ID, key))
         pending = self._new_pending(_Kind.STATUS, client_order_id, record.wire_id, key)
         try:
-            result = await asyncio.wait_for(
+            result = await _aio.wait_for(
                 self._send_and_wait(pending, "H", fields), self._query_timeout
             )
         except asyncio.TimeoutError:
