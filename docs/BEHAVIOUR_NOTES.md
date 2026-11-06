@@ -15,6 +15,8 @@ Rules callers depend on that are easy to miss in the API reference.
 - `restricted_symbols` entries match regardless of case, so `AAPL@xnas` and `aapl` both match, and `BRKb` also restricts a ticker spelled `BRKB`.
 - `cancel_all` sends cancels concurrently, at most 32 at a time, so one slow answer does not hold back the rest of a kill sweep.
 - A cancel during the kill-switch read after the send has been journalled closes the order as `CANCELED_BEFORE_SEND`, because the venue was never called, and then reraises `CancelledError`.
+- An amendment re-reads the kill switch from the journal after `ReplaceRequested` is written, so an engage from another process refuses it with `KILL_SWITCH`, an unreadable journal with `JOURNAL_UNREADABLE`, and a cancel during the read with `CANCELED_BEFORE_SEND`.
+- A disputed fee keeps the first report's amount and currency together; only the venue order id and liquidity are merged from the second.
 - `ismet._aio.wait_for` reports `TimeoutError` for a cancelled operation only when that wait itself cancelled it.
 - An operation that ends cancelled on its own raises `CancelledError`, on 3.10 and 3.11 as well as 3.12.
 
@@ -25,6 +27,7 @@ Rules callers depend on that are easy to miss in the API reference.
 - `export_jsonl` gained `raw_payload`, the exact text the hash covers, and `unique_intent`, and `verify_jsonl` checks an archive with those.
 - An anchor ahead of the record being appended is kept with no critical log when the anchored record is still present with the same digest, since another process wrote it.
 - The anchor is updated after the record commits, under the database write lock, so writers in different processes cannot move it backward and a crash leaves it behind, never ahead.
+- An anchor update whose commit fails is rolled back, so the next append still runs.
 
 ## Accounting
 
@@ -39,6 +42,7 @@ Rules callers depend on that are easy to miss in the API reference.
 - `SimVenue.answer_ticks`, `after_answer`, and `retain_busted_fills` let a test interleave stream events with venue answers.
 - An elected `SimVenue` stop, including one that has already partially filled, takes liquidity when a later quote appears, even if that quote has traded back through the stop.
 - `run_conformance` adds `instrument_symbol`, failing an instrument answered for another symbol, and fails bars spaced by anything other than a whole number of the asked interval.
+  For intervals longer than an hour, a whole number plus or minus exactly one hour also passes, since a daylight-saving change moves a local-time grid by an hour.
 - `MockProvider.bars` serves only bars that have closed by its clock, so a range reaching past now stops at the last closed bar.
 - The release-workflow test also flags a gate step that pipes without pipefail, or runs an `&&` list on any line but the last, since GitHub's default `bash -e` hides either failure.
 
@@ -50,7 +54,8 @@ Rules callers depend on that are easy to miss in the API reference.
 - `FixStore` gained `open_orders`, `fills_since`, `busted_executions`, `reset_period`, `set_reset_period`, `release_quarantine`, and `put_order(..., is_open=)`.
 - A provider declaring `venues` refuses an order on any other venue.
 - Tag 44 is read only for `LIMIT` and `STOP_LIMIT`, so an echoed zero cannot price a stop order at nothing.
-- A report `FixProvider` flags as lost does not lower the stored filled quantity and does not move a terminal order back to a working status.
+- A PossResend report `FixProvider` flags as lost does not lower the stored filled quantity below the fills booked and does not move a terminal order back to a working status.
+  Any other report flagged as lost, a PossDup resend included since it replays in sequence, carries the venue's current CumQty, which the stored filled quantity follows, so later reports on that order match again.
 
 ## Market data
 
@@ -97,3 +102,4 @@ Rules callers depend on that are easy to miss in the API reference.
 - Non-table lists print as TOON `- ` items.
 - `ismet kill engage` that cannot append the halt says the halt was not recorded and to cancel at the venue directly.
 - A no-op `ismet kill engage` includes the `chain` field.
+- `ismet kill engage` checks the chain only after the halt is recorded, so a long verification never delays it.

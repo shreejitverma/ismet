@@ -339,6 +339,37 @@ async def test_a_halt_cannot_narrow_a_wider_engage_decided_while_it_read(
         await oms.abort()
 
 
+async def test_an_engage_in_flight_is_written_once_and_cannot_undo_a_release(
+    journal_path: Path, venue: SimVenue, clock: ManualClock
+) -> None:
+    """The kill loop retries an unrecorded engage. While the engage's own write is in
+    flight it must not write the engage again, or that copy can land after an
+    operator's release and halt the next start."""
+    journal = HoldingJournal(journal_path)
+    oms = manager_over(venue, journal, clock)
+    await oms.start()
+    try:
+        await venue.drain()
+        journal.hold_payload = '"desk"'
+        engage = asyncio.create_task(
+            oms.engage_kill("desk", operator="ops", cancel_open=False)
+        )
+        await until(journal.holding.is_set)
+        retry = asyncio.create_task(oms._record_kill())
+        await asyncio.sleep(0.05)
+        journal.release.set()
+        await engage
+        await retry
+        await oms.release_kill("checked", operator="ops")
+        kinds = [r.kind for r in journal.records()]
+        assert kinds.count(RecordKind.KILL_ENGAGED) == 1
+        assert not journal.kill_state().engaged
+    finally:
+        journal.release.set()
+        await oms.abort()
+        journal.close()
+
+
 # amend-sent-after-kill
 
 
@@ -371,6 +402,162 @@ async def test_an_amend_overtaken_by_a_kill_while_its_record_is_written_is_refus
     finally:
         await oms.abort()
         journal.close()
+
+
+class EngagedElsewhereDuringAppend(SqliteJournal):
+    """A real journal on which another process engages as one record is written."""
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
+        self.other = SqliteJournal(path)
+        self.engage_after: str | None = None
+
+    def append(
+        self,
+        kind: RecordKind,
+        payload: str,
+        *,
+        client_order_id: str | None = None,
+        ts: datetime | None = None,
+        unique_intent: bool = False,
+    ) -> JournalRecord:
+        record = super().append(
+            kind,
+            payload,
+            client_order_id=client_order_id,
+            ts=ts,
+            unique_intent=unique_intent,
+        )
+        if self.engage_after is not None and self.engage_after in payload:
+            self.engage_after = None
+            self.other.append(RecordKind.KILL_ENGAGED, json.dumps(DESK_KILL))
+        return record
+
+    def close(self) -> None:
+        self.other.close()
+        super().close()
+
+
+async def test_an_amend_overtaken_by_a_kill_from_another_process_is_refused(
+    journal_path: Path, venue: SimVenue, clock: ManualClock
+) -> None:
+    """``ismet kill engage`` commits while ReplaceRequested is being written."""
+    journal = EngagedElsewhereDuringAppend(journal_path)
+    oms = manager_over(venue, journal, clock)
+    await oms.start()
+    try:
+        await venue.drain()
+        await oms.submit(order("KA2", price="9.50"))
+        await venue.drain()
+        journal.engage_after = "replace_requested"
+        state = await oms.amend("KA2", quantity=D(5000))
+        assert journal.engage_after is None
+        snapshot = await venue.order_status("KA2", ACME)
+        assert snapshot is not None and snapshot.quantity == 100
+        assert state.status is S.ACCEPTED and state.quantity == 100
+        events = [e for e in events_of(journal) if e.client_order_id == "KA2"]
+        assert isinstance(events[-1], ReplaceRejected)
+        assert events[-1].code == "KILL_SWITCH"
+        assert oms.kill_state.engaged and oms.kill_state.reason == "desk"
+    finally:
+        await oms.abort()
+        journal.close()
+
+
+class ReadFailingAfterAppend(MemoryJournal):
+    fail_reads_after: str | None = None
+    fail_reads = False
+
+    def append(self, kind: RecordKind, payload: str, **kw: Any) -> JournalRecord:
+        record = super().append(kind, payload, **kw)
+        if self.fail_reads_after is not None and self.fail_reads_after in payload:
+            self.fail_reads = True
+        return record
+
+    def kill_state(self) -> KillState:
+        if self.fail_reads:
+            raise JournalError("disk gone")
+        return super().kill_state()
+
+
+async def test_an_amend_whose_kill_switch_cannot_be_read_is_refused(
+    venue: SimVenue, clock: ManualClock
+) -> None:
+    journal = ReadFailingAfterAppend()
+    oms = manager_over(venue, journal, clock)
+    await oms.start()
+    try:
+        await venue.drain()
+        await oms.submit(order("KA3", price="9.50"))
+        await venue.drain()
+        journal.fail_reads_after = "replace_requested"
+        state = await oms.amend("KA3", quantity=D(5000))
+        snapshot = await venue.order_status("KA3", ACME)
+        assert snapshot is not None and snapshot.quantity == 100
+        assert state.status is S.ACCEPTED and state.quantity == 100
+        events = [e for e in events_of(journal) if e.client_order_id == "KA3"]
+        assert isinstance(events[-1], ReplaceRejected)
+        assert events[-1].code == "JOURNAL_UNREADABLE"
+    finally:
+        journal.fail_reads = False
+        await oms.abort()
+
+
+async def test_a_release_read_during_a_local_engage_cannot_clear_it(
+    make_manager: Factory, venue: SimVenue, journal: SqliteJournal
+) -> None:
+    """Memory is engaged at a low record and another process released since. The kill
+    loop's merge is verifying that release when an operator here engages; the merge
+    must not clear memory under the engage, and no order may go out.
+    """
+    oms = make_manager(kill_poll_interval=3600)
+    await oms.start()
+    try:
+        await venue.drain()
+        await oms.engage_kill("first", operator="ops", cancel_open=False)
+        journal.append(
+            RecordKind.KILL_RELEASED, json.dumps({"reason": "clear", "operator": "ops"})
+        )
+        real_verify = oms._newer_kill
+        verifying, verify_may_finish = asyncio.Event(), asyncio.Event()
+        engage_read, engage_may_finish = asyncio.Event(), asyncio.Event()
+        real_durable = oms._durable_kill
+
+        async def stalled_verify(memory: KillState, durable: KillState) -> KillState:
+            found = await real_verify(memory, durable)
+            verifying.set()
+            await verify_may_finish.wait()
+            return found
+
+        async def stalled_read(memory: KillState) -> KillState:
+            found = await real_durable(memory)
+            engage_read.set()
+            await engage_may_finish.wait()
+            return found
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(oms, "_newer_kill", stalled_verify)
+            merge = asyncio.ensure_future(oms._merge_kill(journal.kill_state()))
+            await verifying.wait()
+            patch.setattr(oms, "_newer_kill", real_verify)
+            patch.setattr(oms, "_durable_kill", stalled_read)
+            engage = asyncio.ensure_future(
+                oms.engage_kill("desk pull", operator="desk", cancel_open=False)
+            )
+            await asyncio.sleep(0)
+            verify_may_finish.set()
+            await merge
+            assert oms.kill_state.engaged, "the merge cleared an engage in flight"
+            with pytest.raises(KillSwitchEngaged):
+                await oms.submit(order("KM1", price="9.50"))
+            assert venue.attempts["KM1"] == 0
+            await engage_read.wait()
+            engage_may_finish.set()
+            await engage
+        assert oms.kill_state.engaged and oms.kill_state.reason == "desk pull"
+        assert journal.kill_state().engaged
+    finally:
+        await oms.abort()
 
 
 # other-process-kill-not-reread-before-send
@@ -480,6 +667,27 @@ def fills_recorded(journal: SqliteJournal, cid: str) -> list[Filled]:
     ]
 
 
+def test_a_disputed_fee_never_books_an_amount_in_another_reports_currency() -> None:
+    known = fill_with_fee("1").model_copy(update={"fee": None})
+    report = fill_with_fee("1").model_copy(
+        update={"fee_currency": "EUR", "venue_order_id": "V9"}
+    )
+    state = new_order(
+        SubmitIntent(client_order_id="FE0", ts=START, request=order("FE0"))
+    )
+    for event in (
+        SendStarted(client_order_id="FE0", ts=START),
+        Acknowledged(client_order_id="FE0", ts=START, venue_order_id="V1"),
+        Filled(client_order_id="FE0", ts=START, fill=known),
+        Filled(client_order_id="FE0", ts=START, fill=report),
+    ):
+        state = apply_event(state, event)
+    booked = state.fills[0]
+    assert (booked.fee, booked.fee_currency) == (None, "USD")
+    assert booked.venue_order_id == "V9"
+    assert any("different fee" in a for a in state.anomalies)
+
+
 async def test_a_fill_re_reported_with_another_fee_is_recorded_once_and_flagged(
     make_manager: Factory, venue: SimVenue, journal: SqliteJournal, clock: ManualClock
 ) -> None:
@@ -524,8 +732,9 @@ async def test_a_fill_re_reported_with_another_fee_is_recorded_once_and_flagged(
 async def test_a_fee_dispute_that_also_names_the_currency_is_raised_once(
     make_manager: Factory, venue: SimVenue, journal: SqliteJournal
 ) -> None:
-    """The sweep's report adds the fee currency the record lacked and disputes the
-    fee. It is recorded for the detail, and a later sweep must not raise it again."""
+    """The sweep's report names a fee currency the record lacked and disputes the
+    fee. The booked fee keeps its own currency, and a later sweep must not raise the
+    dispute again."""
     anomalies: list[str] = []
     oms = make_manager(on_anomaly=lambda _cid, message: anomalies.append(message))
     await oms.start()
@@ -547,7 +756,7 @@ async def test_a_fee_dispute_that_also_names_the_currency_is_raised_once(
         await oms.reconcile()
         state = oms.order("FE2")
         assert state.fills[0].fee == booked.fee
-        assert state.fills[0].fee_currency == "USD"
+        assert state.fills[0].fee_currency is None
         assert len([a for a in anomalies if "different fee" in a]) == 1
         assert len(fills_recorded(journal, "FE2")) == 2
         await oms.reconcile()

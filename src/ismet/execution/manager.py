@@ -299,7 +299,7 @@ class OrderManager:
         self._change_requested_at: dict[str, float] = {}
         self._kill = KillState(False)
         self._kill_unrecorded: dict[str, Any] | None = None
-        self._engaging = 0  # engages reading the journal before deciding their record
+        self._engaging = 0  # engages under way, until their record is settled
         self._reconcile_blind: str | None = None
         self._last_sweep: datetime | None = None
         self._durable_sweep: datetime | None = None
@@ -317,6 +317,7 @@ class OrderManager:
         self._executor: ThreadPoolExecutor | None = None
         self._state_lock = asyncio.Lock()
         self._submit_lock = asyncio.Lock()
+        self._kill_record_lock = asyncio.Lock()
         self._recon_lock = asyncio.Lock()
         self._adjust_lock = asyncio.Lock()
         self._changed = asyncio.Condition()
@@ -835,9 +836,13 @@ class OrderManager:
         if not before.engaged:
             self._kill = KillState(True, reason, operator, before.seq, cancel_open)
             logger.critical("kill switch engaged by %s: %s", operator, reason)
-        state = await self._uncancellable(
-            self._settle_kill(before, reason, operator, cancel_open)
-        )
+        self._engaging += 1
+        try:
+            state = await self._uncancellable(
+                self._settle_kill(before, reason, operator, cancel_open)
+            )
+        finally:
+            self._engaging -= 1
         if cancel_open and self._started:
             await self.cancel_all()
         return state
@@ -851,35 +856,29 @@ class OrderManager:
         journal has not yet recorded outranks the journal, as :meth:`_merge_kill` says.
         """
         pending = self._kill_unrecorded
-        self._engaging += 1
-        try:
-            if pending is not None:
-                current = before
-            else:
-                current = await self._durable_kill(before)
-                if self._kill_unrecorded is not None or self._kill.seq > current.seq:
-                    # Another engage or a release in this process decided while we
-                    # read, so memory is newer than what we read and starts from there.
-                    current = self._kill
-            if current.engaged and (current.cancel_open or not cancel_open):
-                if pending is None:
-                    self._kill = current  # on record already, at least as wide
-                return current
-            if current.engaged:
-                logger.critical(
-                    "kill switch widened by %s: cancelling orders", operator
-                )
-                reason, operator = current.reason, current.operator
-            elif before.engaged:
-                logger.critical("kill switch engaged by %s: %s", operator, reason)
-            self._kill = KillState(True, reason, operator, current.seq, cancel_open)
-            self._kill_unrecorded = {
-                "reason": reason,
-                "operator": operator,
-                "cancel_open": cancel_open,
-            }
-        finally:
-            self._engaging -= 1
+        if pending is not None:
+            current = before
+        else:
+            current = await self._durable_kill(before)
+            if self._kill_unrecorded is not None or self._kill.seq > current.seq:
+                # Another engage or a release in this process decided while we
+                # read, so memory is newer than what we read and starts from there.
+                current = self._kill
+        if current.engaged and (current.cancel_open or not cancel_open):
+            if pending is None:
+                self._kill = current  # on record already, at least as wide
+            return current
+        if current.engaged:
+            logger.critical("kill switch widened by %s: cancelling orders", operator)
+            reason, operator = current.reason, current.operator
+        elif before.engaged:
+            logger.critical("kill switch engaged by %s: %s", operator, reason)
+        self._kill = KillState(True, reason, operator, current.seq, cancel_open)
+        self._kill_unrecorded = {
+            "reason": reason,
+            "operator": operator,
+            "cancel_open": cancel_open,
+        }
         await self._record_kill()
         return self._kill
 
@@ -900,26 +899,31 @@ class OrderManager:
             return memory
 
     async def _record_kill(self) -> None:
-        """Try to make an engaged kill durable. A restart must not lose it."""
-        payload = self._kill_unrecorded
-        if payload is None:
-            return
-        try:
-            record = await self._append(RecordKind.KILL_ENGAGED, payload)
-        except (IsmetError, OSError) as exc:
-            self._journal_failed = str(exc)
-            logger.critical("kill switch could not be journalled: %s", exc)
-            return
-        if self._kill_unrecorded is not payload:
-            return  # superseded during the write, by a wider engage or a release
-        self._kill_unrecorded = None
-        self._kill = KillState(
-            True,
-            payload["reason"],
-            payload["operator"],
-            record.seq,
-            payload["cancel_open"],
-        )
+        """Try to make an engaged kill durable. A restart must not lose it.
+
+        One write at a time, so the kill loop cannot write an engage again while the
+        engage's own write is in flight and land it after a release.
+        """
+        async with self._kill_record_lock:
+            payload = self._kill_unrecorded
+            if payload is None:
+                return
+            try:
+                record = await self._append(RecordKind.KILL_ENGAGED, payload)
+            except (IsmetError, OSError) as exc:
+                self._journal_failed = str(exc)
+                logger.critical("kill switch could not be journalled: %s", exc)
+                return
+            if self._kill_unrecorded is not payload:
+                return  # superseded during the write, by a wider engage or a release
+            self._kill_unrecorded = None
+            self._kill = KillState(
+                True,
+                payload["reason"],
+                payload["operator"],
+                record.seq,
+                payload["cancel_open"],
+            )
 
     async def release_kill(self, reason: str, *, operator: str) -> KillState:
         """Allow new orders again. Requires a named operator; journalled."""
@@ -950,6 +954,8 @@ class OrderManager:
             return  # an engage under way reads this release itself, and re-engages
         memory = self._kill
         newer = await self._newer_kill(memory, durable)
+        if self._engaging and not newer.engaged:
+            return  # an engage started during the verify; it decides from the journal
         unchanged = self._kill is memory and self._kill_unrecorded is None
         if newer is not memory and unchanged:
             self._kill = newer
@@ -1520,16 +1526,19 @@ class OrderManager:
             )
         if state.status is not OrderStatus.PENDING_REPLACE:
             return state  # a cancel or a last fill won while the record was written
+        # Engaged while the record was written, here or by another process; the venue
+        # has not seen the change. A kill switch that cannot be read refuses too.
+        try:
+            durable = await self._call_journal(self._journal.kill_state)
+            await self._merge_kill(durable)
+        except asyncio.CancelledError:
+            await self._refuse_amend(client_order_id, "CANCELED_BEFORE_SEND")
+            raise
+        except Exception as exc:
+            logger.critical("kill switch unreadable before the amend: %s", exc)
+            return await self._refuse_amend(client_order_id, "JOURNAL_UNREADABLE")
         if self._kill.engaged:
-            # Engaged while the record was written; the venue has not seen the change.
-            return await self._record(
-                ReplaceRejected(
-                    client_order_id=client_order_id,
-                    ts=self._clock.now(),
-                    reason="stopped before the amendment was sent",
-                    code="KILL_SWITCH",
-                )
-            )
+            return await self._refuse_amend(client_order_id, "KILL_SWITCH")
         try:
             await self._venue.amend_order(
                 client_order_id, symbol, quantity=quantity, limit_price=limit_price
@@ -1547,6 +1556,16 @@ class OrderManager:
         except Exception as exc:
             return await self._mark_unknown(client_order_id, f"amend: {exc!r}")
         return self.order(client_order_id)
+
+    async def _refuse_amend(self, cid: str, code: str) -> OrderState:
+        return await self._record(
+            ReplaceRejected(
+                client_order_id=cid,
+                ts=self._clock.now(),
+                reason="stopped before the amendment was sent",
+                code=code,
+            )
+        )
 
     def _amended_request(
         self,

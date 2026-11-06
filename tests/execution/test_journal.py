@@ -8,6 +8,7 @@ import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -294,6 +295,46 @@ def test_an_intact_anchor_ahead_of_this_append_stays_quiet(
     text = journal.anchor_path.read_text(encoding="ascii")
     assert text.startswith(f"{second.seq} ")
     assert journal.verify().ok
+    journal.close()
+
+
+class FailingAnchorCommit:
+    """A connection whose next ``fail_commits`` COMMITs fail, as a full disk can make
+    them fail; everything else goes to the real connection."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+        self.fail_commits = 0
+
+    def execute(self, sql: str, *args: Any) -> sqlite3.Cursor:
+        if sql == "COMMIT" and self.fail_commits:
+            self.fail_commits -= 1
+            raise sqlite3.OperationalError("disk I/O error")
+        return self._conn.execute(sql, *args)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conn, name)
+
+
+def test_a_failed_anchor_commit_does_not_block_the_next_append(tmp_path: Path) -> None:
+    journal = SqliteJournal(tmp_path / "j.db")
+    journal.append(RecordKind.ANOMALY, '{"n": 1}', ts=TS)
+    wrapped = FailingAnchorCommit(journal._conn)
+    journal._conn = wrapped  # type: ignore[assignment]
+    write_anchor = journal._write_anchor
+
+    def failing_anchor(seq: int, digest: str) -> None:
+        wrapped.fail_commits = 1
+        write_anchor(seq, digest)
+
+    journal._write_anchor = failing_anchor  # type: ignore[method-assign]
+    second = journal.append(RecordKind.ANOMALY, '{"n": 2}', ts=TS)
+    journal._write_anchor = write_anchor  # type: ignore[method-assign]
+    third = journal.append(RecordKind.ANOMALY, '{"n": 3}', ts=TS)
+    assert (second.seq, third.seq) == (2, 3)
+    assert [r.seq for r in journal.records()] == [1, 2, 3]
+    assert journal.verify().ok
+    journal._conn = wrapped._conn
     journal.close()
 
 

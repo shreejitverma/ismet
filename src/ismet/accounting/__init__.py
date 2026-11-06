@@ -18,7 +18,7 @@ from decimal import Decimal
 from enum import Enum
 
 from ismet.errors import ValidationError
-from ismet.execution.state import merged_fill, same_execution
+from ismet.execution.state import fees_differ, merged_fill, same_execution
 from ismet.models.decimals import absolute, add, mul, ratio, sub
 from ismet.models.orders import Fill, OrderSide
 from ismet.models.symbol import Symbol
@@ -175,7 +175,7 @@ class PositionLedger:
                 f"fill {report.fill_id} on {report.client_order_id} was re-reported "
                 "with different terms"
             )
-        if _fees_differ(known, report):
+        if fees_differ(known, report):
             raise ValidationError(
                 f"fill {report.fill_id} on {report.client_order_id} was re-reported "
                 f"with a different fee: {known.fee} {known.fee_currency} then "
@@ -208,18 +208,6 @@ class PositionLedger:
 def _check_fee_has_currency(fill: Fill) -> None:
     if fill.fee is not None and fill.fee != 0 and fill.fee_currency is None:
         raise ValidationError(f"fill {fill.fill_id} has a fee with no currency")
-
-
-def _fees_differ(known: Fill, report: Fill) -> bool:
-    amounts_differ = (
-        known.fee is not None and report.fee is not None and known.fee != report.fee
-    )
-    currencies_differ = (
-        known.fee_currency is not None
-        and report.fee_currency is not None
-        and known.fee_currency != report.fee_currency
-    )
-    return amounts_differ or currencies_differ
 
 
 def build_ledger(

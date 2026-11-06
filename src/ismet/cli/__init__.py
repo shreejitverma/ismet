@@ -698,12 +698,9 @@ def _kill(args: argparse.Namespace) -> int:
     else:
         journal = _existing_journal(args.journal)
     try:
+        # Engaging reports the chain only after the halt is durable: the evidence of a
+        # broken chain survives the append, so `kill release` still refuses on it.
         chain = None if args.action == "engage" else journal.verify()
-        # Engaging reports the chain but never waits on it: the evidence of a broken
-        # chain survives the append, so `kill release` still refuses on it.
-        chain_text = (
-            _lenient_chain_text(journal) if chain is None else _chain_text(chain)
-        )
         if args.action == "release" and chain is not None:
             _require_intact(chain, "kill switch not released")
         state = journal.kill_state()
@@ -714,7 +711,7 @@ def _kill(args: argparse.Namespace) -> int:
                     {
                         "kill": "already engaged (no-op)",
                         "reason": state.reason,
-                        "chain": chain_text,
+                        "chain": _lenient_chain_text(journal),
                     }
                 )
                 return EXIT_OK
@@ -753,7 +750,11 @@ def _kill(args: argparse.Namespace) -> int:
                 "reason": state.reason or "none",
                 "operator": state.operator or "none",
                 "cancel_open": state.cancel_open,
-                "chain": chain_text,
+                "chain": (
+                    _lenient_chain_text(journal)
+                    if chain is None
+                    else _chain_text(chain)
+                ),
             }
         )
         return EXIT_OK if chain is None or chain.ok else EXIT_FAILED

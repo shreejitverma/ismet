@@ -219,6 +219,7 @@ _TAG_SYMBOL = 55
 _TAG_TEXT = 58
 _TAG_TIME_IN_FORCE = 59
 _TAG_TRANSACT_TIME = 60
+_TAG_POSS_RESEND = 97
 _TAG_STOP_PX = 99
 _TAG_CXL_REJ_REASON = 102
 _TAG_ORD_REJ_REASON = 103
@@ -943,13 +944,17 @@ class FixProvider(Provider):
             events = [e for e in events if isinstance(e, Filled)]
             lost_report = self._quarantine_row(message, lost)
         updated = self._updated_record(record, message, wire_id, fill, bust)
-        if lost is not None and record is not None and updated is not None:
-            # A lost report is quarantined and still halts. It must not walk the
-            # stored order backwards: a later PossResend of an older report would
-            # otherwise lower filled and could reopen a terminal order.
+        resent = message.get(_TAG_POSS_RESEND) == "Y"
+        if lost is not None and resent and record is not None and updated is not None:
+            # A late PossResend of an older report is quarantined and still halts. It
+            # must not walk the stored order backwards: it would otherwise lower
+            # filled below the fills booked and could reopen a terminal order. Any
+            # other lost report, a PossDup resend included since it replays in
+            # sequence, carries the venue's current total, which filled follows.
             preserved: dict[str, object] = {}
-            if updated.filled < record.filled:
-                preserved["filled"] = record.filled
+            booked = record.filled + (fill.quantity if fill is not None else Decimal(0))
+            if updated.filled < booked:
+                preserved["filled"] = booked
             if record.status.is_terminal and not updated.status.is_terminal:
                 preserved["status"] = record.status
             if preserved:

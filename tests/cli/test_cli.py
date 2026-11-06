@@ -947,6 +947,33 @@ def test_kill_engage_says_when_the_halt_was_not_recorded(
     assert "tampered" not in out
 
 
+def test_kill_engage_records_the_halt_before_it_reads_the_chain(
+    capsys, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "j.db"
+    journal = SqliteJournal(path)
+    journal.append(RecordKind.ANOMALY, "{}")
+    journal.close()
+    calls: list[str] = []
+    real_append = SqliteJournal.append
+    real_verify = SqliteJournal.verify
+
+    def append(self: SqliteJournal, kind: RecordKind, *args: Any, **kwargs: Any) -> Any:
+        calls.append(f"append {kind.value}")
+        return real_append(self, kind, *args, **kwargs)
+
+    def verify(self: SqliteJournal) -> Any:
+        calls.append("verify")
+        return real_verify(self)
+
+    monkeypatch.setattr(SqliteJournal, "append", append)
+    monkeypatch.setattr(SqliteJournal, "verify", verify)
+    code, out = run(capsys, "kill", "engage", "--journal", str(path), *WHO)
+    assert code == 0 and "kill: engaged" in out and "chain:" in out
+    assert calls[0] == f"append {RecordKind.KILL_ENGAGED.value}"
+    assert "verify" in calls
+
+
 def test_a_no_op_engage_on_a_broken_chain_reports_the_chain(
     capsys, tmp_path: Path
 ) -> None:

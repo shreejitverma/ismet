@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from typing import ClassVar
 
 import pytest
 
@@ -177,6 +178,37 @@ class BarsOffTheInterval(MockProvider):
         ]
 
 
+# 09:30 and 13:30 New York on the Friday and Monday around the US change to daylight
+# time on 2026-03-08: EST is UTC-5 and EDT is UTC-4.
+DST_GRID = [
+    datetime(2026, 3, 6, 14, 30, tzinfo=UTC),
+    datetime(2026, 3, 6, 18, 30, tzinfo=UTC),
+    datetime(2026, 3, 9, 13, 30, tzinfo=UTC),
+    datetime(2026, 3, 9, 17, 30, tzinfo=UTC),
+]
+
+
+class LocalGridAcrossDst(MockProvider):
+    name = "local-grid"
+    stamps: ClassVar[list[datetime]] = DST_GRID
+
+    async def bars(self, symbol, interval, start, end):  # type: ignore[no-untyped-def]
+        hour = await super().bars(symbol, Interval.M1, end - timedelta(hours=1), end)
+        template = hour[0]
+        return [
+            template.model_copy(update={"exchange_ts": ts, "interval": interval})
+            for ts in self.stamps
+        ]
+
+
+class OffGridByHalfAnHour(LocalGridAcrossDst):
+    name = "half-hour-off"
+    stamps: ClassVar[list[datetime]] = [
+        *DST_GRID[:3],
+        DST_GRID[3] + timedelta(minutes=30),
+    ]
+
+
 class InstrumentForAnotherSymbol(MockProvider):
     name = "wrong-instrument"
 
@@ -252,6 +284,19 @@ async def test_a_wrong_provider_fails_exactly_the_check_that_covers_it(
     report = await run_conformance(wrong(tick_interval=0), symbol=sym)
     assert {check.name for check in report.failures} == failing, report.summary()
     assert all(named in check.detail for check in report.failures), report.summary()
+
+
+async def test_four_hour_bars_on_a_local_grid_pass_across_a_dst_change(
+    sym: Symbol,
+) -> None:
+    lookback = datetime.now(UTC) - datetime(2026, 3, 1, tzinfo=UTC)
+    options = {"symbol": sym, "interval": Interval.H4, "lookback": lookback}
+    report = await run_conformance(LocalGridAcrossDst(tick_interval=0), **options)
+    bars = next(c for c in report.checks if c.name == "bars_invariants")
+    assert bars.passed, bars.detail
+    report = await run_conformance(OffGridByHalfAnHour(tick_interval=0), **options)
+    bars = next(c for c in report.checks if c.name == "bars_invariants")
+    assert not bars.passed and "not a whole number of 4h" in bars.detail
 
 
 async def test_a_book_of_exactly_the_asked_depth_passes(sym: Symbol) -> None:

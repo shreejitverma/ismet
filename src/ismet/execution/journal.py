@@ -21,6 +21,7 @@ on every OS.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -512,6 +513,8 @@ class SqliteJournal:
                 self._conn.execute("COMMIT")
             except sqlite3.Error as exc:
                 logger.warning("could not release the journal anchor lock: %s", exc)
+                with contextlib.suppress(sqlite3.Error):
+                    self._conn.execute("ROLLBACK")
 
     def _read_anchor(self) -> tuple[int, str] | None:
         try:

@@ -339,19 +339,23 @@ def same_execution(a: Fill, b: Fill) -> bool:
 
 
 def merged_fill(known: Fill, report: Fill) -> Fill:
-    """Fill in what ``known`` lacks, without overwriting anything it already has."""
-    return known.model_copy(
-        update={
-            "fee": known.fee if known.fee is not None else report.fee,
-            "fee_currency": known.fee_currency or report.fee_currency,
-            "venue_order_id": known.venue_order_id or report.venue_order_id,
-            "liquidity": (
-                known.liquidity
-                if known.liquidity is not Liquidity.UNKNOWN
-                else report.liquidity
-            ),
-        }
-    )
+    """Fill in what ``known`` lacks, without overwriting anything it already has.
+
+    A disputed fee keeps ``known``'s amount and currency together, so the merge never
+    books a pair neither report stated.
+    """
+    update: dict[str, object] = {
+        "venue_order_id": known.venue_order_id or report.venue_order_id,
+        "liquidity": (
+            known.liquidity
+            if known.liquidity is not Liquidity.UNKNOWN
+            else report.liquidity
+        ),
+    }
+    if not fees_differ(known, report):
+        update["fee"] = known.fee if known.fee is not None else report.fee
+        update["fee_currency"] = known.fee_currency or report.fee_currency
+    return known.model_copy(update=update)
 
 
 def _apply_bust(state: OrderState, event: FillBusted) -> OrderState:

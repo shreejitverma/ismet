@@ -2631,11 +2631,35 @@ class TestALostFillSeenInCumQty:
         rows = await provider.quarantined()
         assert [(q.msg_type, q.halted) for q in rows] == [("8", True)]
         assert "CumQty" in rows[0].reason
-        # The lost report's CumQty is 10. Stored filled stays at the fills already
-        # booked: a lost report must not lower it.
-        assert (await provider.open_orders())[0].filled_quantity == Decimal(40)
+        # The venue's CumQty(14) is 10 after the bust it never reported. This report
+        # is no PossResend, so it is the venue's current total, and stored filled
+        # follows it rather than the 50 booked from the reports received.
+        assert (await provider.open_orders())[0].filled_quantity == Decimal(10)
         with pytest.raises(ReportQuarantinedError):
             await provider.place_order(order("C2"))
+
+    async def test_a_report_after_a_lost_bust_matches_the_venue_again(
+        self, acceptor: FixAcceptor, make_provider: ProviderFactory
+    ) -> None:
+        provider = await make_provider()
+        stream = Stream(provider)
+        await provider.place_order(order())
+        await acceptor.fill("C1", "40", "5")
+        await eventually(lambda: bool(stream.of(Filled)))
+        acceptor.orders["C1"].filled = Decimal(0)
+        acceptor.faults.skip_seq_next = 1
+        await acceptor.fill("C1", "10", "5")
+        await eventually(lambda: isinstance(stream.error, ReportQuarantinedError))
+        assert len(await provider.quarantined()) == 1
+        await provider.release_quarantine(
+            operator="op", reason="bust checked", expected=1
+        )
+        after = Stream(provider)
+        await acceptor.exec_report("C1", "4", "4")
+        await eventually(lambda: bool(after.of(Canceled)))
+        assert after.error is None
+        assert len(await provider.quarantined()) == 1
+        await after.close()
 
     async def test_a_late_poss_resend_does_not_lower_filled_or_reopen(
         self, acceptor: FixAcceptor, make_provider: ProviderFactory
@@ -2663,6 +2687,7 @@ class TestALostFillSeenInCumQty:
             if len(await provider.quarantined()) >= 2:
                 break
             await asyncio.sleep(0.01)
+        assert len(await provider.quarantined()) == 2
 
         record = await provider._lookup("C1")
         assert record is not None
