@@ -11,7 +11,7 @@ from ismet.providers.mock import MockProvider
 
 class Custom(Provider):
     name = "custom"
-    venues = frozenset({"xtst"})
+    venues = frozenset({"xfra"})
 
 
 def test_register_and_get() -> None:
@@ -22,7 +22,7 @@ def test_register_and_get() -> None:
     assert reg.get("alias") is MockProvider
     assert reg.names() == ["alias", "custom"]
     assert "custom" in reg and "nope" not in reg and 3 not in reg
-    assert Custom.venues == frozenset({"XTST"})
+    assert Custom.venues == frozenset({"XFRA"})
     with pytest.raises(ConfigError, match="unknown provider"):
         reg.get("nope")
 

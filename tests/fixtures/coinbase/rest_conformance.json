@@ -1,0 +1,66 @@
+{
+ "recorded_at": "2026-11-01T02:08:38.324382Z",
+ "exchanges": [
+  {
+   "method": "GET",
+   "url": "https://api.exchange.coinbase.com/products/BTC-USD",
+   "status": 200,
+   "headers": {
+    "date": "Sun, 01 Nov 2026 02:08:38 GMT",
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "public, max-age=5, must-revalidate",
+    "age": "3"
+   },
+   "body": "{\"id\":\"BTC-USD\",\"base_currency\":\"BTC\",\"quote_currency\":\"USD\",\"quote_increment\":\"0.01\",\"base_increment\":\"0.00000001\",\"display_name\":\"BTC-USD\",\"min_market_funds\":\"1\",\"margin_enabled\":false,\"post_only\":false,\"limit_only\":false,\"cancel_only\":false,\"status\":\"online\",\"status_message\":\"\",\"trading_disabled\":false,\"fx_stablecoin\":false,\"max_slippage_percentage\":\"0.02000000\",\"auction_mode\":false,\"high_bid_limit_percentage\":\"\"}"
+  },
+  {
+   "method": "GET",
+   "url": "https://api.exchange.coinbase.com/products",
+   "status": 200,
+   "headers": {
+    "date": "Sun, 01 Nov 2026 02:08:38 GMT",
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "public, max-age=5, must-revalidate",
+    "age": "3"
+   },
+   "body": "[{\"id\":\"ETH-USD\",\"base_currency\":\"ETH\",\"quote_currency\":\"USD\",\"quote_increment\":\"0.01\",\"base_increment\":\"0.00000001\",\"display_name\":\"ETH-USD\",\"min_market_funds\":\"1\",\"margin_enabled\":false,\"post_only\":false,\"limit_only\":false,\"cancel_only\":false,\"status\":\"online\",\"status_message\":\"\",\"trading_disabled\":false,\"fx_stablecoin\":false,\"max_slippage_percentage\":\"0.02000000\",\"auction_mode\":false,\"high_bid_limit_percentage\":\"\"},{\"id\":\"BTC-USD\",\"base_currency\":\"BTC\",\"quote_currency\":\"USD\",\"quote_increment\":\"0.01\",\"base_increment\":\"0.00000001\",\"display_name\":\"BTC-USD\",\"min_market_funds\":\"1\",\"margin_enabled\":false,\"post_only\":false,\"limit_only\":false,\"cancel_only\":false,\"status\":\"online\",\"status_message\":\"\",\"trading_disabled\":false,\"fx_stablecoin\":false,\"max_slippage_percentage\":\"0.02000000\",\"auction_mode\":false,\"high_bid_limit_percentage\":\"\"},{\"id\":\"BTC-INR\",\"base_currency\":\"BTC\",\"quote_currency\":\"INR\",\"quote_increment\":\"1\",\"base_increment\":\"0.00000001\",\"display_name\":\"BTC/INR\",\"min_market_funds\":\"1\",\"margin_enabled\":false,\"post_only\":false,\"limit_only\":true,\"cancel_only\":false,\"status\":\"online\",\"status_message\":\"\",\"trading_disabled\":false,\"fx_stablecoin\":false,\"max_slippage_percentage\":\"0.03000000\",\"auction_mode\":false,\"high_bid_limit_percentage\":\"\"},{\"id\":\"ETH-BTC\",\"base_currency\":\"ETH\",\"quote_currency\":\"BTC\",\"quote_increment\":\"0.000001\",\"base_increment\":\"0.00000001\",\"display_name\":\"ETH-BTC\",\"min_market_funds\":\"0.00001\",\"margin_enabled\":false,\"post_only\":false,\"limit_only\":false,\"cancel_only\":false,\"status\":\"online\",\"status_message\":\"\",\"trading_disabled\":false,\"fx_stablecoin\":false,\"max_slippage_percentage\":\"0.03000000\",\"auction_mode\":false,\"high_bid_limit_percentage\":\"\"},{\"id\":\"T-USD\",\"base_currency\":\"T\",\"quote_currency\":\"USD\",\"quote_increment\":\"0.0000001\",\"base_increment\":\"1\",\"display_name\":\"T-USD\",\"min_market_funds\":\"1\",\"margin_enabled\":false,\"post_only\":false,\"limit_only\":false,\"cancel_only\":false,\"status\":\"online\",\"status_message\":\"\",\"trading_disabled\":false,\"fx_stablecoin\":false,\"max_slippage_percentage\":\"0.03000000\",\"auction_mode\":false,\"high_bid_limit_percentage\":\"\"},{\"id\":\"ZRX-BTC\",\"base_currency\":\"ZRX\",\"quote_currency\":\"BTC\",\"quote_increment\":\"0.00000001\",\"base_increment\":\"0.00001\",\"display_name\":\"ZRX-BTC\",\"min_market_funds\":\"0.000016\",\"margin_enabled\":false,\"post_only\":false,\"limit_only\":false,\"cancel_only\":false,\"status\":\"delisted\",\"status_message\":\"\",\"trading_disabled\":true,\"fx_stablecoin\":false,\"max_slippage_percentage\":\"0.03000000\",\"auction_mode\":false,\"high_bid_limit_percentage\":\"\"}]",
+   "note": "products filtered to 6 of 845 by recorder"
+  },
+  {
+   "method": "GET",
+   "url": "https://api.exchange.coinbase.com/products/BTC-USD/book?level=1",
+   "status": 200,
+   "headers": {
+    "date": "Sun, 01 Nov 2026 02:08:38 GMT",
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "public, max-age=2, must-revalidate",
+    "age": "0"
+   },
+   "body": "{\"bids\":[[\"77567.27\",\"0.32209354\",10]],\"asks\":[[\"77567.28\",\"0.09374755\",3]],\"sequence\":138612770502,\"auction_mode\":false,\"auction\":null,\"time\":\"2026-11-01T02:08:37.562520056Z\"}"
+  },
+  {
+   "method": "GET",
+   "url": "https://api.exchange.coinbase.com/products/BTC-USD/book?level=2",
+   "status": 200,
+   "headers": {
+    "date": "Sun, 01 Nov 2026 02:08:38 GMT",
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "public, max-age=2, must-revalidate"
+   },
+   "body": "{\"bids\":[[\"77567.27\",\"0.32209349\",10],[\"77565.75\",\"0.04\",1],[\"77565.74\",\"0.10380257\",1],[\"77565.72\",\"0.10293226\",1],[\"77565.71\",\"0.02578458\",2],[\"77565.33\",\"0.00515681\",1],[\"77565.32\",\"0.01288813\",1],[\"77563.5\",\"0.00643546\",1],[\"77563.24\",\"0.11574323\",2],[\"77563.23\",\"0.10293226\",1]],\"asks\":[[\"77567.28\",\"0.07379148\",1],[\"77568.84\",\"0.02578354\",2],[\"77570.32\",\"0.0420012\",1],[\"77571.49\",\"0.0420012\",1],[\"77574.88\",\"0.23253646\",1],[\"77574.89\",\"0.28190658\",1],[\"77574.91\",\"0.10293226\",1],[\"77574.97\",\"0.00466946\",1],[\"77577.29\",\"0.19044274\",1],[\"77577.3\",\"0.10293226\",1]],\"sequence\":138612770732,\"auction_mode\":false,\"auction\":null,\"time\":\"2026-11-01T02:08:38.373108379Z\"}",
+   "note": "cut to the best 10 of (18736, 21670) levels by recorder"
+  },
+  {
+   "method": "GET",
+   "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=60&start=2026-11-01T01%3A38%3A00Z&end=2026-11-01T02%3A07%3A00Z",
+   "status": 200,
+   "headers": {
+    "date": "Sun, 01 Nov 2026 02:08:39 GMT",
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "public, max-age=300, must-revalidate",
+    "age": "35"
+   },
+   "body": "[[1793498820,77612.65,77635.71,77635.7,77616.97,0.65184405],[1793498760,77633.2,77665.93,77665.92,77635.7,2.29284229],[1793498700,77665.92,77702.87,77702.87,77665.92,1.28611039],[1793498640,77673.69,77747.48,77673.69,77702.87,7.0143946],[1793498580,77633.17,77687.43,77633.18,77668.33,3.72185304],[1793498520,77606.96,77633.19,77606.96,77633.18,0.28013046],[1793498460,77589.61,77609.05,77589.62,77606.96,1.39684618],[1793498400,77582.99,77590,77586.1,77589.61,0.94925249],[1793498340,77570.88,77589.2,77570.88,77586.09,0.12958156],[1793498280,77561.6,77571.69,77561.61,77570.88,0.25998413],[1793498220,77555.67,77561.61,77560.86,77561.6,0.12606155],[1793498160,77551.7,77563.24,77563.24,77560.85,0.29149494],[1793498100,77535.19,77565.83,77542.06,77563.23,0.7064397],[1793498040,77513.8,77551.55,77520,77539.44,2.26557389],[1793497980,77520,77540.01,77540,77520,1.15013481],[1793497920,77540,77573.51,77573.5,77540,0.90817548],[1793497860,77569.42,77583.79,77583.78,77573.5,0.61591864],[1793497800,77571.77,77583.79,77571.77,77583.78,0.17571866],[1793497740,77571.76,77573.95,77571.77,77571.77,0.11098667],[1793497680,77560,77574.54,77566.09,77571.76,0.43021004],[1793497620,77560.18,77580.8,77569.5,77566.08,2.21099174],[1793497560,77566.17,77580.8,77580.79,77568.01,1.2209725],[1793497500,77580.79,77613.22,77613.21,77580.8,0.42841878],[1793497440,77611.27,77635.13,77635.13,77613.22,0.31358079],[1793497380,77617.13,77635.91,77617.14,77635.12,1.23734283],[1793497320,77600.08,77622.82,77600.09,77617.14,1.66827756],[1793497260,77592.11,77600.09,77594.03,77600.08,2.55765485],[1793497200,77592.45,77612.54,77612.53,77592.45,0.39856671],[1793497140,77592.11,77612.54,77592.12,77612.54,0.64588781],[1793497080,77585.72,77600.33,77600.32,77592.11,0.06476299]]"
+  }
+ ]
+}

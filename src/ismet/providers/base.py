@@ -6,7 +6,8 @@ from typing import ClassVar
 
 from ismet.capabilities import Capability, capabilities_of
 from ismet.config import ProviderSettings
-from ismet.errors import NotSupported
+from ismet.errors import ConfigError, NotSupported
+from ismet.models.orders import Environment
 from ismet.transport.clock import SYSTEM_CLOCK, Clock
 
 
@@ -16,10 +17,20 @@ class Provider:
     A provider is who gives you access; a venue (MIC) is where instruments
     trade. ``venues`` lists the MICs this provider can serve. Capabilities are
     discovered structurally from the protocols the subclass implements.
+
+    ``environment`` says where this instance's orders go. It defaults to ``LIVE``
+    because a forgotten declaration must fail safe: the order manager refuses a live
+    provider without an explicit acknowledgement.
+
+    ``gates_streams`` says the adapter's streams already drop repeats and set
+    ``AFTER_GAP`` and ``OUT_OF_ORDER`` by its venue's own numbering rule. Otherwise the
+    client treats ``sequence`` as rising by one per event on each symbol.
     """
 
     name: ClassVar[str]
     venues: ClassVar[frozenset[str]] = frozenset()
+    environment: Environment = Environment.LIVE
+    gates_streams: ClassVar[bool] = False
 
     def __init__(self, *, clock: Clock = SYSTEM_CLOCK) -> None:
         self.clock = clock
@@ -68,4 +79,17 @@ class Provider:
         )
 
 
-__all__ = ["Provider"]
+def max_reconnects_option(settings: ProviderSettings) -> int | None:
+    """The ``ws_max_reconnects`` option: a count of zero or more, ``None`` if unset."""
+    value = settings.option("ws_max_reconnects")
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ConfigError(
+            f"provider {settings.name}: ws_max_reconnects must be a count of zero or "
+            f"more, got {value!r}"
+        )
+    return value
+
+
+__all__ = ["Provider", "max_reconnects_option"]

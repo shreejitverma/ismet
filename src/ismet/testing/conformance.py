@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import TypeVar, cast
 
+from ismet import _aio
 from ismet.capabilities import (
     PROTOCOLS,
     Capability,
@@ -24,18 +26,32 @@ from ismet.capabilities import (
     StreamingCapability,
 )
 from ismet.errors import NotSupported
-from ismet.models import Bar, Instrument, Interval, MarketEvent, Symbol
+from ismet.models import Bar, BookState, Instrument, Interval, MarketEvent, Symbol
 from ismet.providers import Provider
 
 T = TypeVar("T")
 
+MAX_PLAUSIBLE_CLOCK_SKEW = timedelta(seconds=5)
+"""A venue clock this far ahead points at a broken timestamp, not ordinary skew."""
+
+MIN_PLAUSIBLE_EXCHANGE_TS = datetime(2000, 1, 1, tzinfo=timezone.utc)
+"""An earlier ``exchange_ts`` is a zero or a wrong unit, not an old market event.
+
+Fixed rather than relative to ``received_ts``, because replayed recordings grow old."""
+
+BOOK_DEPTH = 5
+"""Levels per side asked of ``order_book``."""
+
 
 @dataclass(frozen=True)
 class Check:
+    """One result. A ``skipped`` check could not run and passes by default."""
+
     capability: Capability | None
     name: str
     passed: bool
     detail: str = ""
+    skipped: bool = False
 
 
 @dataclass
@@ -52,23 +68,35 @@ class ConformanceReport:
     def failures(self) -> list[Check]:
         return [c for c in self.checks if not c.passed]
 
+    @property
+    def skipped(self) -> list[Check]:
+        return [c for c in self.checks if c.skipped]
+
     def summary(self) -> str:
         lines = [f"{self.provider}: {'PASS' if self.passed else 'FAIL'}"]
         for c in self.checks:
             scope = c.capability.value if c.capability else "core"
-            mark = "ok " if c.passed else "FAIL"
+            mark = "skip" if c.skipped else "ok " if c.passed else "FAIL"
             lines.append(
                 f"  [{mark}] {scope}.{c.name}" + (f": {c.detail}" if c.detail else "")
             )
         return "\n".join(lines)
 
 
-def _event_invariants(event: MarketEvent, instrument: Instrument | None) -> list[str]:
+def _event_invariants(
+    event: MarketEvent, symbol: Symbol, instrument: Instrument | None
+) -> list[str]:
     problems: list[str] = []
+    if event.symbol != symbol:
+        problems.append(f"answered for {event.symbol}, asked for {symbol}")
     if event.exchange_ts.tzinfo is None or event.received_ts.tzinfo is None:
         problems.append("naive timestamp")
-    if event.exchange_ts > event.received_ts:
-        problems.append("exchange_ts after received_ts")
+    if event.clock_skew > MAX_PLAUSIBLE_CLOCK_SKEW:
+        problems.append(f"exchange_ts ahead of received_ts by {event.clock_skew}")
+    if event.exchange_ts < MIN_PLAUSIBLE_EXCHANGE_TS:
+        problems.append(
+            f"exchange_ts {event.exchange_ts.isoformat()} is implausibly old"
+        )
     if instrument is not None:
         for name in ("bid", "ask", "last", "price", "open", "high", "low", "close"):
             value = getattr(event, name, None)
@@ -146,6 +174,16 @@ async def run_conformance(
                     f"ccy={instrument.currency}",
                 )
             )
+            add(
+                Check(
+                    Capability.REFERENCE_DATA,
+                    "instrument_symbol",
+                    instrument.symbol == symbol,
+                    f"answered for {instrument.symbol}, asked for {symbol}"
+                    if instrument.symbol != symbol
+                    else "",
+                )
+            )
         query = search_query or symbol.ticker
         results = await _timed(
             report,
@@ -174,8 +212,8 @@ async def run_conformance(
             timeout=timeout,
         )
         if quote is not None:
-            problems = _event_invariants(quote, instrument)
-            if quote.bid is None and quote.ask is None and quote.last is None:
+            problems = _event_invariants(quote, symbol, instrument)
+            if quote.book_state is BookState.EMPTY and quote.last is None:
                 problems.append("quote has no bid, ask, or last")
             add(
                 Check(
@@ -189,11 +227,16 @@ async def run_conformance(
             report,
             cap_=Capability.MARKET_DATA,
             name="order_book",
-            fn=lambda: md.order_book(symbol, 5),
+            fn=lambda: md.order_book(symbol, BOOK_DEPTH),
             timeout=timeout,
         )
         if book is not None:
-            problems = _event_invariants(book, instrument)
+            problems = _event_invariants(book, symbol, instrument)
+            for side, levels in (("bid", book.bids), ("ask", book.asks)):
+                if len(levels) > BOOK_DEPTH:
+                    problems.append(
+                        f"{len(levels)} {side} levels, asked for {BOOK_DEPTH}"
+                    )
             if instrument is not None:
                 for lvl in (*book.bids, *book.asks):
                     if not instrument.is_tick_aligned(lvl.price):
@@ -220,7 +263,7 @@ async def run_conformance(
             timeout=timeout,
         )
         if bars is not None:
-            problems = _bars_invariants(bars, instrument, start, end)
+            problems = _bars_invariants(bars, symbol, interval, instrument, start, end)
             add(
                 Check(
                     Capability.HISTORICAL,
@@ -237,6 +280,7 @@ async def run_conformance(
             await _check_stream(
                 "stream_quotes",
                 st.stream_quotes([symbol]),
+                symbol,
                 instrument,
                 stream_messages,
                 timeout,
@@ -246,6 +290,7 @@ async def run_conformance(
             await _check_stream(
                 "stream_trades",
                 st.stream_trades([symbol]),
+                symbol,
                 instrument,
                 stream_messages,
                 timeout,
@@ -258,6 +303,7 @@ async def run_conformance(
 async def _check_stream(
     name: str,
     stream: AsyncIterator[MarketEvent],
+    symbol: Symbol,
     instrument: Instrument | None,
     wanted: int,
     timeout: float,
@@ -277,7 +323,7 @@ async def _check_stream(
                     await aclose()
 
     try:
-        await asyncio.wait_for(drain(), timeout)
+        await _aio.wait_for(drain(), timeout)
     except asyncio.TimeoutError:
         return Check(
             Capability.STREAMING,
@@ -287,7 +333,10 @@ async def _check_stream(
         )
     except Exception as exc:
         return Check(Capability.STREAMING, name, False, f"{type(exc).__name__}: {exc}")
-    problems = [p for e in received for p in _event_invariants(e, instrument)]
+    problems = [p for e in received for p in _event_invariants(e, symbol, instrument)]
+    if len(received) < wanted:
+        # A stream that ends on its own has not shown it delivers.
+        problems.append(f"stream ended after {len(received)} of {wanted} messages")
     seqs = [e.sequence for e in received if e.sequence is not None]
     if seqs and seqs != sorted(seqs):
         problems.append("sequence numbers not monotonic")
@@ -298,7 +347,12 @@ async def _check_stream(
 
 
 def _bars_invariants(
-    bars: list[Bar], instrument: Instrument | None, start: datetime, end: datetime
+    bars: list[Bar],
+    symbol: Symbol,
+    interval: Interval,
+    instrument: Instrument | None,
+    start: datetime,
+    end: datetime,
 ) -> list[str]:
     problems: list[str] = []
     if not bars:
@@ -310,8 +364,28 @@ def _bars_invariants(
         problems.append("duplicate bar timestamps")
     if stamps[0] < start or stamps[-1] >= end:
         problems.append("bars outside [start, end)")
+    step = interval.seconds
+    if step is not None:
+        # Gaps may span closed hours or minutes with no trades, so only a gap that
+        # is not a whole number of intervals proves the bars are not this interval.
+        # A daylight-saving change moves a local-time grid of bars longer than an
+        # hour by exactly one hour, and falls in a closed period, so only a gap of
+        # more than one interval can carry it.
+        shifts = (3600, step - 3600) if step > 3600 else ()
+        for before, after in itertools.pairwise(stamps):
+            gap = (after - before).total_seconds()
+            if gap % step and not (gap > step and gap % step in shifts):
+                problems.append(
+                    f"bars {before.isoformat()} and {after.isoformat()} are {gap:g}s "
+                    f"apart, not a whole number of {interval.value}"
+                )
+                break
     for b in bars:
-        problems.extend(_event_invariants(b, instrument))
+        problems.extend(_event_invariants(b, symbol, instrument))
+        if b.interval is not interval:
+            problems.append(
+                f"bar labelled {b.interval.value}, asked for {interval.value}"
+            )
         if problems:
             break
     return problems
@@ -326,7 +400,7 @@ async def _timed(
     timeout: float,
 ) -> T | None:
     try:
-        result = await asyncio.wait_for(fn(), timeout)
+        result = await _aio.wait_for(fn(), timeout)
     except asyncio.TimeoutError:
         report.checks.append(Check(cap_, name, False, f"timed out after {timeout}s"))
         return None

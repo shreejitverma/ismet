@@ -17,7 +17,7 @@ UTC = timezone.utc
 
 class QuoteOnly(Provider):
     name = "quoteonly"
-    venues = frozenset({"XQOT"})
+    venues = frozenset({"XPAR"})
 
     async def quote(self, symbol: Symbol) -> Quote:
         now = datetime.now(UTC)
@@ -33,7 +33,7 @@ class MockTwin(MockProvider):
 
 class Counting(Provider):
     name = "counting"
-    venues = frozenset({"XCNT"})
+    venues = frozenset({"XTKS"})
 
     def __init__(self) -> None:
         super().__init__()
@@ -49,7 +49,7 @@ class Counting(Provider):
 
 class Broken(Provider):
     name = "broken"
-    venues = frozenset({"XBRK"})
+    venues = frozenset({"XHKG"})
 
     async def open(self) -> None:
         raise RuntimeError("boom")
@@ -57,12 +57,12 @@ class Broken(Provider):
 
 class Last(Counting):
     name = "last"
-    venues = frozenset({"XLST"})
+    venues = frozenset({"XLON"})
 
 
 class BrokenClose(Counting):
     name = "brokenclose"
-    venues = frozenset({"XBRC"})
+    venues = frozenset({"XSES"})
 
     async def close(self) -> None:
         await super().close()
@@ -157,7 +157,7 @@ async def test_routing_errors() -> None:
     with pytest.raises(ValidationError, match="does not serve venue"):
         await client.quote("ACME", venue="XMOK", provider="quoteonly")
     with pytest.raises(ValidationError, match="does not match venue="):
-        await client.quote(Symbol(venue="XMOK", ticker="ACME"), venue="XQOT")
+        await client.quote(Symbol(venue="XMOK", ticker="ACME"), venue="XPAR")
     with pytest.raises(ConfigError, match="not registered"):
         client.provider("nope")
     with pytest.raises(ConfigError, match="already registered"):
@@ -170,10 +170,10 @@ async def test_routing_errors() -> None:
         async for _ in client.stream_quotes([], venue="XMOK"):
             pass
     with pytest.raises(ValidationError, match="span venues"):
-        async for _ in client.stream_quotes(["ACME@XMOK", "X@XQOT"]):
+        async for _ in client.stream_quotes(["ACME@XMOK", "X@XPAR"]):
             pass
     with pytest.raises(ValidationError, match="does not serve"):
-        async for _ in client.stream_quotes(["ACME@XMOK", "X@XQOT"], provider="mock"):
+        async for _ in client.stream_quotes(["ACME@XMOK", "X@XPAR"], provider="mock"):
             pass
 
 
@@ -187,15 +187,15 @@ async def test_ambiguous_venue_requires_explicit_provider() -> None:
 async def test_missing_capability_raises_not_supported() -> None:
     client = IsmetClient([QuoteOnly()])
     assert client.capabilities("quoteonly") == {Capability.MARKET_DATA}
-    assert (await client.quote("X@XQOT")).last is not None
+    assert (await client.quote("X@XPAR")).last is not None
     with pytest.raises(NotSupported, match="historical"):
         await client.bars(
-            "X@XQOT", interval="1d", start=datetime.now(UTC), end=datetime.now(UTC)
+            "X@XPAR", interval="1d", start=datetime.now(UTC), end=datetime.now(UTC)
         )
     with pytest.raises(NotSupported, match="reference_data"):
-        await client.search("x", venue="XQOT")
+        await client.search("x", venue="XPAR")
     with pytest.raises(NotSupported, match="streaming"):
-        async for _ in client.stream_trades(["X@XQOT"]):
+        async for _ in client.stream_trades(["X@XPAR"]):
             pass
 
 

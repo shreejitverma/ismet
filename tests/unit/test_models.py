@@ -9,11 +9,14 @@ from pydantic import ValidationError
 from ismet.models import (
     AssetClass,
     Bar,
+    BookState,
     Instrument,
     Interval,
     Level,
     OrderBook,
+    QualityFlag,
     Quote,
+    Rounding,
     Side,
     Symbol,
     Trade,
@@ -46,20 +49,29 @@ def test_quote_mid_spread_and_crossed(sym: Symbol, now: datetime) -> None:
     q = Quote(symbol=sym, exchange_ts=now, received_ts=now, bid="10", ask="10.02")
     assert q.mid == D("10.01")
     assert q.spread == D("0.02")
-    assert Quote(symbol=sym, exchange_ts=now, received_ts=now).mid is None
-    with pytest.raises(ValidationError, match="crossed"):
-        Quote(symbol=sym, exchange_ts=now, received_ts=now, bid="11", ask="10")
+    assert q.book_state is BookState.NORMAL
+    empty = Quote(symbol=sym, exchange_ts=now, received_ts=now)
+    assert empty.mid is None and empty.book_state is BookState.EMPTY
+    crossed = Quote(symbol=sym, exchange_ts=now, received_ts=now, bid="11", ask="10")
+    assert crossed.book_state is BookState.CROSSED
+    assert crossed.spread == D(-1)
+    assert QualityFlag.CROSSED in crossed.flags
+    locked = Quote(symbol=sym, exchange_ts=now, received_ts=now, bid="10", ask="10")
+    assert locked.book_state is BookState.LOCKED
+    assert QualityFlag.LOCKED in locked.flags
 
 
-def test_exchange_ts_after_received_ts_rejected(sym: Symbol, now: datetime) -> None:
-    with pytest.raises(ValidationError, match="after received_ts"):
-        Trade(
-            symbol=sym,
-            exchange_ts=now + timedelta(seconds=1),
-            received_ts=now,
-            price="1",
-            size="1",
-        )
+def test_clock_skew_is_measured_not_rejected(sym: Symbol, now: datetime) -> None:
+    trade = Trade(
+        symbol=sym,
+        exchange_ts=now + timedelta(milliseconds=1),
+        received_ts=now,
+        price="1",
+        size="1",
+    )
+    assert trade.clock_skew == timedelta(milliseconds=1)
+    assert QualityFlag.CLOCK_SKEW in trade.flags
+    assert trade.latency == timedelta(milliseconds=-1)
 
 
 def test_trade_defaults(sym: Symbol, now: datetime) -> None:
@@ -104,11 +116,17 @@ def test_order_book_ordering_and_best_levels(sym: Symbol, now: datetime) -> None
         OrderBook(
             **base, asks=(Level(price="12", size="1"), Level(price="11", size="1"))
         )
-    with pytest.raises(ValidationError, match="crossed book"):
+    crossed = OrderBook(
+        **base,
+        bids=(Level(price="12", size="1"),),
+        asks=(Level(price="11", size="1"),),
+    )
+    assert crossed.book_state is BookState.CROSSED
+    assert QualityFlag.CROSSED in crossed.flags
+    with pytest.raises(ValidationError, match="descending"):
         OrderBook(
             **base,
-            bids=(Level(price="12", size="1"),),
-            asks=(Level(price="11", size="1"),),
+            bids=(Level(price="10", size="1"), Level(price="10", size="2")),
         )
 
 
@@ -126,5 +144,17 @@ def test_instrument_alignment_helpers(sym: Symbol) -> None:
     assert not inst.is_tick_aligned(D("10.11"))
     assert inst.is_lot_aligned(D(300))
     assert not inst.is_lot_aligned(D(150))
-    assert inst.round_price(D("10.13")) == D("10.10")
+    assert inst.round_price(D("10.13"), Rounding.FLOOR) == D("10.10")
     assert inst.multiplier == D(1)
+
+
+def test_an_instrument_minimum_quantity_cannot_exceed_its_maximum() -> None:
+    with pytest.raises(ValidationError):
+        Instrument(
+            symbol=Symbol(venue="ZSIM", ticker="ACME"),
+            name="Acme",
+            currency="USD",
+            tick_size="0.01",
+            min_quantity="10",
+            max_quantity="1",
+        )

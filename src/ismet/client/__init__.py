@@ -6,8 +6,9 @@ import contextlib
 from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from datetime import datetime
 from types import MappingProxyType
-from typing import cast
+from typing import Any, TypeVar, cast
 
+from ismet.calendars import TradingCalendar, get_calendar
 from ismet.capabilities import (
     Capability,
     HistoricalCapability,
@@ -17,8 +18,17 @@ from ismet.capabilities import (
 )
 from ismet.config import Settings
 from ismet.errors import ConfigError, ValidationError
-from ismet.models import Bar, Instrument, Interval, OrderBook, Quote, Symbol, Trade
+from ismet.export import BarSeries
+from ismet.marketdata.quality import GapHandler, GapPolicy, SequenceGuard
+from ismet.models import Instrument, Interval, OrderBook, Quote, Symbol, Trade
 from ismet.providers import Provider, ProviderRegistry
+
+T = TypeVar("T")
+
+
+def _closing(stream: AsyncIterator[T]) -> contextlib.aclosing[Any]:
+    """Close a provider's stream when the consumer stops, not at garbage collection."""
+    return contextlib.aclosing(cast(Any, stream))
 
 
 class IsmetClient:
@@ -205,7 +215,7 @@ class IsmetClient:
         end: datetime,
         venue: str | None = None,
         provider: str | None = None,
-    ) -> list[Bar]:
+    ) -> BarSeries:
         sym, chosen = self._route(symbol, venue, provider, Capability.HISTORICAL)
         try:
             iv = Interval(interval)
@@ -213,7 +223,8 @@ class IsmetClient:
             raise ValidationError(
                 f"unknown interval {interval!r}; one of {[i.value for i in Interval]}"
             ) from None
-        return await cast(HistoricalCapability, chosen).bars(sym, iv, start, end)
+        bars = await cast(HistoricalCapability, chosen).bars(sym, iv, start, end)
+        return BarSeries(bars)
 
     # Streaming
 
@@ -243,10 +254,23 @@ class IsmetClient:
         *,
         venue: str | None = None,
         provider: str | None = None,
+        gap_policy: GapPolicy = GapPolicy.REPORT,
+        on_gap: GapHandler | None = None,
     ) -> AsyncIterator[Quote]:
+        """Stream quotes. Gaps follow ``gap_policy``; duplicates are dropped.
+
+        What counts as a gap is the provider's call when it declares
+        :attr:`~ismet.providers.Provider.gates_streams`. On such a sparse feed that is
+        the first quote per symbol after a reconnect.
+        """
         syms, chosen = self._route_many(symbols, venue, provider)
-        async for quote in cast(StreamingCapability, chosen).stream_quotes(syms):
-            yield quote
+        guard = SequenceGuard(gap_policy, on_gap=on_gap, gated=chosen.gates_streams)
+        stream = cast(StreamingCapability, chosen).stream_quotes(syms)
+        async with _closing(stream):
+            async for quote in stream:
+                admitted = guard.admit(quote)
+                if admitted is not None:
+                    yield cast(Quote, admitted)
 
     async def stream_trades(
         self,
@@ -254,10 +278,28 @@ class IsmetClient:
         *,
         venue: str | None = None,
         provider: str | None = None,
+        gap_policy: GapPolicy = GapPolicy.REPORT,
+        on_gap: GapHandler | None = None,
     ) -> AsyncIterator[Trade]:
+        """Stream trades. Gaps follow ``gap_policy``; duplicates are dropped.
+
+        What counts as a gap is the provider's call when it declares
+        :attr:`~ismet.providers.Provider.gates_streams`, which trade ids make exact.
+        """
         syms, chosen = self._route_many(symbols, venue, provider)
-        async for trade in cast(StreamingCapability, chosen).stream_trades(syms):
-            yield trade
+        guard = SequenceGuard(gap_policy, on_gap=on_gap, gated=chosen.gates_streams)
+        stream = cast(StreamingCapability, chosen).stream_trades(syms)
+        async with _closing(stream):
+            async for trade in stream:
+                admitted = guard.admit(trade)
+                if admitted is not None:
+                    yield cast(Trade, admitted)
+
+    # Calendars
+
+    def calendar(self, venue: str) -> TradingCalendar:
+        """The trading calendar for ``venue``."""
+        return get_calendar(venue)
 
     # Reference data
 

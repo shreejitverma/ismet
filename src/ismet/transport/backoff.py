@@ -60,7 +60,11 @@ def default_should_retry(exc: BaseException) -> bool:
 
 @dataclass(frozen=True)
 class RetryPolicy:
-    """How many times to retry, with what backoff, on which exceptions."""
+    """How many times to retry, with what backoff, on which exceptions.
+
+    A venue's stated wait longer than ``max_retry_after`` is not retried, since sending
+    before the time it stated is what a limit punishes. The error reaches the caller.
+    """
 
     max_attempts: int = 3
     backoff: ExponentialBackoff = ExponentialBackoff()
@@ -74,8 +78,15 @@ class RetryPolicy:
     def delay_for(self, attempt: int, exc: BaseException) -> float:
         """Delay before the next attempt, honouring ``RateLimited.retry_after``."""
         if isinstance(exc, RateLimited) and exc.retry_after is not None:
-            return min(max(exc.retry_after, 0.0), self.max_retry_after)
+            return max(exc.retry_after, 0.0)
         return self.backoff.delay(attempt)
+
+    def stated_wait_too_long(self, exc: BaseException) -> bool:
+        return (
+            isinstance(exc, RateLimited)
+            and exc.retry_after is not None
+            and exc.retry_after > self.max_retry_after
+        )
 
 
 NO_RETRY = RetryPolicy(max_attempts=1)
@@ -100,7 +111,11 @@ async def retry(
             return await fn()
         except IsmetError as exc:
             attempt += 1
-            if attempt >= policy.max_attempts or not policy.should_retry(exc):
+            if (
+                attempt >= policy.max_attempts
+                or not policy.should_retry(exc)
+                or policy.stated_wait_too_long(exc)
+            ):
                 raise
             delay = policy.delay_for(attempt - 1, exc)
             if on_retry is not None:

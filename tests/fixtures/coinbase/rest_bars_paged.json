@@ -1,0 +1,38 @@
+{
+ "recorded_at": "2026-11-01T02:08:38.324382Z",
+ "exchanges": [
+  {
+   "method": "GET",
+   "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=60&start=2026-11-01T01%3A38%3A00Z&end=2026-11-01T01%3A40%3A00Z",
+   "status": 200,
+   "headers": {
+    "date": "Sun, 01 Nov 2026 02:08:39 GMT",
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "public, max-age=300, must-revalidate"
+   },
+   "body": "[[1793497200,77592.45,77612.54,77612.53,77592.45,0.39856671],[1793497140,77592.11,77612.54,77592.12,77612.54,0.64588781],[1793497080,77585.72,77600.33,77600.32,77592.11,0.06476299]]"
+  },
+  {
+   "method": "GET",
+   "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=60&start=2026-11-01T01%3A41%3A00Z&end=2026-11-01T01%3A43%3A00Z",
+   "status": 200,
+   "headers": {
+    "date": "Sun, 01 Nov 2026 02:08:39 GMT",
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "public, max-age=300, must-revalidate"
+   },
+   "body": "[[1793497380,77617.13,77635.91,77617.14,77635.12,1.23734283],[1793497320,77600.08,77622.82,77600.09,77617.14,1.66827756],[1793497260,77592.11,77600.09,77594.03,77600.08,2.55765485]]"
+  },
+  {
+   "method": "GET",
+   "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=60&start=2026-11-01T01%3A44%3A00Z&end=2026-11-01T01%3A44%3A00Z",
+   "status": 200,
+   "headers": {
+    "date": "Sun, 01 Nov 2026 02:08:39 GMT",
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "public, max-age=300, must-revalidate"
+   },
+   "body": "[[1793497440,77611.27,77635.13,77635.13,77613.22,0.31358079]]"
+  }
+ ]
+}

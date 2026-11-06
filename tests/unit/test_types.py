@@ -17,6 +17,7 @@ from ismet.models.types import (
     VenueCode,
     to_decimal,
 )
+from ismet.refdata.codes import validate_currency
 
 
 class M(BaseModel):
@@ -40,7 +41,9 @@ def test_to_decimal_rejects_non_decimal_types(bad: object) -> None:
         to_decimal(bad)
 
 
-@pytest.mark.parametrize("bad", ["abc", "NaN", "Infinity", "-inf", ""])
+@pytest.mark.parametrize(
+    "bad", ["abc", "NaN", "Infinity", "-inf", "", "1_000.5", "\u0661\u0662\u0663"]
+)
 def test_to_decimal_rejects_non_finite_or_garbage(bad: str) -> None:
     with pytest.raises(ValueError):
         to_decimal(bad)
@@ -56,9 +59,9 @@ def test_float_rejected_at_model_boundary() -> None:
         M(price=1.5)  # type: ignore[arg-type]
 
 
-def test_price_must_be_positive_and_quantity_non_negative() -> None:
-    with pytest.raises(ValidationError, match="> 0"):
-        M(price="0")
+def test_price_may_be_zero_or_negative_and_quantity_non_negative() -> None:
+    assert M(price="0").price == Decimal(0)
+    assert M(price="-37.63").price == Decimal("-37.63")
     assert M(qty="0").qty == Decimal(0)
     with pytest.raises(ValidationError, match=">= 0"):
         M(qty="-1")
@@ -91,6 +94,25 @@ def test_currency_and_mic_validation() -> None:
 
 def test_interval_seconds() -> None:
     assert Interval.M1.seconds == 60
-    assert Interval.D1.seconds == 86400
+    assert Interval.D1.seconds is None
+    assert Interval.D1.is_session_based
+    assert Interval.D1.nominal_seconds == 86400
+    assert Interval.W1.nominal_seconds == 604800
+    assert Interval.MO1.nominal_seconds is None
     assert Interval.MO1.seconds is None
     assert Interval("1h") is Interval.H1
+
+
+@pytest.mark.parametrize(
+    ("spelling", "code"),
+    [("GBp", "GBX"), ("GBX", "GBX"), ("GBP", "GBP"), ("gbp", "GBP"), ("ZAc", "ZAC")],
+)
+def test_pence_spelled_by_a_vendor_are_never_read_as_pounds(
+    spelling: str, code: str
+) -> None:
+    assert validate_currency(spelling) == code
+
+
+def test_a_minor_unit_spelling_of_another_iso_code_is_refused() -> None:
+    with pytest.raises(ValueError, match="ambiguous"):
+        validate_currency("USd")

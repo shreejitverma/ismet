@@ -1,0 +1,38 @@
+{
+ "recorded_at": "2026-11-01T02:08:38.324382Z",
+ "exchanges": [
+  {
+   "method": "GET",
+   "url": "https://api.exchange.coinbase.com/products/NOPE-USD/book?level=1",
+   "status": 404,
+   "headers": {
+    "date": "Sun, 01 Nov 2026 02:08:39 GMT",
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store"
+   },
+   "body": "{\"message\":\"NotFound\"}"
+  },
+  {
+   "method": "GET",
+   "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=7",
+   "status": 400,
+   "headers": {
+    "date": "Sun, 01 Nov 2026 02:08:39 GMT",
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store"
+   },
+   "body": "{\"message\":\"Unsupported granularity\"}"
+  },
+  {
+   "method": "GET",
+   "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=60&start=2026-10-31T00%3A00%3A00Z&end=2026-10-31T06%3A00%3A00Z",
+   "status": 400,
+   "headers": {
+    "date": "Sun, 01 Nov 2026 02:08:39 GMT",
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store"
+   },
+   "body": "{\"message\":\"granularity too small for the requested time range. Count of aggregations requested exceeds 300\"}"
+  }
+ ]
+}

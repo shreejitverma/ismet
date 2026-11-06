@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 from decimal import Decimal
 
 import httpx
@@ -8,6 +9,7 @@ import pytest
 from pydantic import SecretStr
 
 from ismet.errors import (
+    AmbiguousOutcome,
     AuthError,
     CircuitOpen,
     RateLimited,
@@ -24,6 +26,7 @@ from ismet.transport.http import (
     QueryAuth,
     RequestInfo,
     map_response_error,
+    retry_after_seconds,
 )
 from ismet.transport.ratelimit import RateLimiter, RateLimitSpec
 
@@ -358,8 +361,11 @@ async def test_non_json_success_body_raises_transport_error() -> None:
 
 
 def test_map_response_error_variants() -> None:
-    e = map_response_error(429, b"", {"Retry-After": "bogus"})
+    e = map_response_error(429, b"", {"retry-after": "bogus"})
     assert isinstance(e, RateLimited) and e.retry_after is None
+    for not_a_wait in ("inf", "nan"):
+        limited = map_response_error(429, b"", {"retry-after": not_a_wait})
+        assert isinstance(limited, RateLimited) and limited.retry_after is None
     v = map_response_error(400, b"not json", {})
     assert isinstance(v, VenueError) and v.payload is None and v.code is None
     v2 = map_response_error(422, b'{"error_code": 7}', {})
@@ -369,3 +375,83 @@ def test_map_response_error_variants() -> None:
     r = map_response_error(302, b"", {"location": "/login"})
     assert isinstance(r, TransportError) and not r.retryable and r.status == 302
     assert "/login" in str(r)
+
+
+async def test_a_failing_hook_never_replaces_the_result_of_a_request() -> None:
+    def broken(info: object) -> None:
+        raise OSError("metrics backend is down")
+
+    seen: list[object] = []
+
+    def ok(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": 1})
+
+    t = make(ok, hooks=[broken, seen.append])
+    assert await t.get_json("/x") == {"ok": 1}
+    assert len(seen) == 1
+
+
+async def test_a_failing_hook_keeps_the_ambiguous_outcome_of_an_order() -> None:
+    def broken(info: object) -> None:
+        raise OSError("metrics backend is down")
+
+    def lost(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("no answer", request=request)
+
+    t = make(lost, hooks=[broken])
+    with pytest.raises(AmbiguousOutcome):
+        await t.request("POST", "/order", json_body={"q": 1}, idempotent=False)
+
+
+IN_FIVE_MINUTES = "Sun, 01 Nov 2026 23:00:00 GMT"
+FROZEN = datetime(2026, 11, 1, 22, 0, tzinfo=timezone.utc)
+
+
+def test_a_retry_after_date_is_read_against_the_response_date() -> None:
+    headers = {
+        "retry-after": IN_FIVE_MINUTES,
+        "date": "Sun, 01 Nov 2026 22:55:00 GMT",
+    }
+    assert retry_after_seconds(headers, clock=ManualClock(FROZEN)) == 300.0
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"retry-after": IN_FIVE_MINUTES},
+        {"retry-after": IN_FIVE_MINUTES, "date": "not a date"},
+    ],
+    ids=["no-date-header", "unreadable-date-header"],
+)
+def test_a_retry_after_date_without_a_usable_date_uses_the_clock(
+    headers: dict[str, str],
+) -> None:
+    assert retry_after_seconds(headers, clock=ManualClock(FROZEN)) == 3600.0
+
+
+def test_a_retry_after_date_in_the_past_means_no_wait_not_a_negative_one() -> None:
+    late = ManualClock(datetime(2026, 11, 2, tzinfo=timezone.utc))
+    assert retry_after_seconds({"retry-after": IN_FIVE_MINUTES}, clock=late) == 0.0
+
+
+@pytest.mark.parametrize("value", ["soon", "", "5 seconds", "12:00", "nan", "inf"])
+def test_an_unreadable_retry_after_is_still_none(value: str) -> None:
+    assert retry_after_seconds({"retry-after": value}) is None
+
+
+def test_seconds_are_still_seconds() -> None:
+    assert retry_after_seconds({"retry-after": "120"}) == 120.0
+    assert retry_after_seconds({"retry-after": "-5"}) == 0.0
+    assert retry_after_seconds({}) is None
+
+
+async def test_the_transport_reads_a_date_form_retry_after_with_its_own_clock() -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": IN_FIVE_MINUTES})
+
+    async with make(
+        handler, retry_policy=NO_RETRY, clock=ManualClock(FROZEN)
+    ) as transport:
+        with pytest.raises(RateLimited) as caught:
+            await transport.request("GET", "/x")
+    assert caught.value.retry_after == 3600.0

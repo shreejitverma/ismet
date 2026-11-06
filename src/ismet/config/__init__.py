@@ -7,7 +7,7 @@ appear in reprs or logs.
 Environment convention::
 
     ISMET_PROVIDERS=alpaca,mock
-    ISMET_CONFIG_FILE=/path/to/config.toml      # optional override
+    ISMET_CONFIG_FILE=/path/to/config.toml      # optional override; must exist
     ISMET_ALPACA_API_KEY=...     # provider "alpaca", credential "api_key"
     ISMET_ALPACA_PAPER=true      # provider "alpaca", option "paper"
 
@@ -51,6 +51,13 @@ _SECRET_MARKERS = ("KEY", "SECRET", "TOKEN", "PASSWORD", "PASSPHRASE")
 def default_config_path() -> Path:
     """``<user config dir>/ismet/config.toml`` for the current OS."""
     return Path(user_config_dir(APP_NAME)) / "config.toml"
+
+
+def config_file_path(env: Mapping[str, str] | None = None) -> Path:
+    """The file :meth:`Settings.load` reads: the override, or the default."""
+    environ = os.environ if env is None else env
+    override = environ.get(f"{ENV_PREFIX}CONFIG_FILE")
+    return Path(override) if override else default_config_path()
 
 
 class ProviderSettings(BaseModel):
@@ -103,10 +110,15 @@ class Settings(BaseModel):
         layers: list[dict[str, Any]] = []
         path: Path | None = None
         if use_file:
-            override = environ.get(f"{ENV_PREFIX}CONFIG_FILE")
-            path = config_file or (
-                Path(override) if override else default_config_path()
-            )
+            path = config_file or config_file_path(environ)
+            if (
+                config_file is None
+                and environ.get(f"{ENV_PREFIX}CONFIG_FILE")
+                and not path.is_file()
+            ):
+                raise ConfigError(
+                    f"{ENV_PREFIX}CONFIG_FILE names {path}, which is not a file"
+                )
             layers.append(_read_file(path))
         layers.append(_read_env(environ))
         layers.append(_normalise(dict(explicit or {})))
@@ -232,5 +244,6 @@ __all__ = [
     "ENV_PREFIX",
     "ProviderSettings",
     "Settings",
+    "config_file_path",
     "default_config_path",
 ]

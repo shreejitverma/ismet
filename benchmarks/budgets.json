@@ -1,0 +1,8 @@
+{
+  "decimal_midpoint": 100,
+  "decimal_round_to_step": 150,
+  "model_trade_construct": 300,
+  "book_apply_delta_1000_levels": 150,
+  "risk_check_full": 1000,
+  "journal_kill_state": 500
+}

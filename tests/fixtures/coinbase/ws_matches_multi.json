@@ -1,0 +1,46 @@
+{
+ "recorded_at": "2026-11-01T02:08:38.324382Z",
+ "url": "wss://ws-feed.exchange.coinbase.com",
+ "sent": [
+  {
+   "type": "subscribe",
+   "product_ids": [
+    "BTC-USD",
+    "ETH-USD"
+   ],
+   "channels": [
+    "matches"
+   ]
+  }
+ ],
+ "control": [
+  "{\"type\":\"subscriptions\",\"channels\":[{\"name\":\"matches\",\"product_ids\":[\"BTC-USD\",\"ETH-USD\"],\"account_ids\":null}]}"
+ ],
+ "frames": [
+  "{\"type\":\"last_match\",\"trade_id\":851390638,\"maker_order_id\":\"9e8338b0-2a61-4c9b-8295-9078a690bd2b\",\"taker_order_id\":\"4d67d443-405b-4023-93af-3c95231fa869\",\"side\":\"buy\",\"size\":\"3.97620902\",\"price\":\"2263.46\",\"product_id\":\"ETH-USD\",\"sequence\":104540105618,\"time\":\"2026-11-01T02:08:47.811433Z\"}",
+  "{\"type\":\"last_match\",\"trade_id\":1113397261,\"maker_order_id\":\"29f31076-f9e8-44fc-8453-44cee3e4637b\",\"taker_order_id\":\"3fc003c1-5b53-47d1-9bd7-08be3f1445ee\",\"side\":\"buy\",\"size\":\"0.00000007\",\"price\":\"77571.01\",\"product_id\":\"BTC-USD\",\"sequence\":138612777301,\"time\":\"2026-11-01T02:08:47.709811Z\"}",
+  "{\"type\":\"match\",\"trade_id\":1113397262,\"maker_order_id\":\"118c5698-85b9-4d89-bf2a-be0292e0ea60\",\"taker_order_id\":\"f94e9037-27af-4055-88fc-ab4a8fe38606\",\"side\":\"buy\",\"size\":\"0.00000006\",\"price\":\"77573.83\",\"product_id\":\"BTC-USD\",\"sequence\":138612777421,\"time\":\"2026-11-01T02:08:47.853351Z\"}",
+  "{\"type\":\"match\",\"trade_id\":1113397263,\"maker_order_id\":\"5c31b873-5943-49e7-a439-f8dcbfaffb26\",\"taker_order_id\":\"a6f9b97e-569a-4dba-97f7-9bd4bfd3dec5\",\"side\":\"buy\",\"size\":\"0.00000007\",\"price\":\"77571.21\",\"product_id\":\"BTC-USD\",\"sequence\":138612778010,\"time\":\"2026-11-01T02:08:48.971354Z\"}",
+  "{\"type\":\"match\",\"trade_id\":1113397264,\"maker_order_id\":\"4b84a51e-36c7-4152-8c3d-b0139d184e5f\",\"taker_order_id\":\"1e163e74-f0a3-45c8-8d70-6b0ec05302cb\",\"side\":\"buy\",\"size\":\"0.00000009\",\"price\":\"77571.21\",\"product_id\":\"BTC-USD\",\"sequence\":138612778213,\"time\":\"2026-11-01T02:08:49.502593Z\"}",
+  "{\"type\":\"match\",\"trade_id\":1113397265,\"maker_order_id\":\"4b84a51e-36c7-4152-8c3d-b0139d184e5f\",\"taker_order_id\":\"65265e71-811e-41ae-aadd-6c819b9d0c3b\",\"side\":\"buy\",\"size\":\"0.00000004\",\"price\":\"77571.21\",\"product_id\":\"BTC-USD\",\"sequence\":138612778244,\"time\":\"2026-11-01T02:08:49.565469Z\"}",
+  "{\"type\":\"match\",\"trade_id\":1113397266,\"maker_order_id\":\"4b84a51e-36c7-4152-8c3d-b0139d184e5f\",\"taker_order_id\":\"9fc4fada-5cff-4400-9070-b8c09343ff27\",\"side\":\"buy\",\"size\":\"0.00002146\",\"price\":\"77571.21\",\"product_id\":\"BTC-USD\",\"sequence\":138612778339,\"time\":\"2026-11-01T02:08:49.894975Z\"}",
+  "{\"type\":\"match\",\"trade_id\":1113397267,\"maker_order_id\":\"02fd6e62-f1f2-4daf-88fb-823192ca7d9a\",\"taker_order_id\":\"9fc4fada-5cff-4400-9070-b8c09343ff27\",\"side\":\"buy\",\"size\":\"0.00020063\",\"price\":\"77571.21\",\"product_id\":\"BTC-USD\",\"sequence\":138612778341,\"time\":\"2026-11-01T02:08:49.894975Z\"}",
+  "{\"type\":\"match\",\"trade_id\":1113397268,\"maker_order_id\":\"411436f4-16e8-47d5-a303-05182161a573\",\"taker_order_id\":\"9fc4fada-5cff-4400-9070-b8c09343ff27\",\"side\":\"buy\",\"size\":\"0.00158042\",\"price\":\"77571.21\",\"product_id\":\"BTC-USD\",\"sequence\":138612778343,\"time\":\"2026-11-01T02:08:49.894975Z\"}",
+  "{\"type\":\"match\",\"trade_id\":1113397269,\"maker_order_id\":\"684fb93b-b7d9-43a9-a815-3aa80b285ca2\",\"taker_order_id\":\"823ccfa0-7cda-4e5c-a660-2c4fce76b4de\",\"side\":\"sell\",\"size\":\"0.00134947\",\"price\":\"77571.22\",\"product_id\":\"BTC-USD\",\"sequence\":138612778358,\"time\":\"2026-11-01T02:08:49.962146Z\"}",
+  "{\"type\":\"match\",\"trade_id\":1113397270,\"maker_order_id\":\"411436f4-16e8-47d5-a303-05182161a573\",\"taker_order_id\":\"35d8156e-818a-4a13-b3a7-bee731f0e4e1\",\"side\":\"buy\",\"size\":\"0.00000012\",\"price\":\"77571.21\",\"product_id\":\"BTC-USD\",\"sequence\":138612778397,\"time\":\"2026-11-01T02:08:50.049703Z\"}",
+  "{\"type\":\"match\",\"trade_id\":1113397271,\"maker_order_id\":\"87b6df93-f628-455d-920a-b72f62128a17\",\"taker_order_id\":\"b959561a-7d21-4cd4-8284-31c591b30bdd\",\"side\":\"buy\",\"size\":\"0.00000004\",\"price\":\"77571.21\",\"product_id\":\"BTC-USD\",\"sequence\":138612778570,\"time\":\"2026-11-01T02:08:50.667076Z\"}",
+  "{\"type\":\"match\",\"trade_id\":1113397272,\"maker_order_id\":\"87b6df93-f628-455d-920a-b72f62128a17\",\"taker_order_id\":\"8eb6ab57-f099-4706-b374-78c4e148b22d\",\"side\":\"buy\",\"size\":\"0.00000005\",\"price\":\"77571.21\",\"product_id\":\"BTC-USD\",\"sequence\":138612778573,\"time\":\"2026-11-01T02:08:50.668405Z\"}",
+  "{\"type\":\"match\",\"trade_id\":1113397273,\"maker_order_id\":\"87b6df93-f628-455d-920a-b72f62128a17\",\"taker_order_id\":\"6c365798-bc59-4a53-b666-794f7157c589\",\"side\":\"buy\",\"size\":\"0.00000013\",\"price\":\"77571.21\",\"product_id\":\"BTC-USD\",\"sequence\":138612778600,\"time\":\"2026-11-01T02:08:50.773884Z\"}",
+  "{\"type\":\"match\",\"trade_id\":1113397274,\"maker_order_id\":\"87b6df93-f628-455d-920a-b72f62128a17\",\"taker_order_id\":\"d70ce537-71e4-488e-b31a-3928b6646249\",\"side\":\"buy\",\"size\":\"0.00008689\",\"price\":\"77571.21\",\"product_id\":\"BTC-USD\",\"sequence\":138612778918,\"time\":\"2026-11-01T02:08:51.372101Z\"}",
+  "{\"type\":\"match\",\"trade_id\":1113397275,\"maker_order_id\":\"684fb93b-b7d9-43a9-a815-3aa80b285ca2\",\"taker_order_id\":\"f59a25f1-b331-40d9-8a58-ef3ea71f1a7b\",\"side\":\"sell\",\"size\":\"0.00033011\",\"price\":\"77571.22\",\"product_id\":\"BTC-USD\",\"sequence\":138612779000,\"time\":\"2026-11-01T02:08:51.637160Z\"}",
+  "{\"type\":\"match\",\"trade_id\":1113397276,\"maker_order_id\":\"1c92b199-36fa-432f-a735-00d2c9578eb1\",\"taker_order_id\":\"81c8615d-bea3-4c7d-b9f0-2869752c8ce8\",\"side\":\"buy\",\"size\":\"0.00000016\",\"price\":\"77571.21\",\"product_id\":\"BTC-USD\",\"sequence\":138612779012,\"time\":\"2026-11-01T02:08:51.788614Z\"}",
+  "{\"type\":\"match\",\"trade_id\":1113397277,\"maker_order_id\":\"1c92b199-36fa-432f-a735-00d2c9578eb1\",\"taker_order_id\":\"bed8bad5-a859-4f5e-bd77-30924535edf8\",\"side\":\"buy\",\"size\":\"0.00000002\",\"price\":\"77571.21\",\"product_id\":\"BTC-USD\",\"sequence\":138612779021,\"time\":\"2026-11-01T02:08:51.799213Z\"}",
+  "{\"type\":\"match\",\"trade_id\":1113397278,\"maker_order_id\":\"684fb93b-b7d9-43a9-a815-3aa80b285ca2\",\"taker_order_id\":\"6aee37a4-9643-4c4b-8dfd-322f02c79664\",\"side\":\"sell\",\"size\":\"0.00001972\",\"price\":\"77571.22\",\"product_id\":\"BTC-USD\",\"sequence\":138612779223,\"time\":\"2026-11-01T02:08:52.226145Z\"}",
+  "{\"type\":\"match\",\"trade_id\":1113397279,\"maker_order_id\":\"5c518e7c-a282-4d1b-9e38-971280d36866\",\"taker_order_id\":\"782ebd4f-9e1d-43ef-b95d-e2f0cdb19a10\",\"side\":\"buy\",\"size\":\"0.00000003\",\"price\":\"77571.21\",\"product_id\":\"BTC-USD\",\"sequence\":138612779570,\"time\":\"2026-11-01T02:08:53.317590Z\"}",
+  "{\"type\":\"match\",\"trade_id\":1113397280,\"maker_order_id\":\"5c518e7c-a282-4d1b-9e38-971280d36866\",\"taker_order_id\":\"5590c778-42ad-4fb1-bbc8-6b7897638933\",\"side\":\"buy\",\"size\":\"0.00000011\",\"price\":\"77571.21\",\"product_id\":\"BTC-USD\",\"sequence\":138612779710,\"time\":\"2026-11-01T02:08:53.987065Z\"}",
+  "{\"type\":\"match\",\"trade_id\":1113397281,\"maker_order_id\":\"5c518e7c-a282-4d1b-9e38-971280d36866\",\"taker_order_id\":\"3f3115d6-f53d-498f-b2e0-f05f27111bd0\",\"side\":\"buy\",\"size\":\"0.00000007\",\"price\":\"77571.21\",\"product_id\":\"BTC-USD\",\"sequence\":138612779844,\"time\":\"2026-11-01T02:08:54.461288Z\"}",
+  "{\"type\":\"match\",\"trade_id\":1113397282,\"maker_order_id\":\"684fb93b-b7d9-43a9-a815-3aa80b285ca2\",\"taker_order_id\":\"e2f44fdf-9b82-4b16-834e-836847897a27\",\"side\":\"sell\",\"size\":\"0.00366845\",\"price\":\"77571.22\",\"product_id\":\"BTC-USD\",\"sequence\":138612779912,\"time\":\"2026-11-01T02:08:54.728784Z\"}",
+  "{\"type\":\"match\",\"trade_id\":1113397283,\"maker_order_id\":\"5c518e7c-a282-4d1b-9e38-971280d36866\",\"taker_order_id\":\"96eb9420-c7e4-4c9c-b4ae-e693fefe8eef\",\"side\":\"buy\",\"size\":\"0.00000008\",\"price\":\"77571.21\",\"product_id\":\"BTC-USD\",\"sequence\":138612779967,\"time\":\"2026-11-01T02:08:54.929976Z\"}",
+  "{\"type\":\"match\",\"trade_id\":1113397284,\"maker_order_id\":\"5c518e7c-a282-4d1b-9e38-971280d36866\",\"taker_order_id\":\"1458245c-5c0f-4bfb-a56d-e627dd773961\",\"side\":\"buy\",\"size\":\"0.00000023\",\"price\":\"77571.21\",\"product_id\":\"BTC-USD\",\"sequence\":138612780194,\"time\":\"2026-11-01T02:08:55.908968Z\"}"
+ ]
+}
