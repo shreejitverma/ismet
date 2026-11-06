@@ -16,6 +16,7 @@ Rules callers depend on that are easy to miss in the API reference.
 - `cancel_all` sends cancels concurrently, at most 32 at a time, so one slow answer does not hold back the rest of a kill sweep.
 - A cancel during the kill-switch read after the send has been journalled closes the order as `CANCELED_BEFORE_SEND`, because the venue was never called, and then reraises `CancelledError`.
 - An amendment re-reads the kill switch from the journal after `ReplaceRequested` is written, so an engage from another process refuses it with `KILL_SWITCH`, an unreadable journal with `JOURNAL_UNREADABLE`, and a cancel during the read with `CANCELED_BEFORE_SEND`.
+  An amendment overtaken by a cancel or a last fill is not sent, and terms it left on an order that is still open are cleared with `ReplaceRejected` code `CANCELED_BEFORE_SEND`.
 - A disputed fee keeps the first report's amount and currency together; only the venue order id and liquidity are merged from the second.
 - `ismet._aio.wait_for` reports `TimeoutError` for a cancelled operation only when that wait itself cancelled it.
 - An operation that ends cancelled on its own raises `CancelledError`, on 3.10 and 3.11 as well as 3.12.
