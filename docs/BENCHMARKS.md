@@ -31,4 +31,6 @@ Before `fullfsync` was enabled this measured about 45 us, because macOS `fsync()
 This is not suitable for colocated, sub-millisecond strategies, and it does not try to be.
 Group commit would raise throughput under concurrent load, and has not been built.
 
-CI gates CPU-bound paths against generous budgets in `benchmarks/budgets.json`, to catch order-of-magnitude regressions on shared runners.
+CI gates CPU-bound paths against generous budgets in `benchmarks/budgets.json`.
+Each budget is roughly 50 to 110 times the p99 above, so shared-runner noise cannot fail CI.
+That means the gate catches regressions of about two orders of magnitude, not smaller ones.
