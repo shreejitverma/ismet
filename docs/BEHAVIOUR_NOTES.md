@@ -42,7 +42,7 @@ Rules callers depend on that are easy to miss in the API reference.
 - `SimVenue.answer_ticks`, `after_answer`, and `retain_busted_fills` let a test interleave stream events with venue answers.
 - An elected `SimVenue` stop, including one that has already partially filled, takes liquidity when a later quote appears, even if that quote has traded back through the stop.
 - `run_conformance` adds `instrument_symbol`, failing an instrument answered for another symbol, and fails bars spaced by anything other than a whole number of the asked interval.
-  For intervals longer than an hour, a whole number plus or minus exactly one hour also passes, since a daylight-saving change moves a local-time grid by an hour.
+  For intervals longer than an hour, a gap longer than one interval that is a whole number plus or minus exactly one hour also passes, since a daylight-saving change moves a local-time grid by an hour and falls in a closed period.
 - `MockProvider.bars` serves only bars that have closed by its clock, so a range reaching past now stops at the last closed bar.
 - The release-workflow test also flags a gate step that pipes without pipefail, or runs an `&&` list on any line but the last, since GitHub's default `bash -e` hides either failure.
 

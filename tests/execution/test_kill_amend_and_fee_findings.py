@@ -38,6 +38,7 @@ from ismet.models.orders import (
     Filled,
     OrderSide,
     OrderStatus,
+    OutcomeUnknown,
     ReplaceRejected,
     SendStarted,
     SubmitIntent,
@@ -500,6 +501,74 @@ async def test_an_amend_whose_kill_switch_cannot_be_read_is_refused(
         assert events[-1].code == "JOURNAL_UNREADABLE"
     finally:
         journal.fail_reads = False
+        await oms.abort()
+
+
+async def cancel_it(oms: OrderManager, venue: SimVenue, cid: str) -> None:
+    await oms.cancel(cid)
+
+
+async def fill_it(oms: OrderManager, venue: SimVenue, cid: str) -> None:
+    last = Fill(
+        fill_id="LAST",
+        client_order_id=cid,
+        symbol=ACME,
+        side=OrderSide.BUY,
+        price="9.50",
+        quantity="100",
+        ts=START,
+    )
+    venue._deliver(
+        Filled(client_order_id=cid, ts=START, origin=EventOrigin.VENUE, fill=last)
+    )
+    await venue.drain()
+    assert oms.order(cid).status is S.FILLED
+
+
+@pytest.mark.parametrize("overtake", [cancel_it, fill_it], ids=["cancel", "last-fill"])
+async def test_an_amend_overtaken_while_it_reads_the_kill_switch_is_not_sent(
+    venue: SimVenue,
+    clock: ManualClock,
+    overtake: Callable[[OrderManager, SimVenue, str], Coroutine[Any, Any, None]],
+) -> None:
+    """The read after ReplaceRequested is written, the second of the amend, is where
+    the cancel or the last fill lands."""
+    journal = MemoryJournal()
+    oms = manager_over(venue, journal, clock)
+    await oms.start()
+    try:
+        await venue.drain()
+        await oms.submit(order("KA4", price="9.50"))
+        await venue.drain()
+        amends: list[str] = []
+
+        async def amend_order(cid: str, *_: object, **__: object) -> None:
+            amends.append(cid)
+            raise RuntimeError("venue connection reset")
+
+        real_merge = oms._merge_kill
+        reads = 0
+
+        async def overtaken_during_read(durable: KillState) -> None:
+            nonlocal reads
+            reads += 1
+            if reads == 2:
+                await overtake(oms, venue, "KA4")
+            await real_merge(durable)
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(venue, "amend_order", amend_order)
+            patch.setattr(oms, "_merge_kill", overtaken_during_read)
+            state = await oms.amend("KA4", quantity=D(50))
+        assert reads >= 2
+        assert amends == []
+        assert state.status is not S.UNKNOWN
+        assert not [
+            e
+            for e in events_of(journal)
+            if e.client_order_id == "KA4" and isinstance(e, OutcomeUnknown)
+        ]
+    finally:
         await oms.abort()
 
 

@@ -369,11 +369,12 @@ def _bars_invariants(
         # Gaps may span closed hours or minutes with no trades, so only a gap that
         # is not a whole number of intervals proves the bars are not this interval.
         # A daylight-saving change moves a local-time grid of bars longer than an
-        # hour by exactly one hour.
+        # hour by exactly one hour, and falls in a closed period, so only a gap of
+        # more than one interval can carry it.
         shifts = (3600, step - 3600) if step > 3600 else ()
         for before, after in itertools.pairwise(stamps):
             gap = (after - before).total_seconds()
-            if gap % step and gap % step not in shifts:
+            if gap % step and not (gap > step and gap % step in shifts):
                 problems.append(
                     f"bars {before.isoformat()} and {after.isoformat()} are {gap:g}s "
                     f"apart, not a whole number of {interval.value}"

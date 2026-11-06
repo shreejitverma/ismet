@@ -1537,6 +1537,9 @@ class OrderManager:
         except Exception as exc:
             logger.critical("kill switch unreadable before the amend: %s", exc)
             return await self._refuse_amend(client_order_id, "JOURNAL_UNREADABLE")
+        state = self.order(client_order_id)
+        if state.status is not OrderStatus.PENDING_REPLACE:
+            return state  # a cancel or a last fill won while the kill switch was read
         if self._kill.engaged:
             return await self._refuse_amend(client_order_id, "KILL_SWITCH")
         try:
@@ -1558,6 +1561,9 @@ class OrderManager:
         return self.order(client_order_id)
 
     async def _refuse_amend(self, cid: str, code: str) -> OrderState:
+        state = self.order(cid)
+        if state.status is not OrderStatus.PENDING_REPLACE:
+            return state
         return await self._record(
             ReplaceRejected(
                 client_order_id=cid,

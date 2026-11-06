@@ -209,6 +209,20 @@ class OffGridByHalfAnHour(LocalGridAcrossDst):
     ]
 
 
+class HourlyBarsLabelledFourHour(LocalGridAcrossDst):
+    name = "1h-as-4h"
+    stamps: ClassVar[list[datetime]] = [
+        DST_GRID[0] + timedelta(hours=n) for n in range(4)
+    ]
+
+
+class ThreeHourBarsLabelledFourHour(LocalGridAcrossDst):
+    name = "3h-as-4h"
+    stamps: ClassVar[list[datetime]] = [
+        DST_GRID[0] + timedelta(hours=3 * n) for n in range(4)
+    ]
+
+
 class InstrumentForAnotherSymbol(MockProvider):
     name = "wrong-instrument"
 
@@ -290,13 +304,32 @@ async def test_four_hour_bars_on_a_local_grid_pass_across_a_dst_change(
     sym: Symbol,
 ) -> None:
     lookback = datetime.now(UTC) - datetime(2026, 3, 1, tzinfo=UTC)
-    options = {"symbol": sym, "interval": Interval.H4, "lookback": lookback}
-    report = await run_conformance(LocalGridAcrossDst(tick_interval=0), **options)
+    report = await run_conformance(
+        LocalGridAcrossDst(tick_interval=0),
+        symbol=sym,
+        interval=Interval.H4,
+        lookback=lookback,
+    )
     bars = next(c for c in report.checks if c.name == "bars_invariants")
     assert bars.passed, bars.detail
-    report = await run_conformance(OffGridByHalfAnHour(tick_interval=0), **options)
-    bars = next(c for c in report.checks if c.name == "bars_invariants")
-    assert not bars.passed and "not a whole number of 4h" in bars.detail
+
+
+@pytest.mark.parametrize(
+    "wrong",
+    [OffGridByHalfAnHour, HourlyBarsLabelledFourHour, ThreeHourBarsLabelledFourHour],
+    ids=lambda value: value.name,
+)
+async def test_bars_of_another_interval_labelled_four_hour_fail(
+    sym: Symbol, wrong: type[MockProvider]
+) -> None:
+    lookback = datetime.now(UTC) - datetime(2026, 3, 1, tzinfo=UTC)
+    report = await run_conformance(
+        wrong(tick_interval=0), symbol=sym, interval=Interval.H4, lookback=lookback
+    )
+    assert {check.name for check in report.failures} == {"bars_invariants"}
+    assert all(
+        "not a whole number of 4h" in check.detail for check in report.failures
+    ), report.summary()
 
 
 async def test_a_book_of_exactly_the_asked_depth_passes(sym: Symbol) -> None:
