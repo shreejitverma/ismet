@@ -110,29 +110,62 @@ async def test_an_operation_that_ignores_its_cancel_on_timeout_keeps_its_result(
     assert await _aio.wait_for(stubborn(), 0.01) == "finished anyway"
 
 
+async def test_an_operation_that_cancels_itself_is_not_a_timeout() -> None:
+    async def cancel_itself() -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        task.cancel()
+        await asyncio.sleep(0)
+
+    with pytest.raises(asyncio.CancelledError):
+        await _aio.wait_for(cancel_itself(), 5)
+
+
 def direct_wait_for_uses(source: str) -> list[int]:
     """Lines that reach ``asyncio.wait_for`` without the helper, however it is named."""
     tree = ast.parse(source)
     modules = {"asyncio"}
+    task_modules: set[str] = set()
     found = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             modules.update(
-                a.asname or a.name for a in node.names if a.name == "asyncio"
+                alias.asname or alias.name
+                for alias in node.names
+                if alias.name == "asyncio"
             )
         elif isinstance(node, ast.ImportFrom) and (node.module or "").startswith(
             "asyncio"
         ):
-            found.extend(node.lineno for a in node.names if a.name == "wait_for")
+            found.extend(
+                node.lineno for alias in node.names if alias.name == "wait_for"
+            )
+            if node.module == "asyncio":
+                task_modules.update(
+                    alias.asname or alias.name
+                    for alias in node.names
+                    if alias.name == "tasks"
+                )
     found.extend(
         node.lineno
         for node in ast.walk(tree)
-        if isinstance(node, ast.Attribute)
-        and node.attr == "wait_for"
-        and isinstance(node.value, ast.Name)
-        and node.value.id in modules
+        if _is_wait_for_call(node, modules, task_modules)
     )
     return sorted(found)
+
+
+def _is_wait_for_call(node: ast.AST, modules: set[str], task_modules: set[str]) -> bool:
+    """``asyncio.wait_for``, ``asyncio.tasks.wait_for``, or ``tasks.wait_for``."""
+    if not isinstance(node, ast.Attribute) or node.attr != "wait_for":
+        return False
+    if isinstance(node.value, ast.Name):
+        return node.value.id in modules or node.value.id in task_modules
+    return (
+        isinstance(node.value, ast.Attribute)
+        and node.value.attr == "tasks"
+        and isinstance(node.value.value, ast.Name)
+        and node.value.value.id in modules
+    )
 
 
 @pytest.mark.parametrize(
@@ -143,9 +176,20 @@ def direct_wait_for_uses(source: str) -> list[int]:
         ("from asyncio import wait_for as w\nw(x, 1)\n", [1]),
         ("from asyncio.tasks import wait_for\n", [1]),
         ("import asyncio\nasyncio.wait_for (x, 1)\n", [2]),
+        ("import asyncio\nasyncio.tasks.wait_for(x, 1)\n", [2]),
+        ("from asyncio import tasks\ntasks.wait_for(x, 1)\n", [2]),
         ("# asyncio.wait_for(x, 1)\nfrom ismet import _aio\n_aio.wait_for(x, 1)\n", []),
     ],
-    ids=["call", "module-alias", "from-import", "submodule", "spaced", "helper-only"],
+    ids=[
+        "call",
+        "module-alias",
+        "from-import",
+        "submodule",
+        "spaced",
+        "tasks-attribute",
+        "tasks-import",
+        "helper-only",
+    ],
 )
 def test_the_checker_finds_every_spelling(source: str, lines: list[int]) -> None:
     assert direct_wait_for_uses(source) == lines

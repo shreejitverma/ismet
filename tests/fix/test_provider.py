@@ -2631,9 +2631,44 @@ class TestALostFillSeenInCumQty:
         rows = await provider.quarantined()
         assert [(q.msg_type, q.halted) for q in rows] == [("8", True)]
         assert "CumQty" in rows[0].reason
-        assert (await provider.open_orders())[0].filled_quantity == Decimal(10)
+        # The lost report's CumQty is 10. Stored filled stays at the fills already
+        # booked: a lost report must not lower it.
+        assert (await provider.open_orders())[0].filled_quantity == Decimal(40)
         with pytest.raises(ReportQuarantinedError):
             await provider.place_order(order("C2"))
+
+    async def test_a_late_poss_resend_does_not_lower_filled_or_reopen(
+        self, acceptor: FixAcceptor, make_provider: ProviderFactory
+    ) -> None:
+        """A lost older report must not reopen a filled order."""
+        provider = await make_provider()
+        stream = Stream(provider)
+        await provider.place_order(order(quantity="30"))
+        acceptor.faults.skip_seq_next = 1
+        acceptor.orders["C1"].filled = Decimal(30)
+        acceptor.orders["C1"].status = "2"
+        await acceptor.exec_report(
+            "C1",
+            "F",
+            "2",
+            last_qty=Decimal(20),
+            last_px=Decimal("5"),
+            extra=[(97, "Y")],
+        )
+        await eventually(lambda: isinstance(stream.error, ReportQuarantinedError))
+        acceptor.orders["C1"].filled = Decimal(10)
+        acceptor.orders["C1"].status = "1"
+        await acceptor.exec_report("C1", "0", "1", extra=[(97, "Y")])
+        for _ in range(400):
+            if len(await provider.quarantined()) >= 2:
+                break
+            await asyncio.sleep(0.01)
+
+        record = await provider._lookup("C1")
+        assert record is not None
+        assert record.filled == Decimal(30)
+        assert record.status is OrderStatus.FILLED
+        assert await provider.open_orders() == []
 
     @pytest.mark.parametrize("begin_string", ["FIX.4.2", "FIX.4.4"])
     async def test_busts_and_corrections_keep_cum_qty_equal(

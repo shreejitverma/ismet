@@ -22,6 +22,7 @@ import pytest
 
 from ismet.cli import main
 from ismet.cli.toon import encode, scalar
+from ismet.errors import JournalError
 from ismet.execution import RecordKind, SqliteJournal
 from ismet.execution.journal import verify_jsonl
 from ismet.models import Symbol
@@ -925,6 +926,45 @@ def test_kill_status_shows_a_broken_chain(capsys, tmp_path: Path) -> None:  # ty
     broken_journal(path)
     code, out = run(capsys, "kill", "status", "--journal", path)
     assert code == 1 and "broken at record 1" in out
+
+
+def test_kill_engage_says_when_the_halt_was_not_recorded(
+    capsys, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "j.db"
+    journal = SqliteJournal(path)
+    journal.append(RecordKind.ANOMALY, "{}")
+    journal.close()
+
+    def fail(self, *args: object, **kwargs: object) -> None:
+        raise JournalError("journal write failed: disk is full")
+
+    monkeypatch.setattr(SqliteJournal, "append", fail)
+    code, out = run(capsys, "kill", "engage", "--journal", str(path), *WHO)
+    assert code == 1
+    assert "halt NOT recorded" in out
+    assert "cancel at the venue directly" in out
+    assert "tampered" not in out
+
+
+def test_a_no_op_engage_on_a_broken_chain_reports_the_chain(
+    capsys, tmp_path: Path
+) -> None:
+    path = tmp_path / "j.db"
+    journal = SqliteJournal(path)
+    journal.append(RecordKind.ANOMALY, "{}")
+    journal.append(
+        RecordKind.KILL_ENGAGED,
+        json.dumps({"reason": "r", "operator": "o", "cancel_open": True}),
+    )
+    journal.close()
+    connection = sqlite3.connect(path)
+    connection.execute("DROP TRIGGER journal_no_update")
+    connection.execute("UPDATE journal SET payload = '{\"x\": 1}' WHERE seq = 1")
+    connection.commit()
+    connection.close()
+    code, out = run(capsys, "kill", "engage", "--journal", str(path), *WHO)
+    assert code == 0 and "no-op" in out and "chain:" in out
 
 
 def test_kill_engage_still_works_on_a_broken_chain(capsys, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]

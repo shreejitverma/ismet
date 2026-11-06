@@ -943,6 +943,17 @@ class FixProvider(Provider):
             events = [e for e in events if isinstance(e, Filled)]
             lost_report = self._quarantine_row(message, lost)
         updated = self._updated_record(record, message, wire_id, fill, bust)
+        if lost is not None and record is not None and updated is not None:
+            # A lost report is quarantined and still halts. It must not walk the
+            # stored order backwards: a later PossResend of an older report would
+            # otherwise lower filled and could reopen a terminal order.
+            preserved: dict[str, object] = {}
+            if updated.filled < record.filled:
+                preserved["filled"] = record.filled
+            if record.status.is_terminal and not updated.status.is_terminal:
+                preserved["status"] = record.status
+            if preserved:
+                updated = updated.model_copy(update=preserved)
         received = self.clock.now()
         execution = StoredExecution(
             client_order_id,

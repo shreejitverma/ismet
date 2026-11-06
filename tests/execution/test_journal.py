@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -275,6 +276,72 @@ def test_an_anchor_that_disagrees_with_the_chain_means_the_journal_was_replaced(
     (tmp_path / "j.db.head").write_text("garbage", encoding="ascii")
     assert journal.verify().ok  # an unreadable anchor weakens the check, nothing more
     journal.close()
+
+
+def test_an_intact_anchor_ahead_of_this_append_stays_quiet(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Another process already anchored a later intact record. Do not cry tamper."""
+    journal = SqliteJournal(tmp_path / "j.db")
+    journal.append(RecordKind.ANOMALY, '{"n": 1}', ts=TS)
+    second = journal.append(RecordKind.ANOMALY, '{"n": 2}', ts=TS)
+    first = next(journal.records())
+    with caplog.at_level("CRITICAL", logger="ismet.execution"):
+        journal._write_anchor(first.seq, first.hash)
+    assert not [
+        record for record in caplog.records if "behind its anchor" in record.message
+    ]
+    text = journal.anchor_path.read_text(encoding="ascii")
+    assert text.startswith(f"{second.seq} ")
+    assert journal.verify().ok
+    journal.close()
+
+
+def test_a_later_append_cannot_move_the_anchor_backward(tmp_path: Path) -> None:
+    """The check and the replace share the write, so the anchor only grows."""
+    path = tmp_path / "j.db"
+    first = SqliteJournal(path)
+    first.append(RecordKind.ANOMALY, '{"n": 1}', ts=TS)
+    read_anchor = first._read_anchor
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def stalled() -> tuple[int, str] | None:
+        value = read_anchor()
+        entered.set()
+        assert release.wait(5)
+        return value
+
+    first._read_anchor = stalled  # type: ignore[method-assign]
+
+    def append_first() -> None:
+        first.append(RecordKind.ANOMALY, '{"n": 2}', ts=TS)
+
+    def append_second() -> None:
+        second = SqliteJournal(path)
+        second.append(RecordKind.ANOMALY, '{"n": 3}', ts=TS)
+        second.close()
+        finished.set()
+
+    writer = threading.Thread(target=append_first)
+    other = threading.Thread(target=append_second)
+    writer.start()
+    assert entered.wait(5)
+    other.start()
+    other.join(2.0)
+    release.set()
+    writer.join(15)
+    other.join(15)
+    first.close()
+    check = SqliteJournal(path)
+    count = sum(1 for _ in check.records())
+    anchor_seq = int(check.anchor_path.read_text(encoding="ascii").split()[0])
+    result = check.verify()
+    check.close()
+    assert anchor_seq == count
+    assert result.ok
+    assert finished.is_set()
 
 
 def test_appending_after_truncation_keeps_the_evidence(tmp_path: Path) -> None:

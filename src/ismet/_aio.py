@@ -27,11 +27,15 @@ async def wait_for(aw: Awaitable[T], timeout: float | None) -> T:
     if sys.version_info >= (3, 12):
         return await asyncio.wait_for(aw, timeout)
     task = asyncio.ensure_future(aw)
+    # Only a cancel that wait_for itself issued is a timeout. An operation that
+    # ends cancelled for any other reason is CancelledError, as asyncio.wait_for.
+    timed_out = False
     if timeout is not None and timeout <= 0:
         # As asyncio.wait_for: an operation not already done never gets to run.
         if not task.done():
+            timed_out = True
             await _cancel_and_wait(task)
-        return _outcome(task)
+        return _outcome(task, timed_out)
     try:
         await asyncio.wait({task}, timeout=timeout)
     except asyncio.CancelledError:
@@ -40,18 +44,21 @@ async def wait_for(aw: Awaitable[T], timeout: float | None) -> T:
             task.exception()  # retrieved, so an error it ended with is not logged
         raise
     if not task.done():
+        timed_out = True
         await _cancel_and_wait(task)
-    return _outcome(task)
+    return _outcome(task, timed_out)
 
 
-def _outcome(task: asyncio.Future[T]) -> T:
-    """The result of a finished ``task``, or a timeout if it ended cancelled.
+def _outcome(task: asyncio.Future[T], timed_out: bool) -> T:
+    """The result of a finished ``task``, or a timeout if this wait cancelled it.
 
     An operation that ignored its cancel and finished anyway keeps its result or its
-    error, as ``asyncio.wait_for`` does.
+    error, as ``asyncio.wait_for`` does. One that cancelled itself is not a timeout.
     """
     if task.cancelled():
-        raise asyncio.TimeoutError
+        if timed_out:
+            raise asyncio.TimeoutError
+        raise asyncio.CancelledError
     return task.result()
 
 

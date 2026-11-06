@@ -471,27 +471,47 @@ class SqliteJournal:
     def _write_anchor(self, seq: int, digest: str) -> None:
         """Best effort: a missing or older anchor only weakens truncation detection.
 
-        An anchor the chain has fallen behind, or that names a record the chain no
-        longer has, is evidence of truncation or replacement. Appending must not move
-        it, or an emergency ``kill engage`` would make the journal verify clean again.
-        Called with the connection lock held.
+        An anchor that names a record the chain no longer has, or has with another
+        digest, is evidence of truncation or replacement. Appending must not move it,
+        or an emergency ``kill engage`` would make the journal verify clean again. An
+        anchor already past ``seq`` on an intact row was written by another process
+        and is kept, quietly.
+
+        Runs after the record commits, so a crash in between leaves the anchor behind,
+        never ahead. It takes the database write lock for the read and the replace,
+        so writers in different processes update the anchor one at a time and a slower
+        one cannot move it back past a faster one. Called with the connection lock
+        held.
         """
-        anchor = self._read_anchor()
-        if anchor is not None and self._anchor_disputes_chain(anchor, seq):
-            logger.critical(
-                "journal %s is behind its anchor at record %s: keeping the anchor",
-                self.path,
-                anchor[0],
-            )
-            return
-        temporary = self.anchor_path.with_name(
-            f"{self.anchor_path.name}.{os.getpid()}.{threading.get_ident()}"
-        )
         try:
-            temporary.write_text(f"{seq} {digest}", encoding="ascii")
-            temporary.replace(self.anchor_path)
-        except OSError as exc:
-            logger.warning("could not update the journal anchor: %s", exc)
+            self._conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.Error as exc:
+            logger.warning("could not lock the journal to update its anchor: %s", exc)
+            return
+        try:
+            anchor = self._read_anchor()
+            if anchor is not None and self._anchor_disputes_chain(anchor):
+                logger.critical(
+                    "journal %s is behind its anchor at record %s: keeping the anchor",
+                    self.path,
+                    anchor[0],
+                )
+                return
+            if anchor is not None and anchor[0] >= seq:
+                return
+            temporary = self.anchor_path.with_name(
+                f"{self.anchor_path.name}.{os.getpid()}.{threading.get_ident()}"
+            )
+            try:
+                temporary.write_text(f"{seq} {digest}", encoding="ascii")
+                temporary.replace(self.anchor_path)
+            except OSError as exc:
+                logger.warning("could not update the journal anchor: %s", exc)
+        finally:
+            try:
+                self._conn.execute("COMMIT")
+            except sqlite3.Error as exc:
+                logger.warning("could not release the journal anchor lock: %s", exc)
 
     def _read_anchor(self) -> tuple[int, str] | None:
         try:
@@ -500,11 +520,14 @@ class SqliteJournal:
         except (OSError, ValueError):
             return None
 
-    def _anchor_disputes_chain(self, anchor: tuple[int, str], new_seq: int) -> bool:
-        """Whether the anchor says records below ``new_seq`` are gone or replaced."""
+    def _anchor_disputes_chain(self, anchor: tuple[int, str]) -> bool:
+        """Whether the anchored record is gone or no longer has the anchored digest.
+
+        A truncated chain lacks the row, and a replaced one has another digest there.
+        An anchor ahead of this append on an intact row is another process's, not a
+        dispute.
+        """
         anchored_seq, anchored_digest = anchor
-        if anchored_seq >= new_seq:
-            return True
         try:
             row = self._conn.execute(
                 "SELECT hash FROM journal WHERE seq = ?", (anchored_seq,)

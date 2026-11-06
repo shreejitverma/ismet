@@ -212,6 +212,61 @@ class IntentGate(MemoryJournal):
         return super().append(*args, **kw)  # type: ignore[arg-type]
 
 
+class KillReadGate(MemoryJournal):
+    """Holds the post-send kill read, so a test can cancel once the send has started."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reading = threading.Event()
+        self.release = threading.Event()
+        self.arm = False
+
+    def kill_state(self):  # type: ignore[no-untyped-def]
+        if self.arm:
+            self.reading.set()
+            assert self.release.wait(5)
+            self.arm = False
+        return super().kill_state()
+
+
+async def test_cancel_during_the_kill_read_closes_an_unsent_order(
+    venue: SimVenue, clock: ManualClock
+) -> None:
+    """The kill read is after SendStarted, and the order has not reached the venue."""
+    journal = KillReadGate()
+
+    def arm(name: str, _cid: str) -> None:
+        if name == "after_send_started":
+            journal.arm = True
+
+    oms = OrderManager(
+        venue,
+        journal,
+        RiskEngine(permissive_config()),
+        clock=clock,
+        stream_settle=None,
+        kill_poll_interval=3600,
+        reconcile_interval=3600,
+        checkpoint=arm,
+    )
+    await oms.start()
+    try:
+        await venue.drain()
+        task = asyncio.create_task(oms.submit(order("RS5B", price="9.50")))
+        assert await asyncio.to_thread(journal.reading.wait, 5)
+        task.cancel()
+        await asyncio.sleep(0.01)
+        journal.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        state = oms.order("RS5B")
+        assert state.status is S.REJECTED
+        assert state.reject_code == "CANCELED_BEFORE_SEND"
+        assert venue.attempts["RS5B"] == 0
+    finally:
+        await oms.abort()
+
+
 async def test_cancelled_caller_cannot_split_the_journal_from_memory(
     venue: SimVenue, clock: ManualClock
 ) -> None:

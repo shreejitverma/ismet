@@ -52,17 +52,76 @@ def test_only_a_version_tag_can_start_a_release() -> None:
     assert jobs["version"]["if"] == "startsWith(github.ref, 'refs/tags/v')"
 
 
-def test_only_jobs_that_install_nothing_hold_an_oidc_token() -> None:
-    jobs = workflow("publish.yml")["jobs"]
-    holders = {
-        name
-        for name, job in jobs.items()
-        if job.get("permissions", {}).get("id-token") == "write"
+def _grants_id_token(permissions: object) -> bool:
+    """Whether a permissions block can mint an OIDC token.
+
+    A job with no block inherits the workflow's. A job block replaces it rather than
+    merging. A string value, such as ``write-all``, grants every permission.
+    """
+    if isinstance(permissions, str):
+        return True
+    if isinstance(permissions, dict):
+        return permissions.get("id-token") == "write"
+    return False
+
+
+def jobs_holding_an_oidc_token(document: dict[str, Any]) -> set[str]:
+    """Jobs whose effective permissions can mint an OIDC token."""
+    jobs = document.get("jobs") or {}
+    inherited = document.get("permissions")
+    holders: set[str] = set()
+    for name, job in jobs.items():
+        if not isinstance(job, dict):
+            continue
+        permissions = job.get("permissions", inherited)
+        if _grants_id_token(permissions):
+            holders.add(name)
+    return holders
+
+
+def workflow_grants_id_token(document: dict[str, Any]) -> bool:
+    return _grants_id_token(document.get("permissions"))
+
+
+def test_a_job_inherits_a_workflow_token_and_a_blanket_grant_is_one() -> None:
+    inherited = {
+        "permissions": {"id-token": "write", "contents": "read"},
+        "jobs": {"version": {"steps": [{"run": "pip install ."}]}},
     }
+    assert jobs_holding_an_oidc_token(inherited) == {"version"}
+    blanket = {
+        "permissions": "write-all",
+        "jobs": {"build": {"steps": [{"run": "pip install build"}]}},
+    }
+    assert jobs_holding_an_oidc_token(blanket) == {"build"}
+    assert workflow_grants_id_token({"permissions": "write-all"})
+    narrowed = {
+        "permissions": {"id-token": "write"},
+        "jobs": {
+            "build": {
+                "permissions": {"contents": "read"},
+                "steps": [{"run": "echo hi"}],
+            }
+        },
+    }
+    assert jobs_holding_an_oidc_token(narrowed) == set()
+
+
+def test_only_jobs_that_install_nothing_hold_an_oidc_token() -> None:
+    document = workflow("publish.yml")
+    jobs = document["jobs"]
+    holders = jobs_holding_an_oidc_token(document)
     assert holders == {"attest", "publish"}
     for name in holders:
         for step in jobs[name]["steps"]:
             assert "run" not in step, f"{name} runs a command while holding a token"
+    assert not workflow_grants_id_token(document)
+
+
+@pytest.mark.parametrize("path", sorted(ROOT.glob("*.yml")), ids=lambda p: p.name)
+def test_no_workflow_grants_an_oidc_token_at_the_top_level(path: Path) -> None:
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert not workflow_grants_id_token(document)
 
 
 @pytest.mark.parametrize("path", sorted(ROOT.glob("*.yml")), ids=lambda p: p.name)

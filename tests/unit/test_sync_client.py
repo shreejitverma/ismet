@@ -18,6 +18,44 @@ def sync_threads() -> list[threading.Thread]:
     return [t for t in threading.enumerate() if t.name == "ismet-sync"]
 
 
+def test_a_full_stream_buffer_does_not_stall_another_stream() -> None:
+    """A full queue must not occupy the loop's only default-executor worker."""
+    holder: list[object] = []
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    thread = threading.Thread()
+    try:
+        with IsmetSyncClient([MockProvider(tick_interval=0)]) as client:
+            loop = client._loop
+            assert loop is not None
+            ready = threading.Event()
+
+            def install() -> None:
+                loop.set_default_executor(executor)
+                ready.set()
+
+            loop.call_soon_threadsafe(install)
+            assert ready.wait(2)
+            quotes = client.stream_quotes(["ACME"], venue="XMOK", buffer=1)
+            next(quotes)
+            time.sleep(0.3)
+
+            def take() -> None:
+                try:
+                    trades = client.stream_trades(["ACME"], venue="XMOK", buffer=1)
+                    holder.append(next(trades))
+                except BaseException as exc:
+                    holder.append(exc)
+
+            thread = threading.Thread(target=take)
+            thread.start()
+            thread.join(1.0)
+            assert not thread.is_alive()
+            assert holder and not isinstance(holder[0], BaseException)
+    finally:
+        thread.join(5)
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
 def test_context_manager_serves_calls_and_leaves_no_thread() -> None:
     with IsmetSyncClient([MockProvider()]) as client:
         assert len(sync_threads()) == 1

@@ -14,12 +14,17 @@ Rules callers depend on that are easy to miss in the API reference.
 - An instrument with a listing or delisting date needs a calendar, because the date is judged at the venue, not in UTC.
 - `restricted_symbols` entries match regardless of case, so `AAPL@xnas` and `aapl` both match, and `BRKb` also restricts a ticker spelled `BRKB`.
 - `cancel_all` sends cancels concurrently, at most 32 at a time, so one slow answer does not hold back the rest of a kill sweep.
+- A cancel during the kill-switch read after the send has been journalled closes the order as `CANCELED_BEFORE_SEND`, because the venue was never called, and then reraises `CancelledError`.
+- `ismet._aio.wait_for` reports `TimeoutError` for a cancelled operation only when that wait itself cancelled it.
+- An operation that ends cancelled on its own raises `CancelledError`, on 3.10 and 3.11 as well as 3.12.
 
 ## Journal
 
 - Record kinds gained `position_adjusted` and `sweep_mark`.
 - `POSITION_BASELINE` no longer records a price, since cost basis is not a mark.
 - `export_jsonl` gained `raw_payload`, the exact text the hash covers, and `unique_intent`, and `verify_jsonl` checks an archive with those.
+- An anchor ahead of the record being appended is kept with no critical log when the anchored record is still present with the same digest, since another process wrote it.
+- The anchor is updated after the record commits, under the database write lock, so writers in different processes cannot move it backward and a crash leaves it behind, never ahead.
 
 ## Accounting
 
@@ -32,6 +37,7 @@ Rules callers depend on that are easy to miss in the API reference.
 - `run_trading_conformance` requires `DuplicateOrderId` for a repeated client order id, and fails a stream that ends before reporting.
 - `unknown_status_error=` declares a documented exception to "status of an unknown order is `None`". `FixProvider` uses it with `TransportError`, because its only record is local and a wiped store must not make a live order look dead.
 - `SimVenue.answer_ticks`, `after_answer`, and `retain_busted_fills` let a test interleave stream events with venue answers.
+- An elected `SimVenue` stop, including one that has already partially filled, takes liquidity when a later quote appears, even if that quote has traded back through the stop.
 - `run_conformance` adds `instrument_symbol`, failing an instrument answered for another symbol, and fails bars spaced by anything other than a whole number of the asked interval.
 - `MockProvider.bars` serves only bars that have closed by its clock, so a range reaching past now stops at the last closed bar.
 - The release-workflow test also flags a gate step that pipes without pipefail, or runs an `&&` list on any line but the last, since GitHub's default `bash -e` hides either failure.
@@ -44,6 +50,7 @@ Rules callers depend on that are easy to miss in the API reference.
 - `FixStore` gained `open_orders`, `fills_since`, `busted_executions`, `reset_period`, `set_reset_period`, `release_quarantine`, and `put_order(..., is_open=)`.
 - A provider declaring `venues` refuses an order on any other venue.
 - Tag 44 is read only for `LIMIT` and `STOP_LIMIT`, so an echoed zero cannot price a stop order at nothing.
+- A report `FixProvider` flags as lost does not lower the stored filled quantity and does not move a terminal order back to a working status.
 
 ## Market data
 
@@ -76,6 +83,11 @@ Rules callers depend on that are easy to miss in the API reference.
 - `BackfillReport` gained `windows_incomplete` and `sessions_missing`.
 - Reformatting a price is not a revision, so existing stored bars with trailing zeros write one spurious revision after upgrading.
 - `to_records` and dataframes gained `timeliness`, and carry `quality` and `source`.
+- `backfill` leaves a window unfinished when it ends within one period of the store clock, or when a fetched bar is `STALE`, so a rerun fetches it again.
+
+## Sync client
+
+- A full sync-stream buffer waits for room without holding a default-executor worker, so one slow consumer cannot stall every other stream.
 
 ## CLI
 
@@ -83,3 +95,5 @@ Rules callers depend on that are easy to miss in the API reference.
 - `kill` and `journal` refuse abbreviated flags.
 - `ismet providers` lists names, with capabilities only from `ismet providers <name>`.
 - Non-table lists print as TOON `- ` items.
+- `ismet kill engage` that cannot append the halt says the halt was not recorded and to cancel at the venue directly.
+- A no-op `ismet kill engage` includes the `chain` field.

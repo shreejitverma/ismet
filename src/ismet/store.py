@@ -26,7 +26,7 @@ from pathlib import Path
 from ismet.calendars import Session, TradingCalendar
 from ismet.errors import CalendarOutOfRange, IsmetError, ValidationError
 from ismet.export import BarSeries
-from ismet.models import Bar, Interval, Symbol
+from ismet.models import Bar, Interval, QualityFlag, Symbol
 from ismet.models.decimals import _EXACT
 from ismet.refdata.codes import accepting_stored_codes
 from ismet.refdata.master import trading_date
@@ -358,6 +358,11 @@ def _longest_period(interval: Interval) -> timedelta:
     return timedelta(days=31) if seconds is None else timedelta(seconds=seconds)
 
 
+def _window_may_still_change(interval: Interval, end: datetime, clock: Clock) -> bool:
+    """Whether ``end`` is still inside one period of the store clock."""
+    return end > clock.now() - _longest_period(interval)
+
+
 async def backfill(
     fetch: FetchBars,
     store: BarStore,
@@ -382,7 +387,9 @@ async def backfill(
     The bars can be in an earlier window, since a session can straddle several, and the
     store is what is asked. Sessions that began before ``start`` or close after ``end``
     were only partly requested, so they are not required. The bars received are kept
-    either way. Without a calendar, a non-empty answer is taken as final, since nothing
+    either way. A window that ends within one period of the store's clock, or that
+    contains a bar flagged stale, stays unfinished so a later run fetches it again.
+    Without a calendar, any other non-empty answer is taken as final, since nothing
     can contradict it. Check :attr:`BackfillReport.complete`.
 
     ``window`` defaults to 30 days, or 31 for monthly bars. One shorter than the
@@ -461,6 +468,13 @@ async def _backfill_window(
         if missing:
             report.windows_incomplete += 1
             report.sessions_missing.extend(missing)
+            return
+        # One bar in a session, or any non-empty page, is not proof the window is
+        # closed: the newest bar may still be forming, or the page was stale.
+        if _window_may_still_change(interval, end, store._clock) or any(
+            QualityFlag.STALE in bar.quality for bar in bars
+        ):
+            report.windows_incomplete += 1
             return
         store.mark_window_done(symbol, interval, start, end, len(bars))
     # ValueError: a stored row that no longer parses is this window's failure.

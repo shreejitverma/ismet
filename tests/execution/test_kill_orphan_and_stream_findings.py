@@ -1261,6 +1261,33 @@ async def test_an_unelected_stop_does_not_fill_on_an_amend(venue: SimVenue) -> N
     assert await filled_at_venue(venue, "SS8") == 0
 
 
+async def test_an_elected_stop_fills_when_liquidity_appears_below_the_stop(
+    venue: SimVenue,
+) -> None:
+    """Elected with no ask quoted, then an ask appears back through the stop."""
+    venue.set_quote(ACME, "10.00", None)
+    await venue.place_order(
+        order("SS11", price=None, order_type=OrderType.STOP, stop_price="10.50")
+    )
+    venue.trade_through(ACME, "10.55", "100")
+    assert await filled_at_venue(venue, "SS11") == 0
+    venue.set_quote(ACME, "10.00", "10.40")
+    assert await filled_at_venue(venue, "SS11") == 100
+
+
+async def test_an_elected_stop_that_partially_filled_takes_later_liquidity(
+    venue: SimVenue,
+) -> None:
+    venue.set_quote(ACME, "10.00", "10.55", ask_size="40")
+    await venue.place_order(
+        order("SS12", price=None, order_type=OrderType.STOP, stop_price="10.50")
+    )
+    venue.trade_through(ACME, "10.55", "100")
+    assert await filled_at_venue(venue, "SS12") == 40
+    venue.set_quote(ACME, "10.00", "10.40", ask_size="100")
+    assert await filled_at_venue(venue, "SS12") == 100
+
+
 async def test_a_stop_elected_by_a_print_takes_the_touch(venue: SimVenue) -> None:
     """A stop with no limit becomes a market order once elected."""
     await venue.place_order(

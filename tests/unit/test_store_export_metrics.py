@@ -73,7 +73,9 @@ def bar(ts: datetime = DAY, close: str = "10.10", **kw: object) -> Bar:
 
 @pytest.fixture
 def clock() -> ManualClock:
-    return ManualClock(datetime(2026, 3, 10, tzinfo=UTC))
+    # June, so a historical window is more than one bar-period behind the store clock.
+    # A clock of 10 March would leave the March monthly backfill inside that period.
+    return ManualClock(datetime(2026, 6, 1, tzinfo=UTC))
 
 
 @pytest.fixture
@@ -1081,6 +1083,48 @@ async def test_a_monthly_backfill_with_the_default_window_completes(
     calls.clear()
     second = await backfill(*span)
     assert second.complete and calls == []
+
+
+async def test_a_backfill_of_a_still_open_bar_is_not_finished(tmp_path: Path) -> None:
+    """12:30:05 UTC, hourly window ending 12:30: the 12:00 bar is still open."""
+    now = datetime(2026, 3, 9, 12, 30, 5, tzinfo=UTC)
+    start = datetime(2026, 3, 9, 11, 0, tzinfo=UTC)
+    end = datetime(2026, 3, 9, 12, 30, tzinfo=UTC)
+    calls: list[datetime] = []
+
+    async def fetch(symbol, interval, window_start, window_end):  # type: ignore[no-untyped-def]
+        calls.append(window_start)
+        return [bar(start, interval=Interval.H1)]
+
+    with BarStore(tmp_path / "bars.db", clock=ManualClock(now)) as store:
+        report = await backfill(fetch, store, SYM, Interval.H1, start, end)
+        assert not report.complete
+        assert report.windows_incomplete == 1
+        assert not store.window_done(SYM, Interval.H1, start, end)
+        calls.clear()
+        await backfill(fetch, store, SYM, Interval.H1, start, end)
+        assert calls == [start]
+
+
+async def test_a_stale_page_is_not_a_finished_backfill(tmp_path: Path) -> None:
+    start = datetime(2026, 3, 9, tzinfo=UTC)
+    end = datetime(2026, 3, 10, tzinfo=UTC)
+
+    async def fetch(symbol, interval, window_start, window_end):  # type: ignore[no-untyped-def]
+        return [
+            bar(
+                start,
+                interval=Interval.D1,
+                quality=frozenset({QualityFlag.STALE}),
+            )
+        ]
+
+    clock = ManualClock(datetime(2026, 6, 1, tzinfo=UTC))
+    with BarStore(tmp_path / "bars.db", clock=clock) as store:
+        report = await backfill(fetch, store, SYM, Interval.D1, start, end)
+        assert not report.complete
+        assert report.windows_incomplete == 1
+        assert not store.window_done(SYM, Interval.D1, start, end)
 
 
 async def test_a_backfill_ending_mid_period_does_not_stay_open_forever(

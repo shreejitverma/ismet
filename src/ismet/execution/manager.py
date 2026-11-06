@@ -1282,6 +1282,10 @@ class OrderManager:
                 try:
                     durable = await self._call_journal(self._journal.kill_state)
                     await self._merge_kill(durable)
+                except asyncio.CancelledError:
+                    # SendStarted is durable, but place_order has not been called.
+                    await self._refuse_send(cid, "CANCELED_BEFORE_SEND")
+                    raise
                 except Exception as exc:
                     logger.critical("kill switch unreadable before the send: %s", exc)
                     return await self._refuse_send(cid, "JOURNAL_UNREADABLE")

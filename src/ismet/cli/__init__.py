@@ -710,18 +710,33 @@ def _kill(args: argparse.Namespace) -> int:
         if args.action == "engage":
             wants_cancel = not args.keep_orders
             if state.engaged and (state.cancel_open or not wants_cancel):
-                _print({"kill": "already engaged (no-op)", "reason": state.reason})
-                return EXIT_OK
-            journal.append(
-                RecordKind.KILL_ENGAGED,
-                json.dumps(
+                _print(
                     {
-                        "reason": args.reason,
-                        "operator": args.operator,
-                        "cancel_open": wants_cancel,
+                        "kill": "already engaged (no-op)",
+                        "reason": state.reason,
+                        "chain": chain_text,
                     }
-                ),
-            )
+                )
+                return EXIT_OK
+            try:
+                journal.append(
+                    RecordKind.KILL_ENGAGED,
+                    json.dumps(
+                        {
+                            "reason": args.reason,
+                            "operator": args.operator,
+                            "cancel_open": wants_cancel,
+                        }
+                    ),
+                )
+            except (JournalError, OSError) as exc:
+                _print(
+                    {
+                        "error": _error_text(exc),
+                        "help": "halt NOT recorded; cancel at the venue directly",
+                    }
+                )
+                return EXIT_FAILED
             state = journal.kill_state()
         elif args.action == "release":
             if not state.engaged:

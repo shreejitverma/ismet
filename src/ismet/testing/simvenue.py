@@ -459,18 +459,20 @@ class SimVenue(Provider):
         market = self._markets[symbol]
         for order in list(self._orders.values()):
             request = order.request
-            if (
-                request.symbol != symbol
-                or request.stop_price is None
-                or order.status is not OrderStatus.ACCEPTED
-                or order.filled > 0
-            ):
+            if request.symbol != symbol or request.stop_price is None:
+                continue
+            # Already elected: a later quote fills it, including after a partial fill,
+            # even when the quote has traded back through the stop.
+            if order.elected:
+                if order.status not in _WORKING:
+                    continue
+            elif order.status is not OrderStatus.ACCEPTED or order.filled > 0:
                 continue
             buying = request.side is OrderSide.BUY
             touch = market.ask if buying else market.bid
             if touch is None:
                 continue
-            if self._stop_reached(order, touch):
+            if order.elected or self._stop_reached(order, touch):
                 order.elected = True
                 self._take_liquidity(order)
 

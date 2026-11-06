@@ -267,19 +267,19 @@ class IsmetSyncClient:
         finished = threading.Event()
         failure: list[BaseException] = []
 
-        def put(item: Any) -> None:
-            while not stop.is_set():
-                try:
-                    queue.put(item, timeout=_POLL_SECONDS)
-                    return
-                except Full:
-                    continue
-
         async def pump() -> None:
             try:
                 try:
                     async for item in stream:
-                        await asyncio.to_thread(put, item)
+                        # put_nowait, not a worker blocked in Queue.put: a full buffer
+                        # must not take the loop's default executor, or enough slow
+                        # consumers stall every other stream.
+                        while not stop.is_set():
+                            try:
+                                queue.put_nowait(item)
+                                break
+                            except Full:
+                                await asyncio.sleep(_POLL_SECONDS)
                         if stop.is_set():
                             return
                 finally:
