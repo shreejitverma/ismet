@@ -4,6 +4,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import SecretStr
@@ -339,7 +340,8 @@ class TestInboundSequencing:
         await acceptor.send("8", NEWS)
         await acceptor.send("8", NEWS)
         await eventually(lambda: len(listener.messages) == 2)
-        expected = session.next_inbound
+        await eventually(lambda: session.next_inbound == acceptor.next_out)
+        expected = acceptor.next_out
         await acceptor.send_raw_seq(2, "8", NEWS)
         await eventually(lambda: session.state is SessionState.FAILED)
         await acceptor.wait_until(lambda: bool(acceptor.of_type("5")))
@@ -361,7 +363,7 @@ class TestInboundSequencing:
         await acceptor.send_raw_seq(
             seq, "8", [(58, "dup")], poss_dup=True, orig_sending_time=past_text()
         )
-        await acceptor.send_raw_seq(session.next_inbound, "0", [])
+        await acceptor.send_raw_seq(seq + 1, "0", [])
         await eventually(lambda: session.next_inbound == seq + 2)
         assert [m.get(58) for m in listener.messages] == ["original"]
         assert session.is_ready
@@ -500,7 +502,7 @@ class TestInboundSequencing:
         session, listener = await make_session()
         await acceptor.send("3", [(45, "1"), (373, "5"), (58, "nope")])
         await eventually(lambda: len(listener.rejects) == 1)
-        assert session.next_inbound == acceptor.next_out
+        await eventually(lambda: session.next_inbound == acceptor.next_out)
         assert session.is_ready
 
 
@@ -1101,6 +1103,37 @@ class TestConnectionLoss:
         await session.wait_ready(5.0)
         assert session.is_ready
         assert acceptor.connections == 2
+
+    async def test_a_connection_a_stop_overtakes_is_closed_not_leaked(
+        self, acceptor: FixAcceptor, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The connect finishes in the same loop turn as a cancel of the session's
+        # task, which wait_for before Python 3.12 answers with CancelledError and
+        # no result. The socket it opened must still be closed: the venue sees the
+        # disconnect.
+        real_open = asyncio.open_connection
+        opened: list[asyncio.StreamWriter] = []
+        session = FixSession(
+            session_config(acceptor), MemoryFixStore(), RecordingListener()
+        )
+
+        async def open_then_stop(
+            *args: Any, **kwargs: Any
+        ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+            reader, writer = await real_open(*args, **kwargs)
+            opened.append(writer)
+            runner = session._runner
+            assert runner is not None
+            asyncio.get_running_loop().call_soon(runner.cancel)
+            return reader, writer
+
+        monkeypatch.setattr(asyncio, "open_connection", open_then_stop)
+        await session.start()
+        await eventually(lambda: bool(opened))
+        await session.stop()
+        assert opened[0].transport.is_closing()
+        await acceptor.wait_until(lambda: acceptor.disconnects == acceptor.connections)
+        assert acceptor.received == []
 
     async def test_wait_ready_on_a_stopped_session_raises(
         self, acceptor: FixAcceptor, make_session: SessionFactory
