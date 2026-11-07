@@ -1223,7 +1223,7 @@ def test_doctor_names_the_config_file_it_read(
     override.write_text('providers = ["mock"]\n', encoding="utf-8")
     monkeypatch.setenv("ISMET_CONFIG_FILE", str(override))
     _, out = run(capsys, "doctor")
-    assert str(override) in out
+    assert decode_toon(out)["config_file"] == str(override)
 
 
 def test_doctor_fails_when_the_config_override_names_no_file(

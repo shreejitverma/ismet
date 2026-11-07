@@ -1187,6 +1187,7 @@ class TestUnreadableReports:
         held = await provider.quarantined()
         assert held[0].msg_type == "8"
         assert "12=bad" in held[0].content
+        await eventually(lambda: provider.session.next_inbound == acceptor.next_out)
         assert (
             await provider.session.run_store(
                 lambda: provider.session.store.next_inbound()
@@ -2939,7 +2940,7 @@ class TestHaltsAreDurable:
         row = (await provider.quarantined())[0]
         assert (row.msg_type, row.seq, row.halted) == ("*", expected, True)
         assert "to 499" in row.content
-        assert provider.session.next_inbound == 500
+        await eventually(lambda: provider.session.next_inbound == 500)
 
     async def test_an_unrequested_reset_at_logon_halts(
         self, acceptor: FixAcceptor, make_provider: ProviderFactory

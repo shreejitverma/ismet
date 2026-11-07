@@ -104,6 +104,9 @@ def risk(*, block_while_unknown: bool = False) -> RiskEngine:
     )
 
 
+LOST_ACK_TIMEOUT = 0.2
+
+
 class SimulatedCrash(BaseException):
     """The process died here."""
 
@@ -144,7 +147,9 @@ class Rig:
     async def build(
         self,
         *,
-        ack_timeout: float = 0.2,
+        # Generous, so a slow runner is not a lost ack. Tests of a lost ack pass
+        # LOST_ACK_TIMEOUT so the timeout they exercise stays short.
+        ack_timeout: float = 5.0,
         unknown_grace: float = 0.0,
         checkpoint: CheckpointHook | None = None,
         on_event: EventHook | None = None,
@@ -158,7 +163,7 @@ class Rig:
             self.store,
             ack_timeout=ack_timeout,
             query_timeout=1.0,
-            logon_timeout=5.0,
+            logon_timeout=15.0,
             venues=(ACME.venue,),
         )
         await self.provider.open()
@@ -209,7 +214,7 @@ class TestLostAck:
         self, acceptor: FixAcceptor, rig: Rig
     ) -> None:
         """The scenario this adapter exists for."""
-        oms = await rig.build()
+        oms = await rig.build(ack_timeout=LOST_ACK_TIMEOUT)
         acceptor.faults.lose_ack = 1
 
         state = await oms.submit(request())
@@ -248,7 +253,7 @@ class TestLostAck:
     async def test_a_late_ack_resolves_the_order_without_a_query(
         self, acceptor: FixAcceptor, rig: Rig
     ) -> None:
-        oms = await rig.build()
+        oms = await rig.build(ack_timeout=LOST_ACK_TIMEOUT)
         acceptor.faults.lose_ack = 1
         assert (await oms.submit(request())).status is OrderStatus.UNKNOWN
         await acceptor.exec_report("C1", "0", "0")
@@ -261,7 +266,7 @@ class TestLostAck:
     async def test_order_that_filled_while_the_ack_was_lost(
         self, acceptor: FixAcceptor, rig: Rig
     ) -> None:
-        oms = await rig.build()
+        oms = await rig.build(ack_timeout=LOST_ACK_TIMEOUT)
         acceptor.faults.lose_ack = 1
         assert (await oms.submit(request())).status is OrderStatus.UNKNOWN
         await acceptor.fill("C1", "100", "10.00")
@@ -273,7 +278,7 @@ class TestLostAck:
     async def test_order_the_venue_never_kept_is_rejected_after_the_grace_period(
         self, acceptor: FixAcceptor, rig: Rig
     ) -> None:
-        oms = await rig.build()
+        oms = await rig.build(ack_timeout=LOST_ACK_TIMEOUT)
         acceptor.faults.lose_ack = 1
         state = await oms.submit(request())
         assert state.status is OrderStatus.UNKNOWN
@@ -291,7 +296,7 @@ class TestLostAck:
     async def test_a_failed_query_leaves_the_order_unknown(
         self, acceptor: FixAcceptor, rig: Rig
     ) -> None:
-        oms = await rig.build()
+        oms = await rig.build(ack_timeout=LOST_ACK_TIMEOUT)
         acceptor.faults.lose_ack = 1
         await oms.submit(request())
         acceptor.faults.ignore_status_requests = True
@@ -509,7 +514,7 @@ class TestDuplicateOrderId:
         self, acceptor: FixAcceptor, rig: Rig
     ) -> None:
         """The venue already has the order, so calling it rejected would hide it."""
-        oms = await rig.build()
+        oms = await rig.build(ack_timeout=LOST_ACK_TIMEOUT)
         acceptor.orders["C1"] = VenueOrder(
             "C1", "C1", "ACME", "1", Decimal(100), Decimal(10), "O7"
         )
@@ -551,12 +556,12 @@ class TestCrashRecovery:
     async def test_process_death_after_the_send_resolves_on_restart(
         self, acceptor: FixAcceptor, rig: Rig
     ) -> None:
-        oms = await rig.build()
+        oms = await rig.build(ack_timeout=LOST_ACK_TIMEOUT)
         acceptor.faults.lose_ack = 1
         await oms.submit(request())
         await rig.teardown()
 
-        restarted = await rig.build()
+        restarted = await rig.build(ack_timeout=LOST_ACK_TIMEOUT)
 
         assert restarted.order("C1").status is OrderStatus.ACCEPTED
         assert len(acceptor.of_type("D")) == 1
