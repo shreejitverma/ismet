@@ -286,7 +286,7 @@ def test_calendar_views(capsys) -> None:  # type: ignore[no-untyped-def]
     code, out = run(capsys, "calendar", "XOFF")
     assert code == 1 and "no trading calendar" in out
     code, out = run(capsys, "calendar", "XNYS", "--on", "1990-01-02")
-    assert code == 1 and "Update ismet" in out
+    assert code == 1 and "Update ismet" in out and "docs/OPERATIONS.md" in out
     code, out = run(capsys, "calendar", "XNYS", "--on", "garbage")
     assert code == 1 and "error:" in out
 

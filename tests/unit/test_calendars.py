@@ -106,8 +106,10 @@ def test_india_calendars_include_republic_day() -> None:
 def test_out_of_range_query_raises_rather_than_guessing() -> None:
     assert XNYS.first_date == date(2007, 1, 3)
     for day in (XNYS.last_date + timedelta(days=1), date(1999, 1, 4)):
-        with pytest.raises(CalendarOutOfRange, match="covers"):
+        with pytest.raises(CalendarOutOfRange, match="covers") as raised:
             XNYS.is_session(day)
+        assert "load_calendar_file()" in str(raised.value)
+        assert "extended_through()" in str(raised.value)
     with pytest.raises(CalendarOutOfRange):
         XNYS.next_open(datetime.combine(XNYS.last_date, time(23), tzinfo=NY))
 

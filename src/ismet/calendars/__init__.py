@@ -227,8 +227,9 @@ class TradingCalendar:
         if not self.first_date <= day <= self.last_date:
             raise CalendarOutOfRange(
                 f"{self.venue} calendar data covers {self.first_date} to "
-                f"{self.last_date}; {day} is outside it. Update ismet, or supply "
-                "newer data with load_calendar_file()"
+                f"{self.last_date}; {day} is outside it. Update ismet, supply "
+                "newer data with load_calendar_file(), or extend the calendar from "
+                "the venue's holiday list with extended_through()"
             )
 
     def _is_session_unchecked(self, day: date) -> bool:
