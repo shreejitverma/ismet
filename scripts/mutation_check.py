@@ -6,9 +6,13 @@ file with a plausible bug, and names the tests that must fail when it is applied
 mutant those tests do not fail survives: the risk it stands for is not covered.
 The working tree is never touched; every mutant runs in a temporary copy.
 
-    uv run python scripts/mutation_check.py              # every mutant
-    uv run python scripts/mutation_check.py --only ID ...
-    uv run python scripts/mutation_check.py --list
+    uv run --python 3.10 python scripts/mutation_check.py              # every mutant
+    uv run --python 3.10 python scripts/mutation_check.py --only ID ...
+    uv run --python 3.10 python scripts/mutation_check.py --list
+
+A mutant with ``before_python = "3.12"`` can only be killed on an older interpreter.
+On that version or later it is not run and is reported as not applicable, counting
+as neither killed nor survived; on Python 3.12 or later one mutant does not apply.
 
 Exit status: 0 when every mutant is killed, or survives with a recorded
 ``equivalent`` reason; 1 when one survives without one, or an ``equivalent`` mutant
@@ -20,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -49,6 +54,7 @@ class Mutant:
     risk: str
     tests: tuple[str, ...]
     equivalent: str | None = None
+    before_python: str | None = None
 
 
 def load(path: Path = CATALOGUE) -> list[Mutant]:
@@ -63,6 +69,7 @@ def load(path: Path = CATALOGUE) -> list[Mutant]:
             risk=entry["risk"],
             tests=tuple(entry["tests"]),
             equivalent=entry.get("equivalent"),
+            before_python=entry.get("before_python"),
         )
         for entry in data["mutant"]
     ]
@@ -71,6 +78,19 @@ def load(path: Path = CATALOGUE) -> list[Mutant]:
     if duplicates:
         raise ValueError(f"duplicate mutant ids: {duplicates}")
     return mutants
+
+
+def python_version(text: object) -> tuple[int, int]:
+    """``"3.12"`` as ``(3, 12)``; ValueError for anything that is not MAJOR.MINOR."""
+    if not isinstance(text, str) or not re.fullmatch(r"\d+\.\d+", text):
+        raise ValueError(f"{text!r} is not a Python version like '3.12'")
+    major, minor = text.split(".")
+    return int(major), int(minor)
+
+
+def applies_here(m: Mutant, version: tuple[int, int] = sys.version_info[:2]) -> bool:
+    """Whether ``m`` can be killed on Python ``version``."""
+    return m.before_python is None or version < python_version(m.before_python)
 
 
 def problems(mutants: list[Mutant], root: Path = ROOT) -> list[str]:
@@ -91,6 +111,11 @@ def problems(mutants: list[Mutant], root: Path = ROOT) -> list[str]:
             except SyntaxError as exc:
                 # A mutant that cannot import fails every test for the wrong reason.
                 found.append(f"{m.id}: the mutated file does not compile: {exc.msg}")
+        if m.before_python is not None:
+            try:
+                python_version(m.before_python)
+            except ValueError as exc:
+                found.append(f"{m.id}: before_python {exc}")
         if m.find == m.replace:
             found.append(f"{m.id}: replace is the same as find")
         if not m.tests:
@@ -101,11 +126,18 @@ def problems(mutants: list[Mutant], root: Path = ROOT) -> list[str]:
     return found
 
 
+def environment(copy: Path) -> dict[str, str]:
+    return {
+        **os.environ,
+        "PYTHONPATH": str(copy / "src"),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+
+
 def run_tests(copy: Path, tests: tuple[str, ...]) -> tuple[bool, float, str]:
     """Whether the tests pass in ``copy``, how long they took, and the last line."""
-    env = {**os.environ, "PYTHONPATH": str(copy / "src")}
     command = [
-        sys.executable, "-m", "pytest", "-x", "-q",
+        sys.executable, "-B", "-m", "pytest", "-x", "-q",
         "-p", "no:cacheprovider", "--no-cov",
         # It checks the catalogue against the source, so it fails for every mutant
         # and would make each one look killed.
@@ -116,7 +148,7 @@ def run_tests(copy: Path, tests: tuple[str, ...]) -> tuple[bool, float, str]:
         done = subprocess.run(
             command,
             cwd=copy,
-            env=env,
+            env=environment(copy),
             capture_output=True,
             text=True,
             timeout=TIMEOUT_SECONDS,
@@ -129,11 +161,10 @@ def run_tests(copy: Path, tests: tuple[str, ...]) -> tuple[bool, float, str]:
 
 
 def imports_the_copy(copy: Path) -> bool:
-    env = {**os.environ, "PYTHONPATH": str(copy / "src")}
     found = subprocess.run(
-        [sys.executable, "-c", "import ismet; print(ismet.__file__)"],
+        [sys.executable, "-B", "-c", "import ismet; print(ismet.__file__)"],
         cwd=copy,
-        env=env,
+        env=environment(copy),
         capture_output=True,
         text=True,
         check=True,
@@ -162,6 +193,14 @@ def main(argv: list[str]) -> int:
     if broken:
         print("catalogue does not apply:", *broken, sep="\n  ", file=sys.stderr)
         return 2
+    here = "{}.{}".format(*sys.version_info[:2])
+    skipped = [m for m in mutants if not applies_here(m)]
+    for m in skipped:
+        print(f"{m.id:<44} not applicable on Python {here}: {m.risk}")
+    mutants = [m for m in mutants if applies_here(m)]
+    if not mutants:
+        print(f"\n0 mutants run, {len(skipped)} not applicable on Python {here}")
+        return 0
 
     with tempfile.TemporaryDirectory(prefix="ismet-mutation-") as tmp:
         copy = Path(tmp) / "repo"
@@ -201,7 +240,8 @@ def main(argv: list[str]) -> int:
     killed += len(stale)
     print(
         f"\n{killed} of {len(mutants)} mutants killed, {len(survivors)} survived, "
-        f"{sum(1 for m in mutants if m.equivalent) - len(stale)} recorded equivalent"
+        f"{sum(1 for m in mutants if m.equivalent) - len(stale)} recorded equivalent, "
+        f"{len(skipped)} not applicable on Python {here}"
     )
     for m in survivors:
         print(f"survived: {m.id}: {m.risk}")

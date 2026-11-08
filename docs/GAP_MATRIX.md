@@ -20,7 +20,8 @@ ISMET has never placed an order at a real broker, so it is not production-ready.
 
 - Crash safety: tests in `tests/execution/test_sigkill.py` deliver real `SIGKILL` at each send step and at random moments, and a matrix of simulated crashes covers network faults.
 - Tests that catch regressions: 54 hand-written mutants of the safety-critical code in `mutation/mutants.toml`, covering the order manager, kill switch, journal, order state, pre-trade risk, HTTP retry rules, the FIX session and provider, cancellation, and decimal arithmetic.
-  All 54 were killed on 2026-11-08 by `uv run python scripts/mutation_check.py`, which takes about 4 minutes.
+  All 54 were killed on 2026-11-08 by `uv run --python 3.10 python scripts/mutation_check.py`, which takes about 4 minutes.
+  On Python 3.12 or later one mutant, of a workaround only older interpreters need, does not apply and is reported as such.
   Five first survived, and four new tests now kill them.
   A weekly CI workflow is set to repeat the run but has not run yet, and a unit test fails when a refactor stops a mutant from applying.
 - Independent review: three fresh-context reviews reproduced about 100 defects in the first version of the core, each fixed with a regression test. A later review covered `ismet.fix`, the adapters, and the rest of the change, by reading and tracing, and its findings were fixed in the same change with regression tests. No second review has judged those fixes.

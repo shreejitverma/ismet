@@ -8,6 +8,7 @@ mutant into one that no longer applies, which would quietly drop a covered risk.
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -85,3 +86,62 @@ def test_a_mutant_that_cannot_apply_is_reported(
     mutants = mutation_check.load(catalogue(tmp_path, entry))
     found = mutation_check.problems(mutants, tmp_path)
     assert any(named in line for line in found), found
+
+
+@pytest.mark.parametrize("version", ["3", "3.12.1", "three.twelve", "3.x", 3.12])
+def test_an_unparseable_before_python_is_reported(
+    tmp_path: Path, version: object
+) -> None:
+    write_tree(tmp_path, "a = 1\n")
+    entry = ENTRY.format(id="m", find="a = 1", replace="a = 2", test="tests/test_x.py")
+    value = f'"{version}"' if isinstance(version, str) else str(version)
+    mutants = mutation_check.load(
+        catalogue(tmp_path, entry + f"before_python = {value}\n")
+    )
+    found = mutation_check.problems(mutants, tmp_path)
+    assert any("before_python" in line for line in found), found
+
+
+def test_a_mutant_only_killable_before_a_version_does_not_apply_from_it(
+    tmp_path: Path,
+) -> None:
+    entry = ENTRY.format(id="m", find="a = 1", replace="a = 2", test="tests/test_x.py")
+    (gated,) = mutation_check.load(
+        catalogue(tmp_path, entry + 'before_python = "3.12"\n')
+    )
+    (plain,) = mutation_check.load(catalogue(tmp_path, entry))
+    assert mutation_check.applies_here(gated, (3, 11))
+    assert not mutation_check.applies_here(gated, (3, 12))
+    assert not mutation_check.applies_here(gated, (3, 13))
+    assert mutation_check.applies_here(plain, (3, 13))
+
+    here = "{}.{}".format(*sys.version_info[:2])
+    (running,) = mutation_check.load(
+        catalogue(tmp_path, entry + f'before_python = "{here}"\n')
+    )
+    assert not mutation_check.applies_here(running)
+
+
+def test_a_mutant_whose_restored_file_matches_its_size_and_mtime_is_not_cached(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "src").mkdir()
+    module = tmp_path / "src" / "target.py"
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_target.py").write_text(
+        "import target\n\n\ndef test_value():\n    assert target.VALUE == 1\n",
+        encoding="utf-8",
+    )
+    tests = ("tests/test_target.py",)
+    stamp = 1_700_000_000
+
+    module.write_text("VALUE = 2\n", encoding="utf-8")
+    os.utime(module, (stamp, stamp))
+    passed, _, _ = mutation_check.run_tests(tmp_path, tests)
+    assert not passed
+
+    module.write_text("VALUE = 1\n", encoding="utf-8")
+    os.utime(module, (stamp, stamp))
+    passed, _, last = mutation_check.run_tests(tmp_path, tests)
+    assert passed, last
+    assert not list(tmp_path.rglob("*.pyc"))

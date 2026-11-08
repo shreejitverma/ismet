@@ -4,6 +4,8 @@
 # plausible bug, and names the tests that must fail with it applied. `risk` says
 # what a survivor would mean. A mutant that cannot change behaviour gets an
 # `equivalent` reason instead of being deleted, so the decision stays visible.
+# A mutant that can only be killed on older interpreters gets `before_python`, the
+# first version (MAJOR.MINOR) it does not apply to; there it is reported, not run.
 # Hand-picked mutants show the named risks are covered, not that all behaviour is.
 
 # Order manager: admission
@@ -634,6 +636,7 @@ find = "    if sys.version_info >= (3, 12):"
 replace = "    if sys.version_info >= (3, 10):"
 risk = "a caller cancelled as its operation finishes carries on with the result on Python 3.10 and 3.11"
 tests = ["tests/unit/test_aio.py"]
+before_python = "3.12"
 
 [[mutant]]
 id = "decimal-add-uses-ambient-context"
