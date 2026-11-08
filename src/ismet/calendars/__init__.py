@@ -7,8 +7,10 @@ unknown future date as an ordinary weekday is how a system sends orders into a
 holiday, so it is not done.
 
 Holidays can change after a release. :meth:`TradingCalendar.with_closure` and
-:meth:`TradingCalendar.with_hours` apply an announced change immediately, and
-:func:`load_calendar_file` replaces a venue's data without a package upgrade.
+:meth:`TradingCalendar.with_hours` apply an announced change immediately,
+:meth:`TradingCalendar.extended_through` extends a venue past its data from the
+venue's own holiday list, and :func:`load_calendar_file` replaces a venue's data
+without a package upgrade.
 
 Sessions cover regular hours and intraday breaks. Pre-open, auction, and extended
 sessions are venue-specific and are not modelled yet.
