@@ -462,7 +462,10 @@ def _doctor() -> int:
                 {
                     "check": f"calendar {code}",
                     "status": "warn",
-                    "detail": f"data ends {calendar.last_date}; update ismet",
+                    "detail": (
+                        f"data ends {calendar.last_date}; update ismet, or extend it "
+                        "from the venue's holiday list (docs/OPERATIONS.md)"
+                    ),
                 }
             )
     payload: dict[str, Any] = {
@@ -881,7 +884,10 @@ def _error_hint(exc: Exception) -> str:
     if isinstance(exc, NotSupported):
         return "Run `ismet providers <name>` to see a provider's capabilities"
     if isinstance(exc, CalendarOutOfRange):
-        return "Update ismet for newer calendar data"
+        return (
+            "Update ismet, load newer calendar data, or extend the calendar from "
+            "the venue's holiday list (docs/OPERATIONS.md)"
+        )
     return "Run `ismet doctor` to check configuration"
 
 

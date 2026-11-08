@@ -2,7 +2,7 @@
 
 The honest status of every requirement in [MASTER_PROMPT.md](MASTER_PROMPT.md).
 Update it in the same change as the work.
-Last assessed on 2026-11-01 at version 0.4.0.
+Last assessed on 2026-11-08 at version 0.4.0.
 
 **Overall: P0 is done, P3's stated scope and exit are met with its optional order types still missing, P1, P2, and P5 are partial, and P4 and P6 have not started.**
 P5 work began before P4's evidence exists, which departs from the brief's phase order: P4 is blocked on accounts, and the FIX engine and audit work did not need it.
@@ -19,19 +19,23 @@ ISMET has never placed an order at a real broker, so it is not production-ready.
 ## Evidence behind "Proven"
 
 - Crash safety: tests in `tests/execution/test_sigkill.py` deliver real `SIGKILL` at each send step and at random moments, and a matrix of simulated crashes covers network faults.
-- Tests that catch regressions: 88 hand-written mutants of the safety-critical code. 87 were caught, and the survivor (removing an early return in fill deduplication) left behaviour identical.
+- Tests that catch regressions: 54 hand-written mutants of the safety-critical code in `mutation/mutants.toml`, covering the order manager, kill switch, journal, order state, pre-trade risk, HTTP retry rules, the FIX session and provider, cancellation, and decimal arithmetic.
+  All 54 were killed on 2026-11-08 by `uv run --python 3.10 python scripts/mutation_check.py`, which takes about 4 minutes.
+  On Python 3.12 or later one mutant, of a workaround only older interpreters need, does not apply and is reported as such.
+  Five first survived, and four new tests now kill them.
+  A weekly CI workflow is set to repeat the run but has not run yet, and a unit test fails when a refactor stops a mutant from applying.
 - Independent review: three fresh-context reviews reproduced about 100 defects in the first version of the core, each fixed with a regression test. A later review covered `ismet.fix`, the adapters, and the rest of the change, by reading and tracing, and its findings were fixed in the same change with regression tests. No second review has judged those fixes.
 
-Mutants are hand-picked, so "87 of 88" says the listed risks are covered, not that all behaviour is.
-No list of those mutants or script to rerun them is committed, so the figure cannot be reproduced, and it predates the later fixes.
-This falls short of the brief's "phase evidence is published in the repo".
+Mutants are hand-picked, so "54 of 54" says the listed risks are covered, not that all behaviour is.
+An earlier, uncommitted set of 88 mutants is retired; the committed catalogue replaces it and anyone can rerun it.
 
 ## Known limits
 
 - A lost FIX 150=G before a crash can cause a false overfill halt on restart: the first reconciliation runs before the stream replays busts, so it books the corrected fill while the old one still counts. This fails closed, and clears after an operator release.
 - The first FIX sequence reset of a session period makes the prior period's messages unrequestable. With an order working and a previous connection that did not end with a clean Logout exchange, the reset halts through the quarantine until an operator releases it. After a clean Logout, a report the venue sent while we were logged out is caught only by the reconciliation CumQty comparison on an open order.
 - A FIX SequenceReset-GapFill over a report the venue no longer holds is not visible when it arrives. The next report on that order whose CumQty differs from the fills received, below for a lost bust or correction and above for a lost fill, halts through the quarantine and ends in a `FILL_MISMATCH` break. With no later report, only reconciliation of an open order can catch it.
-- XBOM, XSHG, and XSES data, and the aliases XNSE and XSHE, ends on 2026-12-31, two months from this assessment, and orders on those venues are then refused unless they rest for later. Refresh the snapshot before then.
+- XBOM, XSHG, and XSES data, and the aliases XNSE and XSHE, ends on 2026-12-31, and orders on those venues are then refused unless they rest for later.
+  The newest exchange_calendars (4.13.2, checked 2026-11-07) still ends there, so no release can extend it yet; an operator extends a venue from its own holiday circular with `TradingCalendar.extended_through`, as docs/OPERATIONS.md describes.
 - The bundled calendars hold no weekend session for any venue, XBOM included: every venue's `extra` list is empty and no `special` date falls on a weekend.
   A weekend session a venue really holds therefore reads as closed, and whether XBOM holds any has not been checked.
 - Conformance does not check for open bars.
@@ -59,7 +63,7 @@ This falls short of the brief's "phase evidence is published in the repo".
 | Contract specs | Partial | Option and future terms are validated. Chains and continuous contracts are missing. |
 | Point-in-time security master | Built | `SecurityMaster` works but ships empty: no vendor feeds it yet. |
 | Corporate actions | Built | Split and dividend back-adjustment. A dividend needs the bar of the session before its ex-date, or an explicit `price_factor`. Rights, spin-offs, and mergers need an explicit factor. No vendor feeds it yet. |
-| Calendars | Built | 24 venues and 4 aliases, checked against the source (4.13.2 in CI, the newest weekly). XNSE, XBOM, XSHG, XSHE, XSES data ends 2026-12-31. Aliases are stated assumptions, and are not checked against the source. |
+| Calendars | Built | 24 venues and 4 aliases, checked against the source (4.13.2 in CI, the newest weekly). XNSE, XBOM, XSHG, XSHE, XSES data ends 2026-12-31, and an operator can extend a venue from its published holiday list. Aliases are stated assumptions, and are not checked against the source. |
 | Pre-open, auction, extended sessions | Missing | Regular hours and breaks only. |
 | Data quality monitor | Built | Not wired into streams by default; the caller runs it. |
 | Conformance v2 | Proven | Market data and trading suites. Tests prove the trading suite catches broken adapters. |
@@ -87,7 +91,7 @@ This falls short of the brief's "phase evidence is published in the repo".
 | Pre-trade risk | Proven | Fails closed. Locates are a caller-supplied hook. |
 | Kill switch | Proven | Across processes. Limit: if the journal is down when it is engaged and the process then stops, the engagement is lost, and this is logged at critical level. |
 | Simulated venue | Built | Faults modelled on broker behaviour from general knowledge, not validated against any broker. |
-| Reconciliation | Proven | Orders, fills including closed orders, positions. The sweep window is durable. Mutation figures above predate the latest fixes. |
+| Reconciliation | Proven | Orders, fills including closed orders, positions. The sweep window is durable. |
 | Gross exposure | Built | Current marks refreshed per order, never cost basis. Fails closed across currencies, since no rate table exists. |
 | Brackets, OCO, multi-leg | Missing | Not in the brief's P3 scope, listed for honesty. |
 | Client-side order emulation | Missing | Deliberately absent. |
@@ -107,9 +111,9 @@ This falls short of the brief's "phase evidence is published in the repo".
 | ITCH, OUCH, SBE parsers | Missing | |
 | Audit trail | Proven | Hash chain, append-only triggers, anchor file. Not assessed against Rule 17a-4. |
 | Control mappings | Partial | SEC 15c3-5, Reg SHO, MiFID II RTS 6 and RTS 25, SEBI, with unverified items marked. DORA, MAR, MiCA, and CAT are not mapped. |
-| Metrics | Built | Protocol and hooks. OpenTelemetry extra is missing. |
+| Metrics | Built | Protocol and hooks, and an OpenTelemetry adapter in the `otel` extra, tested against the SDK's in-memory reader. Not run against a real collector. |
 | Runbook | Built | Not yet tested by a person other than its author. |
-| Threat model, supply chain | Built | CI workflows have not run yet, including attestation, SBOM, the release gate, and the Dependabot configuration. Action commits were checked once against upstream tags with `git ls-remote`, which shows the tag points at the commit and says nothing about its contents. |
+| Threat model, supply chain | Built | The CI matrix, CodeQL, and Dependabot have run; the release workflow, with attestation, SBOM, and the release gate, has not, since no version tag has been pushed. Action commits were checked once against upstream tags with `git ls-remote`, which shows the tag points at the commit and says nothing about its contents. |
 | Vault, KMS, keychain, rotation | Missing | |
 | Performance gates | Built | Generous CPU budgets. Group commit is not built. |
 | Post-trade accounting | Built | Lots, P&L, per-currency fees, slippage. `Valuation.fills_with_unknown_fee` says when fees are a lower bound. `AVERAGE` lots round at the decimal context, so their P&L is not exact. Exchange taxes such as STT and settlement cash are not modelled. |

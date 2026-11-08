@@ -286,7 +286,7 @@ def test_calendar_views(capsys) -> None:  # type: ignore[no-untyped-def]
     code, out = run(capsys, "calendar", "XOFF")
     assert code == 1 and "no trading calendar" in out
     code, out = run(capsys, "calendar", "XNYS", "--on", "1990-01-02")
-    assert code == 1 and "Update ismet" in out
+    assert code == 1 and "Update ismet" in out and "docs/OPERATIONS.md" in out
     code, out = run(capsys, "calendar", "XNYS", "--on", "garbage")
     assert code == 1 and "error:" in out
 
@@ -1214,6 +1214,20 @@ def test_export_never_replaces_a_file_that_appeared_meanwhile(
     assert code == 1 and "already exists" in out
     assert out_path.read_text(encoding="utf-8") == "someone else's audit file"
     assert [p.name for p in tmp_path.glob(".out.jsonl.*")] == []
+
+
+def test_doctor_warns_of_calendar_data_ending_and_names_both_remedies(
+    capsys, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr(
+        "ismet.cli._now", lambda: datetime(2026, 11, 7, 12, 0, tzinfo=timezone.utc)
+    )
+    _, out = run(capsys, "doctor")
+    warned = [line for line in out.splitlines() if "calendar XBOM" in line]
+    assert warned and "warn" in warned[0]
+    assert "data ends 2026-12-31" in warned[0]
+    assert "extend it" in warned[0] and "OPERATIONS" in warned[0]
+    assert not [line for line in out.splitlines() if "calendar XNYS" in line]
 
 
 def test_doctor_names_the_config_file_it_read(

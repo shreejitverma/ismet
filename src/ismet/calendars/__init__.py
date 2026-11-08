@@ -7,8 +7,10 @@ unknown future date as an ordinary weekday is how a system sends orders into a
 holiday, so it is not done.
 
 Holidays can change after a release. :meth:`TradingCalendar.with_closure` and
-:meth:`TradingCalendar.with_hours` apply an announced change immediately, and
-:func:`load_calendar_file` replaces a venue's data without a package upgrade.
+:meth:`TradingCalendar.with_hours` apply an announced change immediately,
+:meth:`TradingCalendar.extended_through` extends a venue past its data from the
+venue's own holiday list, and :func:`load_calendar_file` replaces a venue's data
+without a package upgrade.
 
 Sessions cover regular hours and intraday breaks. Pre-open, auction, and extended
 sessions are venue-specific and are not modelled yet.
@@ -18,6 +20,7 @@ from __future__ import annotations
 
 import copy
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from enum import Enum
@@ -147,6 +150,40 @@ class TradingCalendar:
             edited._special = special
         return edited
 
+    def extended_through(
+        self, last: date, *, closed: Iterable[date], source: str
+    ) -> TradingCalendar:
+        """A copy covering dates up to ``last``, from a venue's published holiday list.
+
+        For the gap between a release's snapshot and the venue's next calendar: the
+        current regular hours continue, and ``closed`` must name every weekday in the
+        new dates with no session, taken from the venue's own circular. An empty list
+        is a claim that there is none. ``source`` names that circular and is kept on
+        the calendar. Half days and weekend sessions are then set with
+        :meth:`with_hours`. Aliases are separate calendars: extend each one used.
+        """
+        if not source.strip():
+            raise ValidationError("an extension needs the source of its holiday list")
+        if last <= self.last_date:
+            raise ValidationError(
+                f"{self.venue} already covers {self.last_date}; extend past it"
+            )
+        added = frozenset(closed)
+        outside = sorted(d for d in added if not self.last_date < d <= last)
+        if outside:
+            raise ValidationError(
+                f"closures {outside} fall outside the extension "
+                f"{self.last_date + timedelta(days=1)} to {last}"
+            )
+        weekend = sorted(d for d in added if d.weekday() >= 5)
+        if weekend:
+            raise ValidationError(f"closures {weekend} fall on weekends")
+        edited = self._replace(closed=self._closed | added)
+        edited.last_date = last
+        note = f"extended to {last.isoformat()} from {source.strip()}"
+        edited.source = f"{self.source}; {note}" if self.source else note
+        return edited
+
     def with_closure(self, day: date) -> TradingCalendar:
         """A copy with ``day`` closed, for an announced unscheduled closure."""
         self._check_range(day)
@@ -190,8 +227,9 @@ class TradingCalendar:
         if not self.first_date <= day <= self.last_date:
             raise CalendarOutOfRange(
                 f"{self.venue} calendar data covers {self.first_date} to "
-                f"{self.last_date}; {day} is outside it. Update ismet, or supply "
-                "newer data with load_calendar_file()"
+                f"{self.last_date}; {day} is outside it. Update ismet, supply "
+                "newer data with load_calendar_file(), or extend the calendar from "
+                "the venue's holiday list with extended_through()"
             )
 
     def _is_session_unchecked(self, day: date) -> bool:

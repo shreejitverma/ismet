@@ -28,7 +28,14 @@ from ismet.models import (
     datetime_from_ns,
     to_decimal,
 )
-from ismet.models.decimals import is_multiple, midpoint, ratio, round_to_step
+from ismet.models.decimals import (
+    absolute,
+    add,
+    is_multiple,
+    midpoint,
+    ratio,
+    round_to_step,
+)
 from ismet.models.types import Currency, VenueCode
 from ismet.refdata import (
     currency_info,
@@ -97,6 +104,15 @@ def test_rounding_is_independent_of_the_callers_decimal_context() -> None:
         ctx.prec = 5
         assert tiny.round_price(big, Rounding.FLOOR) == big
         assert tiny.is_tick_aligned(big)
+
+
+def test_sums_and_absolute_values_are_independent_of_the_callers_context() -> None:
+    notional = D("-123456789012.123456789012345678")
+    fee = D("-0.000000000000000001")
+    with decimal.localcontext() as ctx:
+        ctx.prec = 5
+        assert add(notional, fee) == D("-123456789012.123456789012345679")
+        assert absolute(notional) == D("123456789012.123456789012345678")
 
 
 def test_midpoint_is_exact_beyond_the_default_context() -> None:
@@ -403,6 +419,14 @@ async def test_5xx_on_order_post_is_ambiguous_and_never_resent(status: int) -> N
         with pytest.raises(AmbiguousOutcome) as caught:
             await t.post_json("/orders", {})
     assert caught.value.status == status and not caught.value.retryable
+    assert calls == ["POST"]
+
+
+async def test_an_accepted_order_post_with_an_unreadable_answer_is_ambiguous() -> None:
+    calls, transport = counting(lambda _: httpx.Response(200, text="<html>ok</html>"))
+    async with HttpTransport("https://v", transport=transport, retry_policy=FAST) as t:
+        with pytest.raises(AmbiguousOutcome, match="unreadable response"):
+            await t.post_json("/orders", {})
     assert calls == ["POST"]
 
 

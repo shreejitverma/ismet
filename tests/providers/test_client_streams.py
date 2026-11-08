@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import uuid
 from itertools import pairwise
 from typing import Any
 
@@ -249,8 +250,13 @@ async def test_a_venue_refusal_survives_a_full_dropping_queue() -> None:
 
 async def test_a_handshake_429_waits_out_its_retry_after() -> None:
     attempts: list[float] = []
+    # Only this test's client asks for this path: a client left reconnecting by
+    # another test can land on the reused port, and must not count here.
+    path = f"/t-{uuid.uuid4().hex}"
 
     def process_request(conn: ServerConnection, request: Request) -> WsResponse | None:
+        if request.path != path:
+            return conn.respond(404, "not this test")
         attempts.append(time.monotonic())
         if len(attempts) > 1:
             return None
@@ -265,7 +271,7 @@ async def test_a_handshake_429_waits_out_its_retry_after() -> None:
         handler, "127.0.0.1", 0, process_request=process_request
     ) as server:
         port = next(iter(server.sockets)).getsockname()[1]
-        ws = WebSocketTransport(f"ws://127.0.0.1:{port}", backoff=FAST_BACKOFF)
+        ws = WebSocketTransport(f"ws://127.0.0.1:{port}{path}", backoff=FAST_BACKOFF)
         await ws.start()
         await ws.close()
     assert len(attempts) == 2

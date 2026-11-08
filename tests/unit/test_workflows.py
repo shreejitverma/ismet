@@ -412,3 +412,17 @@ def test_a_missing_sdist_is_refused(tmp_path: Path) -> None:
     make_dist(dist)
     (dist / "ismet-1.tar.gz").unlink()
     assert run_script("check_dist.py", str(dist)).returncode == 1
+
+
+def test_dependabot_updates_only_the_uv_lockfile() -> None:
+    """Dependabot's uv updates touch uv.lock only, never pyproject.toml specifiers.
+
+    A Dependabot uv PR once rewrote the specifiers recorded in uv.lock without changing
+    pyproject.toml, so `uv lock --check` failed and main's CI went red. The oracle is
+    GitHub's documented `lockfile-only` versioning strategy for the uv ecosystem.
+    """
+    config = yaml.safe_load(
+        (ROOT.parent / "dependabot.yml").read_text(encoding="utf-8")
+    )
+    (uv,) = [u for u in config["updates"] if u["package-ecosystem"] == "uv"]
+    assert uv["versioning-strategy"] == "lockfile-only"

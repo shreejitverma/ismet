@@ -10,6 +10,7 @@ from decimal import Decimal
 
 import pytest
 from websockets.asyncio.server import Server, ServerConnection, serve
+from websockets.datastructures import Headers
 from websockets.exceptions import InvalidStatus, InvalidURI
 from websockets.http11 import Request, Response
 
@@ -595,3 +596,16 @@ async def test_a_control_frame_eviction_does_not_swallow_a_newest_drop() -> None
     assert told["B"] is True  # A was evicted ahead of it.
     assert told["C"] is False  # Nothing was lost between B and C.
     assert told["control"] or told["E"]  # D was lost, and something must say so.
+
+
+async def test_a_handshake_wait_outlasts_a_sleep_ending_a_tick_early() -> None:
+    # asyncio runs a timer once the clock is within its resolution of the due time
+    # (BaseEventLoop._run_once), so asyncio.sleep(d) may end at d - tick: 15.6 ms on
+    # Windows before Python 3.13. Unpadded, the reconnect after a 429 came 9 ms
+    # inside the venue's Retry-After of 0.4 s on a Windows runner.
+    tick = asyncio.get_running_loop()._clock_resolution
+    stated = 0.25
+    rejected = InvalidStatus(
+        Response(429, "Too Many Requests", Headers({"Retry-After": str(stated)}), b"")
+    )
+    assert make("ws://127.0.0.1:1")._stated_wait(rejected) - tick >= stated

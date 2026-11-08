@@ -55,7 +55,7 @@ from websockets.asyncio.client import ClientConnection, connect
 
 from ismet import _aio
 from ismet.errors import AuthError, IsmetError, RateLimited, TransportError
-from ismet.transport.backoff import ExponentialBackoff
+from ismet.transport.backoff import _CLOCK_TICK, ExponentialBackoff
 from ismet.transport.clock import SYSTEM_CLOCK, Clock
 from ismet.transport.http import retry_after_seconds
 
@@ -450,7 +450,10 @@ class WebSocketTransport:
         return {name.lower(): v for name, v in exc.response.headers.raw_items()}
 
     def _stated_wait(self, exc: websockets.exceptions.InvalidStatus) -> float:
-        return retry_after_seconds(self._headers(exc), clock=self._clock) or 0.0
+        # Padded by a clock tick, as RetryPolicy pads one: asyncio.sleep can end a
+        # tick early, which would reconnect inside the venue's stated wait.
+        stated = retry_after_seconds(self._headers(exc), clock=self._clock)
+        return 0.0 if stated is None else stated + _CLOCK_TICK
 
     def _rejected(self, exc: websockets.exceptions.InvalidStatus) -> IsmetError | None:
         if self._on_rejected is None:

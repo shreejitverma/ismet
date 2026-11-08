@@ -16,6 +16,8 @@ Pure-Python wheel on Linux, macOS, and Windows, x86_64 and arm64, Python 3.10 to
 pip install ismet
 ```
 
+Optional extras: `ismet[pandas]` and `ismet[polars]` for dataframes, and `ismet[otel]` to record metrics through OpenTelemetry.
+
 ## See it work, with no account
 
 ```bash
@@ -184,6 +186,7 @@ Data comes from `exchange_calendars`, and CI checks each source venue session by
 XNSE, XNAS, XJPX, and XSHE are stated aliases of XBOM, XNYS, XTKS, and XSHG, so that proof does not reach them.
 A registered closure lasts for the running process, so apply it at startup in each one.
 **XNSE, XBOM, XSHG, XSHE, and XSES data ends on 2026-12-31**, because the source's lists end there.
+Until a release covers later dates, extend a venue from its exchange's own holiday circular with `extended_through`, as [docs/OPERATIONS.md](docs/OPERATIONS.md) shows.
 Pre-open, auction, and extended sessions are not modelled.
 
 ## Configuration
