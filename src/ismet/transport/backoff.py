@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import time
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from typing import TypeVar
@@ -11,6 +12,10 @@ from typing import TypeVar
 from ismet.errors import IsmetError, RateLimited, TransportError
 
 T = TypeVar("T")
+
+# asyncio ends a sleep up to one tick of the monotonic clock early (15.6 ms on
+# Windows before Python 3.13), so a stated wait is padded by that tick.
+_CLOCK_TICK = time.get_clock_info("monotonic").resolution
 
 
 @dataclass(frozen=True)
@@ -76,9 +81,13 @@ class RetryPolicy:
             raise ValueError("max_attempts must be >= 1")
 
     def delay_for(self, attempt: int, exc: BaseException) -> float:
-        """Delay before the next attempt, honouring ``RateLimited.retry_after``."""
+        """Delay before the next attempt, honouring ``RateLimited.retry_after``.
+
+        A stated wait is padded by one tick of the monotonic clock, so the retry
+        cannot wake before the stated time and be sent early or refused again.
+        """
         if isinstance(exc, RateLimited) and exc.retry_after is not None:
-            return max(exc.retry_after, 0.0)
+            return max(exc.retry_after, 0.0) + _CLOCK_TICK
         return self.backoff.delay(attempt)
 
     def stated_wait_too_long(self, exc: BaseException) -> bool:

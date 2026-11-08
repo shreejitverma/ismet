@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import textwrap
@@ -260,7 +261,7 @@ class TestSqlite:
         src = Path(__file__).resolve().parents[2] / "src"
         result = subprocess.run(
             [sys.executable, "-c", script],
-            env={"PYTHONPATH": str(src)},
+            env={**os.environ, "PYTHONPATH": str(src)},
             check=False,
         )
         assert result.returncode == 9

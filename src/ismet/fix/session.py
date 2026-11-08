@@ -474,10 +474,7 @@ class FixSession:
             self._set_state(SessionState.CONNECTING)
             was_ready = False
             try:
-                reader, writer = await _aio.wait_for(
-                    asyncio.open_connection(cfg.host, cfg.port, ssl=cfg.ssl),
-                    cfg.connect_timeout,
-                )
+                reader, writer = await self._connect()
             except (OSError, asyncio.TimeoutError) as exc:
                 reason = f"connect failed: {type(exc).__name__}"
             else:
@@ -504,6 +501,28 @@ class FixSession:
                 )
                 return
             await asyncio.sleep(cfg.reconnect_backoff.delay(max(attempt - 1, 0)))
+
+    async def _connect(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        """Open the connection, closing one that a cancel overtook.
+
+        A connect that finishes in the same loop turn as a cancel of this task ends
+        in ``CancelledError`` with its result dropped, which would leave the socket
+        open to the venue until garbage collection.
+        """
+        cfg = self.config
+        opening = asyncio.ensure_future(
+            asyncio.open_connection(cfg.host, cfg.port, ssl=cfg.ssl)
+        )
+        try:
+            return await _aio.wait_for(opening, cfg.connect_timeout)
+        except BaseException:
+            if (
+                opening.done()
+                and not opening.cancelled()
+                and opening.exception() is None
+            ):
+                opening.result()[1].close()
+            raise
 
     def _on_disconnected(self, reason: str) -> None:
         logger.warning(
