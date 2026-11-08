@@ -104,7 +104,9 @@ def risk(*, block_while_unknown: bool = False) -> RiskEngine:
     )
 
 
-LOST_ACK_TIMEOUT = 0.2
+# The one ack timeout also bounds the answers a lost-ack test expects, such as the
+# protective cancel reconcile sends, so it must outlast a slow runner's reply.
+LOST_ACK_TIMEOUT = 1.0
 
 
 class SimulatedCrash(BaseException):
