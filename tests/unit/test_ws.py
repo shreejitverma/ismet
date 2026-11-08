@@ -132,11 +132,15 @@ async def test_gives_up_after_max_reconnects() -> None:
 
 
 async def test_max_reconnects_exhaustion_fails_start_promptly() -> None:
+    # Promptly means before the start timeout, not after it. Windows answers a
+    # closed port only after about 2s of SYN retries per attempt, so a fixed
+    # wall-clock bound below that would measure the OS, not the transport.
+    timeout = 20.0
     ws = make("ws://127.0.0.1:1", max_reconnects=1)
     started = time.monotonic()
     with pytest.raises(TransportError, match="failed after 1 reconnects") as info:
-        await ws.start(timeout=10)
-    assert time.monotonic() - started < 2.0
+        await ws.start(timeout=timeout)
+    assert time.monotonic() - started < timeout / 2
     assert ws.state is ConnectionState.FAILED
     assert isinstance(info.value.__cause__, OSError)
     await ws.close()

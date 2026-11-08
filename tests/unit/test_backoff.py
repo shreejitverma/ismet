@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import random
+import time
 
 import pytest
 from hypothesis import given
@@ -136,7 +138,20 @@ async def test_retry_waits_each_stated_retry_after_within_the_cap() -> None:
 
     policy = RetryPolicy(max_attempts=3, max_retry_after=10)
     assert await retry(fn, policy, sleep=sleep) == 3
-    assert slept == [10, 0.25]
+    tick = time.get_clock_info("monotonic").resolution
+    assert slept == [10 + tick, 0.25 + tick]
+
+
+async def test_a_stated_wait_outlasts_an_asyncio_sleep_that_ends_a_tick_early() -> None:
+    # asyncio runs a timer once the clock is within its resolution of the due
+    # time (BaseEventLoop._run_once), so asyncio.sleep(d) may end at d - tick.
+    # On Windows before Python 3.13 the tick is 15.6 ms, and an unpadded retry
+    # woke inside the venue's wait, was refused by the local hold, and ran out
+    # of attempts.
+    tick = asyncio.get_running_loop()._clock_resolution
+    stated = 0.25
+    delay = RetryPolicy().delay_for(0, RateLimited("slow", retry_after=stated))
+    assert delay - tick >= stated
 
 
 @pytest.mark.parametrize("cap", [0.5, 10.0])
