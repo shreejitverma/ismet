@@ -6,5 +6,6 @@ updates:
       interval: weekly
   - package-ecosystem: uv
     directory: /
+    versioning-strategy: lockfile-only
     schedule:
       interval: weekly
