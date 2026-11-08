@@ -462,7 +462,10 @@ def _doctor() -> int:
                 {
                     "check": f"calendar {code}",
                     "status": "warn",
-                    "detail": f"data ends {calendar.last_date}; update ismet",
+                    "detail": (
+                        f"data ends {calendar.last_date}; update ismet, or extend it "
+                        "from the venue's holiday list (docs/OPERATIONS.md)"
+                    ),
                 }
             )
     payload: dict[str, Any] = {

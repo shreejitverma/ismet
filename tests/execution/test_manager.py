@@ -626,6 +626,37 @@ async def test_nothing_is_sent_if_send_started_cannot_be_journalled(
         await oms.abort()
 
 
+class OnceFailingJournal(MemoryJournal):
+    """A disk that fails the next write only, then recovers."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_next = False
+
+    def append(self, *args: object, **kw: object):  # type: ignore[no-untyped-def]
+        if self.fail_next:
+            self.fail_next = False
+            raise JournalError("disk full, once")
+        return super().append(*args, **kw)  # type: ignore[arg-type]
+
+
+async def test_an_intent_write_that_fails_once_refuses_the_order(
+    venue: SimVenue, clock: ManualClock
+) -> None:
+    # The journal recovers before the send would start, and the order must still
+    # not go out: its intent was not on record when the submit was decided.
+    journal = OnceFailingJournal()
+    oms = OrderManager(venue, journal, RiskEngine(permissive_config()), clock=clock)
+    await oms.start()
+    try:
+        journal.fail_next = True
+        with pytest.raises(JournalError):
+            await oms.submit(order("JF5", price="9.50"))
+        assert venue.attempts["JF5"] == 0
+    finally:
+        await oms.abort()
+
+
 async def test_journal_failure_on_a_venue_fill_keeps_the_fill_and_stops_trading(
     venue: SimVenue, clock: ManualClock
 ) -> None:

@@ -1,0 +1,657 @@
+# Mutants of the safety-critical code, run by scripts/mutation_check.py.
+#
+# Each entry replaces one exact snippet, which must occur once in `file`, with a
+# plausible bug, and names the tests that must fail with it applied. `risk` says
+# what a survivor would mean. A mutant that cannot change behaviour gets an
+# `equivalent` reason instead of being deleted, so the decision stays visible.
+# Hand-picked mutants show the named risks are covered, not that all behaviour is.
+
+# Order manager: admission
+
+[[mutant]]
+id = "oms-kill-switch-not-checked"
+file = "src/ismet/execution/manager.py"
+find = '''
+        if self._kill.engaged:
+            raise KillSwitchEngaged(self._kill.reason)
+        if self._journal_failed is not None:'''
+replace = '''
+        if False:
+            raise KillSwitchEngaged(self._kill.reason)
+        if self._journal_failed is not None:'''
+risk = "a new order is admitted while the kill switch is engaged"
+tests = ["tests/execution/test_manager.py"]
+
+[[mutant]]
+id = "oms-journal-failure-not-checked"
+file = "src/ismet/execution/manager.py"
+find = '''
+        if self._journal_failed is not None:
+            raise KillSwitchEngaged(f"journal failure: {self._journal_failed}")'''
+replace = '''
+        if False:
+            raise KillSwitchEngaged(f"journal failure: {self._journal_failed}")'''
+risk = "a new order is admitted after the journal failed to record"
+tests = ["tests/execution/test_manager.py"]
+
+[[mutant]]
+id = "oms-blind-reconcile-not-checked"
+file = "src/ismet/execution/manager.py"
+find = '''
+        if self._reconcile_blind is not None:
+            raise RiskRejected("reconciliation", self._reconcile_blind)'''
+replace = '''
+        if False:
+            raise RiskRejected("reconciliation", self._reconcile_blind)'''
+risk = "a new order is admitted while the last reconcile could not query the venue"
+tests = ["tests/execution/test_review_regressions.py"]
+
+[[mutant]]
+id = "oms-stream-health-not-checked"
+file = "src/ismet/execution/manager.py"
+find = '''
+        if not self.stream_healthy:
+            raise RiskRejected("execution_stream", "the execution stream is down")'''
+replace = '''
+        if False:
+            raise RiskRejected("execution_stream", "the execution stream is down")'''
+risk = "a new order is admitted while the execution stream is down"
+tests = ["tests/execution/test_review_regressions.py"]
+
+# Order manager: journal before send, and never twice
+
+[[mutant]]
+id = "oms-durable-write-failure-swallowed"
+file = "src/ismet/execution/manager.py"
+find = '''
+            except (JournalError, ConfigError, OSError) as exc:
+                if durable:
+                    raise
+                self._unjournalled.append(event)'''
+replace = '''
+            except (JournalError, ConfigError, OSError) as exc:
+                self._unjournalled.append(event)'''
+risk = "an order is sent although its intent or send start never reached the journal"
+tests = ["tests/execution/test_manager.py"]
+
+[[mutant]]
+id = "oms-intent-not-durable"
+file = "src/ismet/execution/manager.py"
+find = '''
+                        client_order_id=cid, ts=self._clock.now(), request=request
+                    ),
+                    durable=True,'''
+replace = '''
+                        client_order_id=cid, ts=self._clock.now(), request=request
+                    ),
+                    durable=False,'''
+risk = "an order goes on to its send although writing its intent failed"
+tests = ["tests/execution/test_manager.py"]
+
+[[mutant]]
+id = "oms-existing-order-sent-again"
+file = "src/ismet/execution/manager.py"
+find = '''
+                "different order"
+            )
+        return existing'''
+replace = '''
+                "different order"
+            )
+        return None'''
+risk = "a retried submit with the same client order id sends the order a second time"
+tests = ["tests/execution/test_manager.py"]
+
+[[mutant]]
+id = "oms-restart-submitting-closed-as-never-sent"
+file = "src/ismet/execution/manager.py"
+find = '''
+                await self._mark_unknown(
+                    state.client_order_id, "process stopped during the send"
+                )'''
+replace = '''
+                await self._never_sent(state.client_order_id)'''
+risk = "an order whose send may have reached the venue before a crash is closed as never sent on restart"
+tests = ["tests/execution/test_crash_recovery.py"]
+
+[[mutant]]
+id = "oms-ambiguous-send-closed-as-rejected"
+file = "src/ismet/execution/manager.py"
+find = '''
+        except AmbiguousOutcome as exc:
+            return await self._mark_unknown(cid, str(exc))'''
+replace = '''
+        except AmbiguousOutcome as exc:
+            return await self._rejected(cid, str(exc), "AMBIGUOUS")'''
+risk = "a send that may have reached the venue is closed as rejected, so the exposure is forgotten and can be sent again"
+tests = ["tests/execution/test_manager.py"]
+
+# Order manager: kill switch
+
+[[mutant]]
+id = "kill-engage-memory-not-flipped"
+file = "src/ismet/execution/manager.py"
+find = '''
+        if not before.engaged:
+            self._kill = KillState(True, reason, operator, before.seq, cancel_open)
+            logger.critical("kill switch engaged by %s: %s", operator, reason)'''
+replace = '''
+        if not before.engaged:
+            logger.critical("kill switch engaged by %s: %s", operator, reason)'''
+risk = "a send already past its checks goes out while an engage waits on the journal"
+tests = ["tests/execution/test_kill_amend_and_fee_findings.py"]
+
+[[mutant]]
+id = "kill-equal-seq-not-widened"
+file = "src/ismet/execution/manager.py"
+find = "            return durable if widens else memory"
+replace = "            return memory"
+risk = "a wider engage on record at the same sequence is ignored, so open orders are not cancelled"
+tests = ["tests/execution/test_kill_amend_and_fee_findings.py"]
+
+[[mutant]]
+id = "kill-release-believed-on-broken-chain"
+file = "src/ismet/execution/manager.py"
+find = '''
+        result = await self._call_journal(self._journal.verify)
+        if not result.ok:
+            logger.critical(
+                "ignoring a kill switch release'''
+replace = '''
+        result = await self._call_journal(self._journal.verify)
+        if False:
+            logger.critical(
+                "ignoring a kill switch release'''
+risk = "a kill switch release inserted into a tampered journal switches trading back on"
+tests = ["tests/execution/test_review_regressions.py"]
+
+[[mutant]]
+id = "kill-merge-ignores-engage-in-flight"
+file = "src/ismet/execution/manager.py"
+find = '''
+        if self._engaging and not durable.engaged:
+            return  # an engage under way reads this release itself, and re-engages
+        memory = self._kill
+        newer = await self._newer_kill(memory, durable)
+        if self._engaging and not newer.engaged:
+            return  # an engage started during the verify; it decides from the journal'''
+replace = '''
+        memory = self._kill
+        newer = await self._newer_kill(memory, durable)'''
+risk = "a journal read racing a local engage adopts a release and switches the kill switch off"
+tests = ["tests/execution/test_kill_amend_and_fee_findings.py"]
+
+[[mutant]]
+id = "kill-settle-ignores-decision-during-read"
+file = "src/ismet/execution/manager.py"
+find = "            if self._kill_unrecorded is not None or self._kill.seq > current.seq:"
+replace = "            if self._kill_unrecorded is not None:"
+risk = "an engage overwrites a release or engage this process decided while it read the journal"
+tests = ["tests/execution/test_kill_amend_and_fee_findings.py"]
+
+[[mutant]]
+id = "kill-loop-no-cancel-sweep"
+file = "src/ismet/execution/manager.py"
+find = "                if self._kill.engaged and self._kill.cancel_open and self.open_orders():"
+replace = "                if False:"
+risk = "orders left open after an engage with cancel_open are never cancelled by the sweep"
+tests = ["tests/execution/test_manager.py"]
+
+[[mutant]]
+id = "kill-send-skips-reread"
+file = "src/ismet/execution/manager.py"
+find = '''
+                    durable = await self._call_journal(self._journal.kill_state)
+                    await self._merge_kill(durable)
+                except asyncio.CancelledError:
+                    # SendStarted is durable'''
+replace = '''
+                    pass
+                except asyncio.CancelledError:
+                    # SendStarted is durable'''
+risk = "an order is sent although another process engaged the kill switch while its send start was written"
+tests = ["tests/execution/test_kill_amend_and_fee_findings.py"]
+
+[[mutant]]
+id = "kill-amend-skips-reread"
+file = "src/ismet/execution/manager.py"
+find = '''
+            durable = await self._call_journal(self._journal.kill_state)
+            await self._merge_kill(durable)
+        except asyncio.CancelledError:
+            await self._refuse_amend(client_order_id, "CANCELED_BEFORE_SEND")'''
+replace = '''
+            pass
+        except asyncio.CancelledError:
+            await self._refuse_amend(client_order_id, "CANCELED_BEFORE_SEND")'''
+risk = "an amendment is sent although another process engaged the kill switch while it was written"
+tests = ["tests/execution/test_kill_amend_and_fee_findings.py"]
+
+# Order manager: unknown outcomes and reconciliation
+
+[[mutant]]
+id = "recon-not-found-skips-grace"
+file = "src/ismet/execution/manager.py"
+find = '''
+        if now - first_seen < self._unknown_grace:
+            report.complete = False
+            return
+        await self._record('''
+replace = '''
+        await self._record('''
+risk = "an order still in flight is declared missing at the venue before unknown_grace passes"
+tests = ["tests/execution/test_manager.py"]
+
+[[mutant]]
+id = "recon-busted-fill-booked-again"
+file = "src/ismet/execution/manager.py"
+find = '''
+            if fill.fill_id in state.busted_fill_ids:
+                continue
+            known = any'''
+replace = '''
+            known = any'''
+risk = "a fill the venue busted is booked again by a reconciliation sweep"
+tests = ["tests/execution/test_exposure_and_recovery.py"]
+
+[[mutant]]
+id = "recon-known-fill-booked-again"
+file = "src/ismet/execution/manager.py"
+find = "            known = any(f.fill_id == fill.fill_id for f in state.fills)"
+replace = "            known = False"
+risk = "a fill the record already holds is booked a second time by reconciliation"
+tests = ["tests/execution/test_exposure_and_recovery.py"]
+
+[[mutant]]
+id = "recon-fill-dispute-not-recorded"
+file = "src/ismet/execution/manager.py"
+find = '''
+                if terms not in self._reported_corrections:
+                    self._reported_corrections.add(terms)'''
+replace = '''
+                if False:
+                    self._reported_corrections.add(terms)'''
+risk = "a sweep that finds a known fill with other terms neither records it nor raises the anomaly"
+tests = ["tests/execution/test_review_regressions.py"]
+
+[[mutant]]
+id = "recon-position-untracked-symbol-ignored"
+file = "src/ismet/execution/manager.py"
+find = "        for symbol in sorted({*venue, *self._tracked_symbols()}, key=str):"
+replace = "        for symbol in sorted(self._tracked_symbols(), key=str):"
+risk = "a position the venue holds in a symbol ismet never traded is not reported as a break"
+tests = ["tests/execution/test_manager.py"]
+
+[[mutant]]
+id = "oms-overfill-not-halting"
+file = "src/ismet/execution/manager.py"
+find = '''
+_HALTING_ANOMALIES = (
+    "overfill",
+'''
+replace = '''
+_HALTING_ANOMALIES = (
+'''
+risk = "an overfill is logged but does not stop new orders"
+tests = ["tests/execution/test_manager.py"]
+
+# Journal
+
+[[mutant]]
+id = "journal-content-hash-not-checked"
+file = "src/ismet/execution/journal.py"
+find = '''
+        if computed != digest:
+            return VerifyResult(False, count, prev, seq, "record content altered")'''
+replace = '''
+        if False:
+            return VerifyResult(False, count, prev, seq, "record content altered")'''
+risk = "an edited journal record verifies as intact"
+tests = ["tests/execution/test_journal.py"]
+
+[[mutant]]
+id = "journal-anchor-replacement-not-disputed"
+file = "src/ismet/execution/journal.py"
+find = "        return row is None or row[0] != anchored_digest"
+replace = "        return row is None"
+risk = "an append to a replaced journal moves the anchor, so the replacement then verifies clean"
+tests = ["tests/execution/test_journal.py"]
+
+[[mutant]]
+id = "journal-anchor-moves-backward"
+file = "src/ismet/execution/journal.py"
+find = '''
+            if anchor is not None and anchor[0] >= seq:
+                return'''
+replace = '''
+            if anchor is not None and anchor[0] == seq:
+                return'''
+risk = "a slower writer moves the anchor back past a faster one, weakening truncation detection"
+tests = ["tests/execution/test_journal.py"]
+
+[[mutant]]
+id = "journal-update-trigger-inert"
+file = "src/ismet/execution/journal.py"
+find = '''
+CREATE TRIGGER IF NOT EXISTS journal_no_update BEFORE UPDATE ON journal
+    BEGIN SELECT RAISE(ABORT, 'journal is append-only'); END;'''
+replace = '''
+CREATE TRIGGER IF NOT EXISTS journal_no_update BEFORE UPDATE ON journal
+    BEGIN SELECT 1; END;'''
+risk = "a journal row can be updated in place"
+tests = ["tests/execution/test_journal.py"]
+
+[[mutant]]
+id = "journal-kill-fold-drops-cancel-open"
+file = "src/ismet/execution/journal.py"
+find = '''
+            bool(detail.get("cancel_open", False))
+            or (engaged and state.engaged and state.cancel_open),'''
+replace = '''
+            bool(detail.get("cancel_open", False)),'''
+risk = "a later narrower engage switches off the cancel sweep an earlier engage asked for"
+tests = ["tests/execution/test_journal.py"]
+
+# Order state
+
+[[mutant]]
+id = "state-cancel-reject-closes-order"
+file = "src/ismet/execution/state.py"
+find = "        S.PENDING_CANCEL: _Next.RESUMED,"
+replace = "        S.PENDING_CANCEL: S.CANCELED,"
+risk = "a refused cancel closes an order that is still working at the venue"
+tests = ["tests/execution/test_state.py"]
+
+[[mutant]]
+id = "state-same-execution-ignores-quantity"
+file = "src/ismet/execution/state.py"
+find = '''
+    return (a.symbol, a.side, a.price, a.quantity) == (
+        b.symbol,
+        b.side,
+        b.price,
+        b.quantity,
+    )'''
+replace = '''
+    return (a.symbol, a.side, a.price) == (
+        b.symbol,
+        b.side,
+        b.price,
+    )'''
+risk = "a fill re-reported with another quantity is merged silently instead of halting"
+tests = ["tests/execution/test_state.py"]
+
+[[mutant]]
+id = "state-fee-currency-difference-ignored"
+file = "src/ismet/execution/state.py"
+find = "    return amounts_differ or currencies_differ"
+replace = "    return amounts_differ"
+risk = "a fill re-reported with a fee in another currency is merged without an anomaly"
+tests = ["tests/execution/test_kill_amend_and_fee_findings.py"]
+
+[[mutant]]
+id = "state-overfill-checks-single-fill"
+file = "src/ismet/execution/state.py"
+find = '''
+    ceiling = _fill_ceiling(updated)
+    if updated.filled_quantity > ceiling:'''
+replace = '''
+    ceiling = _fill_ceiling(updated)
+    if fill.quantity > ceiling:'''
+risk = "fills that together exceed the order quantity are not flagged as an overfill"
+tests = ["tests/execution/test_state.py"]
+
+[[mutant]]
+id = "state-fill-after-bust-booked"
+file = "src/ismet/execution/state.py"
+find = '''
+    if fill.fill_id in state.busted_fill_ids:
+        return _note(state, f"fill {fill.fill_id} reported again after its bust")'''
+replace = '''
+    if False:
+        return _note(state, f"fill {fill.fill_id} reported again after its bust")'''
+risk = "a fill reported again after the venue busted it is booked as a new execution"
+tests = ["tests/execution/test_exposure_and_recovery.py"]
+
+# Pre-trade risk
+
+[[mutant]]
+id = "risk-engine-error-approves"
+file = "src/ismet/execution/risk.py"
+find = '''
+        except Exception as exc:
+            return _reject("risk_engine_error", f"{type(exc).__name__}: {exc}")'''
+replace = '''
+        except Exception:
+            return APPROVED'''
+risk = "an exception inside a risk check approves the order"
+tests = ["tests/execution/test_risk.py"]
+
+[[mutant]]
+id = "risk-missing-instrument-approved"
+file = "src/ismet/execution/risk.py"
+find = '''
+    if instrument is None:
+        return _reject("instrument", f"no reference data for {request.symbol}")'''
+replace = '''
+    if instrument is None:
+        return APPROVED'''
+risk = "an order for a symbol with no reference data is not refused by the instrument check"
+tests = ["tests/execution/test_risk.py"]
+
+[[mutant]]
+id = "risk-missing-quote-approved"
+file = "src/ismet/execution/risk.py"
+find = '''
+    if quote is None:
+        return _reject("reference_price", "no reference quote")'''
+replace = '''
+    if quote is None:
+        return APPROVED'''
+risk = "an order is admitted with no reference quote to judge it against"
+tests = ["tests/execution/test_risk.py"]
+
+[[mutant]]
+id = "risk-gross-unknown-approved"
+file = "src/ismet/execution/risk.py"
+find = '''
+    if ctx.gross_notional is None:
+        return _reject("max_gross_notional", "gross exposure unknown")'''
+replace = '''
+    if ctx.gross_notional is None:
+        return APPROVED'''
+risk = "a gross limit passes when gross exposure cannot be computed"
+tests = ["tests/execution/test_risk.py"]
+
+[[mutant]]
+id = "oms-gross-skips-unmarked-position"
+file = "src/ismet/execution/manager.py"
+find = '''
+            if mark is None or instrument is None:
+                return None
+            currencies.add(instrument.currency)
+            value = mul(mul(position, mark), instrument.multiplier)'''
+replace = '''
+            if mark is None or instrument is None:
+                continue
+            currencies.add(instrument.currency)
+            value = mul(mul(position, mark), instrument.multiplier)'''
+risk = "a held position with no mark counts as zero gross exposure instead of failing the limit closed"
+tests = ["tests/execution/test_exposure_and_recovery.py"]
+
+[[mutant]]
+id = "oms-gross-mixes-currencies"
+file = "src/ismet/execution/manager.py"
+find = "        return gross if len(currencies) <= 1 else None"
+replace = "        return gross"
+risk = "gross exposure in several currencies is added as one number instead of failing closed"
+tests = ["tests/execution/test_exposure_and_recovery.py"]
+
+[[mutant]]
+id = "risk-limit-currency-not-checked"
+file = "src/ismet/execution/risk.py"
+find = '''
+            lambda: check_limit_currency(ctx, config),
+'''
+replace = '''
+'''
+risk = "an order in a currency other than the limits' currency is judged as if they matched"
+tests = ["tests/execution/test_exposure_and_recovery.py"]
+
+[[mutant]]
+id = "risk-short-sale-unknown-position-approved"
+file = "src/ismet/execution/risk.py"
+find = '''
+    if ctx.position is None:
+        return _reject("short_sale", "position unknown; cannot classify the sale")'''
+replace = '''
+    if ctx.position is None:
+        return APPROVED'''
+risk = "a sale is admitted unmarked although the position is unknown, so it may be an unmarked short"
+tests = ["tests/execution/test_risk.py"]
+
+# HTTP transport
+
+[[mutant]]
+id = "http-non-idempotent-retried"
+file = "src/ismet/transport/http.py"
+find = "        policy = (retry_policy or self.retry_policy) if repeatable else NO_RETRY"
+replace = "        policy = retry_policy or self.retry_policy"
+risk = "a non-idempotent request such as an order is sent more than once"
+tests = ["tests/unit/test_correctness_regressions.py"]
+
+[[mutant]]
+id = "http-500-not-ambiguous"
+file = "src/ismet/transport/http.py"
+find = "            if not is_read and (raw.status_code >= 500 or raw.status_code < 400):"
+replace = "            if not is_read and (raw.status_code > 500 or raw.status_code < 400):"
+risk = "an order answered with HTTP 500 is treated as not delivered although the venue may have processed it"
+tests = ["tests/unit/test_correctness_regressions.py"]
+
+[[mutant]]
+id = "http-read-timeout-treated-as-not-sent"
+file = "src/ismet/transport/http.py"
+find = "_NOT_SENT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)"
+replace = "_NOT_SENT_ERRORS = (httpx.ConnectError, httpx.TimeoutException, httpx.PoolTimeout)"
+risk = "an order whose response timed out is treated as not delivered although it may have been sent"
+tests = ["tests/unit/test_correctness_regressions.py"]
+
+[[mutant]]
+id = "http-unreadable-success-not-ambiguous"
+file = "src/ismet/transport/http.py"
+find = '''
+        try:
+            return response.json()
+        except TransportError as exc:
+            # The server accepted the request and its answer cannot be read.
+            raise AmbiguousOutcome('''
+replace = '''
+        try:
+            return response.json()
+        except ValueError as exc:
+            # The server accepted the request and its answer cannot be read.
+            raise AmbiguousOutcome('''
+risk = "an accepted order whose response cannot be parsed is treated as not delivered"
+tests = ["tests/unit/test_correctness_regressions.py"]
+
+# FIX session and provider
+
+[[mutant]]
+id = "fix-too-low-without-possdup-accepted"
+file = "src/ismet/fix/session.py"
+find = '''
+            if not poss_dup:
+                await self._fail_too_low(expected, seq)'''
+replace = '''
+            if False:
+                await self._fail_too_low(expected, seq)'''
+risk = "a MsgSeqNum below the expected one without PossDupFlag is ignored instead of terminating the session"
+tests = ["tests/fix/test_session.py::TestInboundSequencing::test_too_low_without_possdup_terminates"]
+
+[[mutant]]
+id = "fix-gap-not-rerequested"
+file = "src/ismet/fix/session.py"
+find = '''
+        if target is None:
+            await self._send_resend_request()
+        if msg_type == "A":
+            await self._after_logon()'''
+replace = '''
+        if msg_type == "A":
+            await self._after_logon()'''
+risk = "a gap in inbound sequence numbers is never re-requested, so missed execution reports are lost"
+tests = ["tests/fix/test_session.py"]
+
+[[mutant]]
+id = "fix-app-message-not-stored"
+file = "src/ismet/fix/session.py"
+find = "            seq = await self.run_store(lambda: self.store.allocate_outbound(record))"
+replace = "            seq = await self.run_store(self.store.allocate_outbound)"
+risk = "an order is written to the socket without its stored copy, so a ResendRequest cannot replay it"
+tests = ["tests/fix/test_session.py::TestOutboundDurability"]
+
+[[mutant]]
+id = "fix-write-failure-not-ambiguous"
+file = "src/ismet/fix/session.py"
+find = '''
+            except _DisconnectError as exc:
+                raise AmbiguousOutcome('''
+replace = '''
+            except _DisconnectError as exc:
+                raise SessionDownError('''
+risk = "a stored order whose write failed is treated as never sent although it may be resent under the same number"
+tests = ["tests/fix/test_session.py::TestOutboundDurability"]
+
+[[mutant]]
+id = "fix-lost-store-reported-not-found"
+file = "src/ismet/fix/provider.py"
+find = '''
+        if record is None:
+            raise NoSendRecord(_no_record_text(client_order_id), retryable=False)'''
+replace = '''
+        if record is None:
+            return None'''
+risk = "after the FIX store is lost, a sent order is reported as not at the venue and closed instead of staying unknown"
+tests = ["tests/fix/test_provider.py::TestOrderStatus"]
+
+[[mutant]]
+id = "fix-quarantine-new-order-admitted"
+file = "src/ismet/fix/provider.py"
+find = '''
+            await self._refuse_while_halted()
+            if await self._lookup(cid) is not None:'''
+replace = '''
+            if await self._lookup(cid) is not None:'''
+risk = "a new order is sent while a quarantined execution report awaits an operator"
+tests = ["tests/fix/test_provider.py::TestHaltsAreDurable"]
+
+# Async helpers and exact decimals
+
+[[mutant]]
+id = "aio-wait-for-drops-cancel"
+file = "src/ismet/_aio.py"
+find = "    if sys.version_info >= (3, 12):"
+replace = "    if sys.version_info >= (3, 10):"
+risk = "a caller cancelled as its operation finishes carries on with the result on Python 3.10 and 3.11"
+tests = ["tests/unit/test_aio.py"]
+
+[[mutant]]
+id = "decimal-add-uses-ambient-context"
+file = "src/ismet/models/decimals.py"
+find = '''
+def add(a: Decimal, b: Decimal) -> Decimal:
+    with localcontext(_EXACT):
+        return a + b'''
+replace = '''
+def add(a: Decimal, b: Decimal) -> Decimal:
+    return a + b'''
+risk = "a sum of money is rounded by whatever decimal context the caller left in place"
+tests = ["tests/unit/test_correctness_regressions.py"]
+
+[[mutant]]
+id = "decimal-absolute-rounds"
+file = "src/ismet/models/decimals.py"
+find = "    return a.copy_abs()"
+replace = "    return abs(a)"
+risk = "an absolute notional is rounded to the ambient decimal precision"
+tests = ["tests/unit/test_correctness_regressions.py"]

@@ -72,6 +72,15 @@ Rules callers depend on that are easy to miss in the API reference.
   Whether Binance answers handshakes this way has not been checked.
 - A Binance hold of over 20 seconds raises `RateLimited` from a new stream or from one with `ws_max_reconnects`, and any other stream logs a WARNING with the remaining time and waits.
 
+## Calendars
+
+- `TradingCalendar.extended_through(last, closed=..., source=...)` returns a copy covering dates up to `last`, continuing the last era's hours, closed on the listed weekdays, and recording `source`.
+- `ismet doctor` warns 90 days before a calendar's data ends and names both remedies, upgrading or extending from the venue's holiday list.
+
+## Observability
+
+- `ismet.otel.OpenTelemetryMetrics`, from the `otel` extra, implements `Metrics` on an OpenTelemetry meter, and refuses a negative counter increment.
+
 ## Reference data
 
 - `SecurityMaster.universe(venue, on, known_at=)` resolves each symbol by the same rule as `resolve`.

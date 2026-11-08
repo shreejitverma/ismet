@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import time
+import uuid
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -1027,9 +1028,11 @@ async def test_a_policy_cap_below_the_stated_wait_refuses_the_retry() -> None:
 
 async def test_a_stream_does_not_handshake_during_a_hold() -> None:
     handshakes: list[float] = []
+    path = f"/t-{uuid.uuid4().hex}"  # a stray client on a reused port must not count
 
     def process_request(conn: ServerConnection, request: Request) -> None:
-        handshakes.append(time.monotonic())
+        if request.path == path:
+            handshakes.append(time.monotonic())
 
     async def handler(conn: ServerConnection) -> None:
         await conn.wait_closed()
@@ -1043,7 +1046,7 @@ async def test_a_stream_does_not_handshake_during_a_hold() -> None:
         provider = BinanceProvider(
             http_transport=transport,
             retry_policy=NO_RETRY,
-            ws_url=f"ws://127.0.0.1:{port}",
+            ws_url=f"ws://127.0.0.1:{port}{path}",
         )
         provider._currencies["BTCUSDT"] = "USDT"
         async with provider:

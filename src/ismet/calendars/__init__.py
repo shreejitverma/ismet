@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import copy
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from enum import Enum
@@ -145,6 +146,40 @@ class TradingCalendar:
             edited._extra = extra
         if special is not None:
             edited._special = special
+        return edited
+
+    def extended_through(
+        self, last: date, *, closed: Iterable[date], source: str
+    ) -> TradingCalendar:
+        """A copy covering dates up to ``last``, from a venue's published holiday list.
+
+        For the gap between a release's snapshot and the venue's next calendar: the
+        current regular hours continue, and ``closed`` must name every weekday in the
+        new dates with no session, taken from the venue's own circular. An empty list
+        is a claim that there is none. ``source`` names that circular and is kept on
+        the calendar. Half days and weekend sessions are then set with
+        :meth:`with_hours`. Aliases are separate calendars: extend each one used.
+        """
+        if not source.strip():
+            raise ValidationError("an extension needs the source of its holiday list")
+        if last <= self.last_date:
+            raise ValidationError(
+                f"{self.venue} already covers {self.last_date}; extend past it"
+            )
+        added = frozenset(closed)
+        outside = sorted(d for d in added if not self.last_date < d <= last)
+        if outside:
+            raise ValidationError(
+                f"closures {outside} fall outside the extension "
+                f"{self.last_date + timedelta(days=1)} to {last}"
+            )
+        weekend = sorted(d for d in added if d.weekday() >= 5)
+        if weekend:
+            raise ValidationError(f"closures {weekend} fall on weekends")
+        edited = self._replace(closed=self._closed | added)
+        edited.last_date = last
+        note = f"extended to {last.isoformat()} from {source.strip()}"
+        edited.source = f"{self.source}; {note}" if self.source else note
         return edited
 
     def with_closure(self, day: date) -> TradingCalendar:

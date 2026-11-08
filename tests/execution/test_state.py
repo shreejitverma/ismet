@@ -226,6 +226,16 @@ def test_overfill_is_counted_and_surfaced() -> None:
     assert any("overfill" in a for a in after.anomalies)
 
 
+def test_fills_each_within_the_quantity_but_over_it_together_are_an_overfill() -> None:
+    state = apply_event(new_order(INTENT), SendStarted(**BASE))
+    partly = apply_event(state, fill("F1", "60"))
+    assert not partly.anomalies
+    after = apply_event(partly, fill("F2", "60"))
+    assert after.status is S.FILLED
+    assert after.filled_quantity == 120
+    assert any("overfill" in a for a in after.anomalies)
+
+
 def test_fill_while_status_unknown_keeps_it_unknown_until_full() -> None:
     state = in_status(S.UNKNOWN)
     partly = apply_event(state, fill("F1", "40"))

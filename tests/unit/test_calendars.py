@@ -289,3 +289,66 @@ def test_no_bundled_venue_has_a_weekend_session_and_the_gap_matrix_agrees() -> N
     matrix = (root / "docs/GAP_MATRIX.md").read_text(encoding="utf-8")
     assert "special weekend sessions are unconfirmed" not in matrix
     assert "no weekend session" in matrix
+
+
+# Extending a calendar past its snapshot from the venue's own holiday list. The
+# dates below are test inputs, not claims about any venue's real 2027 holidays.
+
+XBOM = get_calendar("XBOM")
+EXTENSION_SOURCE = "test circular 2027/1"
+
+
+def test_an_extension_continues_the_regular_hours_with_the_listed_closures() -> None:
+    last = XBOM.session(XBOM.last_date)
+    assert last is not None
+    extended = XBOM.extended_through(
+        date(2027, 1, 29), closed=[date(2027, 1, 26)], source=EXTENSION_SOURCE
+    )
+    session = extended.session(date(2027, 1, 4))
+    assert session is not None
+    assert session.open.timetz() == last.open.timetz()
+    assert session.close.timetz() == last.close.timetz()
+    assert not extended.is_session(date(2027, 1, 26))
+    assert not extended.is_session(date(2027, 1, 2))  # a Saturday
+    assert extended.next_session_date(XBOM.last_date) == date(2027, 1, 1)
+    assert extended.last_date == date(2027, 1, 29)
+    assert extended.source.endswith(f"extended to 2027-01-29 from {EXTENSION_SOURCE}")
+    with pytest.raises(CalendarOutOfRange):
+        extended.is_session(date(2027, 2, 1))
+
+
+def test_extending_leaves_the_bundled_calendar_unchanged() -> None:
+    extended = XBOM.extended_through(
+        date(2027, 1, 29), closed=[], source=EXTENSION_SOURCE
+    )
+    assert extended.is_session(date(2027, 1, 26))
+    with pytest.raises(CalendarOutOfRange):
+        get_calendar("XBOM").is_session(date(2027, 1, 4))
+
+
+def test_an_extended_day_can_take_special_hours() -> None:
+    extended = XBOM.extended_through(
+        date(2027, 1, 29), closed=[], source=EXTENSION_SOURCE
+    ).with_hours(date(2027, 1, 27), time(9, 15), time(12, 0))
+    session = extended.session(date(2027, 1, 27))
+    assert session is not None
+    assert session.close.astimezone(extended.tz).time() == time(12, 0)
+    assert session.early_close
+
+
+@pytest.mark.parametrize(
+    ("last", "closed", "source", "named"),
+    [
+        (date(2027, 1, 29), [], " ", "source"),
+        (date(2026, 12, 31), [], EXTENSION_SOURCE, "already covers"),
+        (date(2027, 1, 29), [date(2026, 12, 25)], EXTENSION_SOURCE, "outside"),
+        (date(2027, 1, 29), [date(2027, 2, 1)], EXTENSION_SOURCE, "outside"),
+        (date(2027, 1, 29), [date(2027, 1, 2)], EXTENSION_SOURCE, "weekend"),
+    ],
+    ids=["no-source", "not-later", "before-gap", "after-end", "weekend"],
+)
+def test_an_extension_refuses_what_it_cannot_honour(
+    last: date, closed: list[date], source: str, named: str
+) -> None:
+    with pytest.raises(ValidationError, match=named):
+        XBOM.extended_through(last, closed=closed, source=source)

@@ -84,12 +84,28 @@ A strategy that restarts should resubmit with the same deterministic id, which r
 | Anomaly `re-reported with a different fee` | The stream or a fill query reports a known fill with another fee or fee currency | The first fee stays booked and the report is recorded once per fill and fee. Settle it against the venue's statement; new orders are not halted. |
 | Halt after a bust | A fill was busted while ismet was down, on a venue that does not repeat the bust, so the books keep it and the venue does not | Confirm with the venue. ismet cannot tell a bust from a lost report, so it halts rather than guess. |
 | `ReportQuarantinedError` from a FIX stream, `place_order`, or `amend_order` | A report could not be applied, an ExecID was reported again with different content, a sequence reset (the peer's, or our own `reset_on_logon` with an order working after an unclean disconnect) may have skipped reports, or a report's CumQty disagrees with the fills received. New orders and amendments stay refused, also across restarts | Read `await FixProvider.quarantined()`, compare each unreleased row with the venue's records, then call `await FixProvider.release_quarantine(operator=..., reason=..., expected=<the unreleased count you checked>)`, which is recorded in the store. The release is refused if the count has changed, because a row arrived that nobody checked. |
-| `CalendarOutOfRange` rejection | The venue's calendar data has ended. An order that rests for later (OPG, CLS, or GTC or GTD on a limit or stop limit) skips this check and is not refused | Upgrade ismet, or supply newer data with `load_calendar_file`. `ismet doctor` warns 90 days ahead. |
+| `CalendarOutOfRange` rejection | The venue's calendar data has ended. An order that rests for later (OPG, CLS, or GTC or GTD on a limit or stop limit) skips this check and is not refused | Upgrade ismet if a release covers the dates, or extend the calendar from the venue's holiday circular (see Calendar updates). `ismet doctor` warns 90 days ahead. |
 | `stale_data` rejection | The reference quote is too old | Check the market data feed. |
 
 ## Monitoring
 
 Bind `ismet.observability.Metrics` to your metrics system and alert on the following.
+For OpenTelemetry, install `ismet[otel]` and pass `ismet.otel.OpenTelemetryMetrics` to the hooks:
+
+```python
+from ismet.observability import break_hook, order_event_hook
+from ismet.otel import OpenTelemetryMetrics
+
+metrics = OpenTelemetryMetrics()  # the global meter provider's "ismet" meter
+manager = OrderManager(
+    ...,
+    on_event=order_event_hook(metrics),
+    on_break=break_hook(metrics),
+)
+```
+
+It records on whatever meter provider and exporter the application configured, keeps the metric names below, and sets the unit `s` on names ending in `_seconds`.
+With no provider configured, OpenTelemetry records nothing.
 
 | Metric | Alert when |
 |---|---|
@@ -155,6 +171,27 @@ register_calendar(get_calendar("XNYS").with_closure(date(2026, 12, 7)))
 
 `with_closure` only returns a copy, and `register_calendar` and `load_calendar_file` change the running process alone.
 Apply them at startup in every process that uses the venue, including after each restart, until a release carries the closure.
+
+When a venue's data is about to end and no release extends it, because the source has not published that venue's next year yet, extend it from the venue's own holiday circular:
+
+```python
+from datetime import date
+
+from ismet.calendars import get_calendar, register_calendar
+
+circular = "the exchange circular that lists the 2027 trading holidays"
+extended = get_calendar("XNSE").extended_through(
+    date(2027, 12, 31),
+    closed=[...],  # every weekday holiday in the circular, as datetime.date
+    source=circular,
+)
+register_calendar(extended)
+```
+
+The regular hours of the last era continue, every weekday not listed in `closed` becomes a session, and the source is kept in the calendar's `source` attribute.
+An empty `closed` list claims the venue has no weekday holiday in the new dates, so copy the circular rather than leave it out.
+Set half days and announced weekend sessions with `with_hours` on the extended calendar.
+An alias such as `XNSE` for `XBOM` is its own calendar, so extend and register each code the process trades.
 
 ## FIX sessions
 
