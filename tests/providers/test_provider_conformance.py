@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -17,13 +17,18 @@ from ._support import manifest, replay, session
 
 
 def _freeze_conformance_clock(monkeypatch: pytest.MonkeyPatch, provider: str) -> None:
-    """Conformance asks for bars up to now, but the replay only knows record time."""
-    end = manifest(provider, "conformance_end")
+    """Conformance asks for bars up to now, but the replay only knows record time.
+
+    The recording asked for bars ending at ``conformance_end``. Conformance asks up
+    to the close of the minute it runs in, so the clock stops inside the minute
+    before, where it asks the recorded range.
+    """
+    now = manifest(provider, "conformance_end") - timedelta(seconds=1)
 
     class Frozen(datetime):
         @classmethod
         def now(cls, tz: timezone | None = None) -> datetime:  # type: ignore[override]  # noqa: ARG003
-            return end
+            return now
 
     monkeypatch.setattr("ismet.testing.conformance.datetime", Frozen)
 

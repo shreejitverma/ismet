@@ -4,6 +4,12 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    groups:
+      # init and analyze must move together; one PR each leaves them on two
+      # versions, which CodeQL refuses.
+      codeql:
+        patterns:
+          - "github/codeql-action*"
   - package-ecosystem: uv
     directory: /
     versioning-strategy: lockfile-only

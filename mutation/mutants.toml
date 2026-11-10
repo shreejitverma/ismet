@@ -658,3 +658,37 @@ find = "    return a.copy_abs()"
 replace = "    return abs(a)"
 risk = "an absolute notional is rounded to the ambient decimal precision"
 tests = ["tests/unit/test_correctness_regressions.py"]
+
+# Conformance: bars a provider returns
+
+[[mutant]]
+id = "conformance-open-bar-passes"
+file = "src/ismet/testing/conformance.py"
+find = "    latest = answered + MAX_PLAUSIBLE_CLOCK_SKEW\n"
+replace = "    latest = answered + MAX_PLAUSIBLE_CLOCK_SKEW + timedelta(days=2)\n"
+risk = "a provider serving a bar still forming passes conformance"
+tests = ["tests/conformance/test_bar_conformance.py"]
+
+[[mutant]]
+id = "conformance-trailing-bars-not-required"
+file = "src/ismet/testing/conformance.py"
+find = "    while slot < end and slot + step <= settled:\n"
+replace = "    while slot < end and slot + step <= settled - (end - start):\n"
+risk = "a provider that stops short of the newest closed bar passes conformance"
+tests = ["tests/conformance/test_bar_conformance.py"]
+
+[[mutant]]
+id = "conformance-closed-venue-ignored"
+file = "src/ismet/testing/conformance.py"
+find = "        missing = sorted(s for s in slots if calendar.is_open(s))\n"
+replace = "        missing = sorted(slots)\n"
+risk = "bars absent while the venue is closed are reported missing"
+tests = ["tests/conformance/test_bar_conformance.py"]
+
+[[mutant]]
+id = "conformance-range-ends-before-forming-bar"
+file = "src/ismet/testing/conformance.py"
+find = "    minute_end = now.replace(second=0, microsecond=0) + timedelta(minutes=1)\n"
+replace = "    minute_end = now.replace(second=0, microsecond=0) + timedelta(0)\n"
+risk = "the range asked ends before the bar still forming, so a provider serving it is never exposed"
+tests = ["tests/conformance/test_bar_conformance.py"]
