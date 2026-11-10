@@ -6,9 +6,9 @@ file with a plausible bug, and names the tests that must fail when it is applied
 mutant those tests do not fail survives: the risk it stands for is not covered.
 The working tree is never touched; every mutant runs in a temporary copy.
 
-    uv run --python 3.10 python scripts/mutation_check.py              # every mutant
-    uv run --python 3.10 python scripts/mutation_check.py --only ID ...
-    uv run --python 3.10 python scripts/mutation_check.py --list
+    uv run --python 3.10 --extra dev python scripts/mutation_check.py   # every mutant
+    uv run --python 3.10 --extra dev python scripts/mutation_check.py --only ID ...
+    uv run --python 3.10 --extra dev python scripts/mutation_check.py --list
 
 A mutant with ``before_python = "3.12"`` can only be killed on an older interpreter.
 On that version or later it is not run and is reported as not applicable, counting
@@ -156,7 +156,10 @@ def run_tests(copy: Path, tests: tuple[str, ...]) -> tuple[bool, float, str]:
         )
     except subprocess.TimeoutExpired:
         return False, time.monotonic() - started, f"timed out after {TIMEOUT_SECONDS}s"
+    # pytest reports on stdout; a run that cannot start, such as one without
+    # pytest installed, says why only on stderr.
     lines = [line for line in done.stdout.splitlines() if line.strip()]
+    lines = lines or [line for line in done.stderr.splitlines() if line.strip()]
     return done.returncode == 0, time.monotonic() - started, lines[-1] if lines else ""
 
 

@@ -135,6 +135,39 @@ def test_every_third_party_action_is_pinned_to_a_commit(path: Path) -> None:
                 assert all(c in "0123456789abcdef" for c in ref), uses
 
 
+def test_actions_from_one_repository_share_one_commit() -> None:
+    """CodeQL's init and analyze steps, and any other actions from one repository,
+    run the same release.
+
+    Dependabot once bumped `github/codeql-action/init` and `.../analyze` in two
+    PRs, so each left them on two versions, which CodeQL warns of and both PRs'
+    analyze jobs failed on. Its config now groups them, and this holds the pins.
+    """
+    pins: dict[str, set[str]] = {}
+    for path in sorted(ROOT.glob("*.yml")):
+        for job in yaml.safe_load(path.read_text(encoding="utf-8"))["jobs"].values():
+            for step in job.get("steps", []):
+                uses = step.get("uses")
+                if uses is None or uses.startswith("./"):
+                    continue
+                action, _, ref = uses.partition("@")
+                repository = "/".join(action.split("/")[:2])
+                pins.setdefault(repository, set()).add(ref)
+    split = {repo: refs for repo, refs in pins.items() if len(refs) > 1}
+    assert split == {}
+
+
+def test_dependabot_bumps_codeql_init_and_analyze_together() -> None:
+    config = yaml.safe_load(
+        (ROOT.parent / "dependabot.yml").read_text(encoding="utf-8")
+    )
+    (actions,) = [
+        u for u in config["updates"] if u["package-ecosystem"] == "github-actions"
+    ]
+    patterns = [p for group in actions["groups"].values() for p in group["patterns"]]
+    assert "github/codeql-action*" in patterns
+
+
 @pytest.mark.parametrize("path", sorted(ROOT.glob("*.yml")), ids=lambda p: p.name)
 def test_every_job_on_a_runner_has_a_time_limit(path: Path) -> None:
     """A hung test must fail its job, not hold a runner for GitHub's six hours."""

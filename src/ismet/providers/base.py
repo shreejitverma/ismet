@@ -25,12 +25,18 @@ class Provider:
     ``gates_streams`` says the adapter's streams already drop repeats and set
     ``AFTER_GAP`` and ``OUT_OF_ORDER`` by its venue's own numbering rule. Otherwise the
     client treats ``sequence`` as rising by one per event on each symbol.
+
+    ``bars_every_interval`` says ``bars`` returns a bar for every closed interval in
+    which the venue's calendar is open, including intervals with no trades. The
+    conformance suite then fails a missing bar. Leave it ``False`` unless the
+    vendor documents it, since many vendors omit intervals without trades.
     """
 
     name: ClassVar[str]
     venues: ClassVar[frozenset[str]] = frozenset()
     environment: Environment = Environment.LIVE
     gates_streams: ClassVar[bool] = False
+    bars_every_interval: ClassVar[bool] = False
 
     def __init__(self, *, clock: Clock = SYSTEM_CLOCK) -> None:
         self.clock = clock

@@ -2,7 +2,7 @@
 
 The honest status of every requirement in [MASTER_PROMPT.md](MASTER_PROMPT.md).
 Update it in the same change as the work.
-Last assessed on 2026-11-08 at version 0.4.0.
+Last assessed on 2026-11-10 at version 0.4.0.
 
 **Overall: P0 is done, P3's stated scope and exit are met with its optional order types still missing, P1, P2, and P5 are partial, and P4 and P6 have not started.**
 P5 work began before P4's evidence exists, which departs from the brief's phase order: P4 is blocked on accounts, and the FIX engine and audit work did not need it.
@@ -19,14 +19,14 @@ ISMET has never placed an order at a real broker, so it is not production-ready.
 ## Evidence behind "Proven"
 
 - Crash safety: tests in `tests/execution/test_sigkill.py` deliver real `SIGKILL` at each send step and at random moments, and a matrix of simulated crashes covers network faults.
-- Tests that catch regressions: 54 hand-written mutants of the safety-critical code in `mutation/mutants.toml`, covering the order manager, kill switch, journal, order state, pre-trade risk, HTTP retry rules, the FIX session and provider, cancellation, and decimal arithmetic.
-  All 54 were killed on 2026-11-08 by `uv run --python 3.10 python scripts/mutation_check.py`, which takes about 4 minutes.
+- Tests that catch regressions: 58 hand-written mutants of the safety-critical code in `mutation/mutants.toml`, covering the order manager, kill switch, journal, order state, pre-trade risk, HTTP retry rules, the FIX session and provider, cancellation, decimal arithmetic, and the bar checks of the conformance suite.
+  All 58 were killed on 2026-11-10 by `uv run --python 3.10 --extra dev python scripts/mutation_check.py`, which takes about 4 minutes.
   On Python 3.12 or later one mutant, of a workaround only older interpreters need, does not apply and is reported as such.
   Five first survived, and four new tests now kill them.
-  A weekly CI workflow is set to repeat the run but has not run yet, and a unit test fails when a refactor stops a mutant from applying.
+  A weekly CI workflow repeats the run, and passed with the 54 mutants then committed on 2026-11-09; a unit test fails when a refactor stops a mutant from applying.
 - Independent review: three fresh-context reviews reproduced about 100 defects in the first version of the core, each fixed with a regression test. A later review covered `ismet.fix`, the adapters, and the rest of the change, by reading and tracing, and its findings were fixed in the same change with regression tests. No second review has judged those fixes.
 
-Mutants are hand-picked, so "54 of 54" says the listed risks are covered, not that all behaviour is.
+Mutants are hand-picked, so "58 of 58" says the listed risks are covered, not that all behaviour is.
 An earlier, uncommitted set of 88 mutants is retired; the committed catalogue replaces it and anyone can rerun it.
 
 ## Known limits
@@ -38,10 +38,10 @@ An earlier, uncommitted set of 88 mutants is retired; the committed catalogue re
   The newest exchange_calendars (4.13.2, checked 2026-11-07) still ends there, so no release can extend it yet; an operator extends a venue from its own holiday circular with `TradingCalendar.extended_through`, as docs/OPERATIONS.md describes.
 - The bundled calendars hold no weekend session for any venue, XBOM included: every venue's `extra` list is empty and no `special` date falls on a weekend.
   A weekend session a venue really holds therefore reads as closed, and whether XBOM holds any has not been checked.
-- Conformance does not check for open bars.
-  It asks for a range ending at the last whole minute, so a provider returning a partial bar is never exposed, and a range past now needs newly recorded cassettes.
-- Conformance checks that bars are a whole number of intervals apart, not that none are missing.
-  Bars of a longer interval mislabelled as the asked one, such as one bar every 30 minutes labelled 1m, still pass, because a venue may close or have minutes with no trades.
+- Conformance asks for bars up to the close of the bar still forming and fails a provider that returns it, but the Binance and Coinbase recordings were made before it asked that far.
+  Their replayed runs stop the clock just inside the recorded minute, so the request matches the recording, and the forming bar there is one the recording already shows closed; neither adapter has been checked against a forming bar by conformance, only by its own adapter tests.
+- Conformance finds missing bars only for a provider declaring `bars_every_interval`, since many vendors omit intervals with no trades.
+  Only the mock declares it: whether Binance or Coinbase serve a bar for an interval without trades has not been checked, so for them a missing bar, or bars of a longer interval mislabelled as the asked one, such as one every 30 minutes labelled 1m, still pass.
 - The private code for the simulated venue changed from `XSIM`, which is a real MIC, to `ZSIM`.
 
 ## P0 Correctness
@@ -66,7 +66,7 @@ An earlier, uncommitted set of 88 mutants is retired; the committed catalogue re
 | Calendars | Built | 24 venues and 4 aliases, checked against the source (4.13.2 in CI, the newest weekly). XNSE, XBOM, XSHG, XSHE, XSES data ends 2026-12-31, and an operator can extend a venue from its published holiday list. Aliases are stated assumptions, and are not checked against the source. |
 | Pre-open, auction, extended sessions | Missing | Regular hours and breaks only. |
 | Data quality monitor | Built | Not wired into streams by default; the caller runs it. |
-| Conformance v2 | Proven | Market data and trading suites. Tests prove the trading suite catches broken adapters. |
+| Conformance v2 | Proven | Market data and trading suites. Tests prove the trading suite catches broken adapters, and the market data suite catches bars still forming and, for a provider declaring `bars_every_interval`, missing bars. |
 
 ## P2 Market data
 

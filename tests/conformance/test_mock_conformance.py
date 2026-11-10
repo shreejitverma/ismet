@@ -191,9 +191,12 @@ DST_GRID = [
 class LocalGridAcrossDst(MockProvider):
     name = "local-grid"
     stamps: ClassVar[list[datetime]] = DST_GRID
+    # The grid models a venue with closed hours, which XMOK's calendar does not have.
+    bars_every_interval: ClassVar[bool] = False
 
     async def bars(self, symbol, interval, start, end):  # type: ignore[no-untyped-def]
-        hour = await super().bars(symbol, Interval.M1, end - timedelta(hours=1), end)
+        now = datetime.now(UTC)
+        hour = await super().bars(symbol, Interval.M1, now - timedelta(hours=1), now)
         template = hour[0]
         return [
             template.model_copy(update={"exchange_ts": ts, "interval": interval})

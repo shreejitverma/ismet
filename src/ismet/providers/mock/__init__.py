@@ -145,6 +145,7 @@ class MockProvider(Provider):
 
     name: ClassVar[str] = "mock"
     venues: ClassVar[frozenset[str]] = frozenset({MOCK_VENUE})
+    bars_every_interval: ClassVar[bool] = True
 
     def __init__(
         self,

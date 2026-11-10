@@ -17,6 +17,7 @@ from decimal import Decimal
 from typing import TypeVar, cast
 
 from ismet import _aio
+from ismet.calendars import get_calendar
 from ismet.capabilities import (
     PROTOCOLS,
     Capability,
@@ -25,7 +26,7 @@ from ismet.capabilities import (
     ReferenceDataCapability,
     StreamingCapability,
 )
-from ismet.errors import NotSupported
+from ismet.errors import CalendarOutOfRange, NotSupported, ValidationError
 from ismet.models import Bar, BookState, Instrument, Interval, MarketEvent, Symbol
 from ismet.providers import Provider
 
@@ -253,8 +254,8 @@ async def run_conformance(
 
     if Capability.HISTORICAL in caps:
         hist = cast(HistoricalCapability, provider)
-        end = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-        start = end - lookback
+        asked = datetime.now(timezone.utc)
+        start, end = _bars_range(asked, interval, lookback)
         bars = await _timed(
             report,
             cap_=Capability.HISTORICAL,
@@ -262,6 +263,7 @@ async def run_conformance(
             fn=lambda: hist.bars(symbol, interval, start, end),
             timeout=timeout,
         )
+        answered = datetime.now(timezone.utc)
         if bars is not None:
             problems = _bars_invariants(bars, symbol, interval, instrument, start, end)
             add(
@@ -271,6 +273,18 @@ async def run_conformance(
                     not problems,
                     f"{len(bars)} bars"
                     + ("; " + "; ".join(problems) if problems else ""),
+                )
+            )
+            add(_bars_closed(bars, symbol, interval, answered))
+            add(
+                _bars_complete(
+                    bars,
+                    symbol,
+                    interval,
+                    start,
+                    end,
+                    asked,
+                    declared=provider.bars_every_interval,
                 )
             )
 
@@ -389,6 +403,160 @@ def _bars_invariants(
         if problems:
             break
     return problems
+
+
+def _bars_range(
+    now: datetime, interval: Interval, lookback: timedelta
+) -> tuple[datetime, datetime]:
+    """The range asked of ``bars``: ``lookback`` up to past the still-open bar.
+
+    The range ends at the close of the current minute plus one interval less a
+    minute, so it covers the bar still forming now whatever grid the venue uses. A
+    conformant provider leaves that bar out, which :func:`_bars_closed` checks.
+    """
+    minute_end = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    step = interval.seconds
+    reach = (
+        timedelta(seconds=step) - timedelta(minutes=1)
+        if step and step > 60
+        else timedelta(0)
+    )
+    return minute_end - lookback, minute_end + reach
+
+
+def _bars_closed(
+    bars: list[Bar], symbol: Symbol, interval: Interval, answered: datetime
+) -> Check:
+    """No bar may close after the answer arrived: such a bar is still open.
+
+    An intraday bar closes one interval after it opens. A daily bar closes with its
+    session in the venue's calendar, found by ``session_date`` or else by the date
+    of its open at the venue; one dated to a day without a session is not judged.
+    Weekly and monthly bars are not checked.
+    """
+    name = "bars_closed"
+    step = interval.seconds
+    if step is None and interval is not Interval.D1:
+        return Check(
+            Capability.HISTORICAL,
+            name,
+            True,
+            f"not checked: {interval.value} bars",
+            skipped=True,
+        )
+    latest = answered + MAX_PLAUSIBLE_CLOCK_SKEW
+    for bar in bars:
+        if step is not None:
+            closes = bar.exchange_ts + timedelta(seconds=step)
+        else:
+            try:
+                session_close = _session_close(bar, symbol)
+            except (ValidationError, CalendarOutOfRange) as exc:
+                return Check(
+                    Capability.HISTORICAL,
+                    name,
+                    True,
+                    f"not checked: {exc}",
+                    skipped=True,
+                )
+            if session_close is None:
+                # Dated to a day without a session; nothing says when it closes.
+                continue
+            closes = session_close
+        if closes > latest:
+            return Check(
+                Capability.HISTORICAL,
+                name,
+                False,
+                f"bar {bar.exchange_ts.isoformat()} closes {closes.isoformat()}, "
+                f"after the answer at {answered.isoformat()}, so it is still open",
+            )
+    return Check(Capability.HISTORICAL, name, True)
+
+
+def _session_close(bar: Bar, symbol: Symbol) -> datetime | None:
+    """When the session of a daily bar closes, by its date at the venue."""
+    calendar = get_calendar(symbol.venue)
+    day = bar.session_date or calendar.local_date(bar.exchange_ts)
+    session = calendar.session(day)
+    return None if session is None else session.close
+
+
+def _bars_complete(
+    bars: list[Bar],
+    symbol: Symbol,
+    interval: Interval,
+    start: datetime,
+    end: datetime,
+    asked: datetime,
+    *,
+    declared: bool,
+) -> Check:
+    """For a provider declaring ``bars_every_interval``, no open interval is missing.
+
+    Missing intervals are counted on the grid of the bars returned, so no grid
+    anchor is assumed. One is required only when the venue's calendar is open at
+    its start and it had closed before the request was made.
+    """
+    name = "bars_complete"
+    step_seconds = interval.seconds
+    if not declared:
+        return Check(
+            Capability.HISTORICAL,
+            name,
+            True,
+            "not checked: the provider does not declare bars_every_interval",
+            skipped=True,
+        )
+    if step_seconds is None or not bars:
+        return Check(
+            Capability.HISTORICAL,
+            name,
+            True,
+            f"not checked: {interval.value} bars"
+            if bars
+            else "not checked: no bars returned",
+            skipped=True,
+        )
+    try:
+        calendar = get_calendar(symbol.venue)
+    except ValidationError as exc:
+        return Check(
+            Capability.HISTORICAL, name, True, f"not checked: {exc}", skipped=True
+        )
+    step = timedelta(seconds=step_seconds)
+    # Closed before the request, with room for a venue clock ahead of ours.
+    settled = asked - MAX_PLAUSIBLE_CLOCK_SKEW
+    stamps = sorted({b.exchange_ts for b in bars})
+    slots: list[datetime] = []
+    slot = stamps[0] - step
+    while slot >= start:
+        slots.append(slot)
+        slot -= step
+    for before, after in itertools.pairwise(stamps):
+        slot = before + step
+        while slot + step <= after:
+            slots.append(slot)
+            slot += step
+    slot = stamps[-1] + step
+    while slot < end and slot + step <= settled:
+        slots.append(slot)
+        slot += step
+    try:
+        missing = sorted(s for s in slots if calendar.is_open(s))
+    except CalendarOutOfRange as exc:
+        return Check(
+            Capability.HISTORICAL, name, True, f"not checked: {exc}", skipped=True
+        )
+    if missing:
+        return Check(
+            Capability.HISTORICAL,
+            name,
+            False,
+            f"{len(missing)} {interval.value} bars missing while {symbol.venue} is "
+            f"open, the first at {missing[0].isoformat()}",
+        )
+    return Check(Capability.HISTORICAL, name, True)
 
 
 async def _timed(
