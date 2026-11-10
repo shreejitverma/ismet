@@ -45,7 +45,7 @@ Rules callers depend on that are easy to miss in the API reference.
 - `run_conformance` adds `instrument_symbol`, failing an instrument answered for another symbol, and fails bars spaced by anything other than a whole number of the asked interval.
   For intervals longer than an hour, a gap longer than one interval that is a whole number plus or minus exactly one hour also passes, since a daylight-saving change moves a local-time grid by an hour and falls in a closed period.
 - `MockProvider.bars` serves only bars that have closed by its clock, so a range reaching past now stops at the last closed bar.
-- `run_conformance` asks for bars up to the close of the bar still forming, so its `lookback` now ends one interval later than the last whole minute.
+- `run_conformance` asks for bars from `lookback` before the close of the current minute up to that close, one minute later than before, so the range contains the bar still forming.
   Its `bars_closed` check fails a bar that closes more than `MAX_PLAUSIBLE_CLOCK_SKEW` after the answer arrived.
   An intraday bar closes one interval after it opens, and a daily bar closes with its session in the venue's calendar; weekly and monthly bars are not checked.
 - `Provider.bars_every_interval` declares that `bars` returns a bar for every closed interval in which the venue's calendar is open, intervals without trades included.

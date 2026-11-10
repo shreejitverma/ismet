@@ -60,8 +60,10 @@ class ReturnsTheOpenBar(MockProvider):
             forming = last.exchange_ts + timedelta(days=1)
             update = {"exchange_ts": forming, "session_date": forming.date()}
         else:
-            step = timedelta(seconds=interval.seconds)
-            update = {"exchange_ts": last.exchange_ts + step}
+            forming = last.exchange_ts + timedelta(seconds=interval.seconds)
+            update = {"exchange_ts": forming}
+        if not start <= forming < end:
+            return bars
         return [*bars, last.model_copy(update=update)]
 
 
@@ -110,9 +112,9 @@ async def test_the_mock_serves_every_closed_bar_and_not_the_open_one(
     assert checks["bars_closed"] == (True, False, "")
     assert checks["bars_complete"] == (True, False, "")
     # Asked for the forming minute alone, the venue has nothing closed to serve.
-    forming = _bars_range(NOW, Interval.M1, MINUTE)
+    forming = _bars_range(NOW, MINUTE)
     assert await mock.bars(sym, Interval.M1, *forming) == []
-    start, end = _bars_range(NOW, Interval.M1, 30 * MINUTE)
+    start, end = _bars_range(NOW, 30 * MINUTE)
     stamps = [b.exchange_ts for b in await mock.bars(sym, Interval.M1, start, end)]
     assert stamps[-1] == datetime(2026, 11, 10, 14, 36, tzinfo=UTC)
 
@@ -209,21 +211,17 @@ async def test_a_bar_closed_within_the_skew_allowance_may_be_absent(
 
 
 @pytest.mark.parametrize(
-    ("interval", "start", "end"),
+    "forming",
     [
-        (Interval.M1, "14:08", "14:38"),
-        (Interval.H1, "14:08", "15:37"),
-        (Interval.D1, "14:08", "14:38"),
+        datetime(2026, 11, 10, 14, 37, tzinfo=UTC),
+        datetime(2026, 11, 10, 14, 0, tzinfo=UTC),
+        datetime(2026, 11, 10, 0, 0, tzinfo=UTC),
     ],
+    ids=["1m", "1h", "1d"],
 )
-def test_the_range_asked_covers_the_bar_still_forming(
-    interval: Interval, start: str, end: str
-) -> None:
-    def at(hhmm: str) -> datetime:
-        hour, minute = map(int, hhmm.split(":"))
-        return NOW.replace(hour=hour, minute=minute, second=0)
-
-    assert _bars_range(NOW, interval, 30 * MINUTE) == (at(start), at(end))
+def test_the_range_asked_covers_the_bar_still_forming(forming: datetime) -> None:
+    start, end = _bars_range(NOW, timedelta(days=1))
+    assert start <= forming < end
 
 
 XNYS = Symbol(venue="XNYS", ticker="IBM")

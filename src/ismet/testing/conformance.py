@@ -255,7 +255,7 @@ async def run_conformance(
     if Capability.HISTORICAL in caps:
         hist = cast(HistoricalCapability, provider)
         asked = datetime.now(timezone.utc)
-        start, end = _bars_range(asked, interval, lookback)
+        start, end = _bars_range(asked, lookback)
         bars = await _timed(
             report,
             cap_=Capability.HISTORICAL,
@@ -405,23 +405,15 @@ def _bars_invariants(
     return problems
 
 
-def _bars_range(
-    now: datetime, interval: Interval, lookback: timedelta
-) -> tuple[datetime, datetime]:
-    """The range asked of ``bars``: ``lookback`` up to past the still-open bar.
+def _bars_range(now: datetime, lookback: timedelta) -> tuple[datetime, datetime]:
+    """The range asked of ``bars``: ``lookback`` up to the current minute's close.
 
-    The range ends at the close of the current minute plus one interval less a
-    minute, so it covers the bar still forming now whatever grid the venue uses. A
-    conformant provider leaves that bar out, which :func:`_bars_closed` checks.
+    The range ends at the close of the current minute, so it contains the bar still
+    forming, which opens at or before now. A conformant provider leaves that bar
+    out, which :func:`_bars_closed` checks.
     """
     minute_end = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
-    step = interval.seconds
-    reach = (
-        timedelta(seconds=step) - timedelta(minutes=1)
-        if step and step > 60
-        else timedelta(0)
-    )
-    return minute_end - lookback, minute_end + reach
+    return minute_end - lookback, minute_end
 
 
 def _bars_closed(

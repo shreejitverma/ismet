@@ -686,9 +686,9 @@ risk = "bars absent while the venue is closed are reported missing"
 tests = ["tests/conformance/test_bar_conformance.py"]
 
 [[mutant]]
-id = "conformance-range-misses-forming-bar"
+id = "conformance-range-ends-before-forming-bar"
 file = "src/ismet/testing/conformance.py"
-find = "        if step and step > 60\n"
-replace = "        if step and step > 3600\n"
-risk = "an hourly provider's still-forming bar lies outside the range asked"
+find = "    minute_end = now.replace(second=0, microsecond=0) + timedelta(minutes=1)\n"
+replace = "    minute_end = now.replace(second=0, microsecond=0) + timedelta(0)\n"
+risk = "the range asked ends before the bar still forming, so a provider serving it is never exposed"
 tests = ["tests/conformance/test_bar_conformance.py"]

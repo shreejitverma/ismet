@@ -8,6 +8,7 @@ id-token, would fail here.
 
 from __future__ import annotations
 
+import fnmatch
 import re
 import subprocess
 import sys
@@ -164,8 +165,22 @@ def test_dependabot_bumps_codeql_init_and_analyze_together() -> None:
     (actions,) = [
         u for u in config["updates"] if u["package-ecosystem"] == "github-actions"
     ]
-    patterns = [p for group in actions["groups"].values() for p in group["patterns"]]
-    assert "github/codeql-action*" in patterns
+
+    def group_of(dependency: str) -> str | None:
+        # Dependabot puts a dependency in the first group, in file order, matching it.
+        for name, group in actions.get("groups", {}).items():
+            if any(
+                fnmatch.fnmatchcase(dependency, p) for p in group.get("patterns", [])
+            ) and not any(
+                fnmatch.fnmatchcase(dependency, p)
+                for p in group.get("exclude-patterns", [])
+            ):
+                return str(name)
+        return None
+
+    init = group_of("github/codeql-action/init")
+    assert init is not None
+    assert group_of("github/codeql-action/analyze") == init
 
 
 @pytest.mark.parametrize("path", sorted(ROOT.glob("*.yml")), ids=lambda p: p.name)

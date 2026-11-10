@@ -38,7 +38,7 @@ An earlier, uncommitted set of 88 mutants is retired; the committed catalogue re
   The newest exchange_calendars (4.13.2, checked 2026-11-07) still ends there, so no release can extend it yet; an operator extends a venue from its own holiday circular with `TradingCalendar.extended_through`, as docs/OPERATIONS.md describes.
 - The bundled calendars hold no weekend session for any venue, XBOM included: every venue's `extra` list is empty and no `special` date falls on a weekend.
   A weekend session a venue really holds therefore reads as closed, and whether XBOM holds any has not been checked.
-- Conformance asks for bars up to the close of the bar still forming and fails a provider that returns it, but the Binance and Coinbase recordings were made before it asked that far.
+- Conformance asks for bars up to the close of the current minute, which contains the bar still forming, and fails a provider that returns it, but the Binance and Coinbase recordings were made before it asked that far.
   Their replayed runs stop the clock just inside the recorded minute, so the request matches the recording, and the forming bar there is one the recording already shows closed; neither adapter has been checked against a forming bar by conformance, only by its own adapter tests.
 - Conformance finds missing bars only for a provider declaring `bars_every_interval`, since many vendors omit intervals with no trades.
   Only the mock declares it: whether Binance or Coinbase serve a bar for an interval without trades has not been checked, so for them a missing bar, or bars of a longer interval mislabelled as the asked one, such as one every 30 minutes labelled 1m, still pass.
