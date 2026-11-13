@@ -482,7 +482,7 @@ class TestPlaceOrderContract:
         self, acceptor: FixAcceptor, make_provider: ProviderFactory
     ) -> None:
         """The socket is cut mid-send, so the venue sees the order on the resend."""
-        provider = await make_provider(ack_timeout=0.05)
+        provider = await make_provider(ack_timeout=0.05, logon_timeout=0.1)
         stream = Stream(provider)
         assert provider.session._writer is not None
         session_writer = provider.session._writer
@@ -493,8 +493,13 @@ class TestPlaceOrderContract:
             session_writer.transport.abort()
 
         session_writer.write = half_write  # type: ignore[method-assign]
+        # Hold the session out until the ack timeout has fired: a reconnect inside
+        # it resends the order first, and the ack can then beat the timeout.
+        acceptor.faults.ignore_logon = True
         with pytest.raises(AmbiguousOutcome):
             await provider.place_order(order())
+        assert acceptor.of_type("D") == []
+        acceptor.faults.ignore_logon = False
         await provider.session.wait_ready(5.0)
         await eventually(lambda: "C1" in acceptor.orders)
         assert acceptor.orders["C1"].arrivals == 1

@@ -340,7 +340,7 @@ class TestConnectionLoss:
     async def test_order_lost_on_the_wire_reaches_the_venue_once_by_session_resend(
         self, acceptor: FixAcceptor, rig: Rig
     ) -> None:
-        oms = await rig.build(ack_timeout=0.05)
+        oms = await rig.build(ack_timeout=0.05, logon_timeout=0.1)
         assert rig.provider is not None
         session = rig.provider.session
         assert session._writer is not None
@@ -352,9 +352,13 @@ class TestConnectionLoss:
             writer.transport.abort()
 
         writer.write = half_then_cut  # type: ignore[method-assign]
+        # Hold the session out until the ack timeout has fired: a reconnect inside
+        # it resends the order first, and the test then races its own recovery.
+        acceptor.faults.ignore_logon = True
         state = await oms.submit(request())
         assert state.status is OrderStatus.UNKNOWN
         assert acceptor.of_type("D") == []
+        acceptor.faults.ignore_logon = False
         await session.wait_ready(5.0)
         await eventually(lambda: "C1" in acceptor.orders)
         await oms.wait_for("C1", lambda s: s.status is OrderStatus.ACCEPTED, 2.0)
