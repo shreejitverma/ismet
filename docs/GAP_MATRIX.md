@@ -35,7 +35,11 @@ An earlier, uncommitted set of 88 mutants is retired; the committed catalogue re
 - The first FIX sequence reset of a session period makes the prior period's messages unrequestable. With an order working and a previous connection that did not end with a clean Logout exchange, the reset halts through the quarantine until an operator releases it. After a clean Logout, a report the venue sent while we were logged out is caught only by the reconciliation CumQty comparison on an open order.
 - A FIX SequenceReset-GapFill over a report the venue no longer holds is not visible when it arrives. The next report on that order whose CumQty differs from the fills received, below for a lost bust or correction and above for a lost fill, halts through the quarantine and ends in a `FILL_MISMATCH` break. With no later report, only reconciliation of an open order can catch it.
 - XBOM, XSHG, and XSES data, and the aliases XNSE and XSHE, ends on 2026-12-31, and orders on those venues are then refused unless they rest for later.
-  The newest exchange_calendars (4.13.2, checked 2026-11-07) still ends there, so no release can extend it yet; an operator extends a venue from its own holiday circular with `TradingCalendar.extended_through`, as docs/OPERATIONS.md describes.
+  The newest exchange_calendars (4.13.3, checked 2026-11-21) still ends there, so no release can extend it yet; an operator extends a venue from its own holiday circular with `TradingCalendar.extended_through`, as docs/OPERATIONS.md describes.
+- XKRX opens and closes an hour late on the college entrance exam day, and the source lists those days only through 2025-11-13.
+  The 2026 exam day and later ones read as regular 09:00 to 15:30 sessions until the source lists them; an operator can set the hours with `TradingCalendar.with_hours`.
+- The source can add a closure after the fact: exchange_calendars 4.13.3 added the HKEX typhoon and rainstorm closures of 2023-09-01 and 2023-09-08, and releases before it showed those days as sessions.
+  The weekly drift workflow catches such a change within a week of the release, and the snapshot is then regenerated.
 - The bundled calendars hold no weekend session for any venue, XBOM included: every venue's `extra` list is empty and no `special` date falls on a weekend.
   A weekend session a venue really holds therefore reads as closed, and whether XBOM holds any has not been checked.
 - Conformance asks for bars up to the close of the current minute, which contains the bar still forming, and fails a provider that returns it, but the Binance and Coinbase recordings were made before it asked that far.
@@ -63,7 +67,7 @@ An earlier, uncommitted set of 88 mutants is retired; the committed catalogue re
 | Contract specs | Partial | Option and future terms are validated. Chains and continuous contracts are missing. |
 | Point-in-time security master | Built | `SecurityMaster` works but ships empty: no vendor feeds it yet. |
 | Corporate actions | Built | Split and dividend back-adjustment. A dividend needs the bar of the session before its ex-date, or an explicit `price_factor`. Rights, spin-offs, and mergers need an explicit factor. No vendor feeds it yet. |
-| Calendars | Built | 24 venues and 4 aliases, checked against the source (4.13.2 in CI, the newest weekly). XNSE, XBOM, XSHG, XSHE, XSES data ends 2026-12-31, and an operator can extend a venue from its published holiday list. Aliases are stated assumptions, and are not checked against the source. |
+| Calendars | Built | 24 venues and 4 aliases, checked against the source (4.13.3 in CI, the newest weekly). The snapshot runs to 2027-11-19, a year past its generation. XNSE, XBOM, XSHG, XSHE, XSES data ends 2026-12-31, and an operator can extend a venue from its published holiday list. Aliases are stated assumptions, and are not checked against the source. |
 | Pre-open, auction, extended sessions | Missing | Regular hours and breaks only. |
 | Data quality monitor | Built | Not wired into streams by default; the caller runs it. |
 | Conformance v2 | Proven | Market data and trading suites. Tests prove the trading suite catches broken adapters, and the market data suite catches bars still forming and, for a provider declaring `bars_every_interval`, missing bars. |

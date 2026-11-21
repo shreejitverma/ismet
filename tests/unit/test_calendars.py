@@ -93,6 +93,33 @@ def test_lunch_breaks_on_asian_venues() -> None:
     assert session is not None and session.break_start is not None
 
 
+@pytest.mark.parametrize(
+    ("venue", "day"),
+    [
+        ("XHKG", date(2023, 9, 1)),  # Typhoon Saola, HKEX notice 2309012news
+        ("XHKG", date(2023, 9, 8)),  # Black rainstorm, HKEX notice 2309083news
+        ("XKRX", date(2026, 6, 3)),  # Local election day
+        ("XKRX", date(2027, 5, 3)),  # Labor Day in lieu: a public holiday from 2026
+    ],
+)
+def test_closures_added_in_exchange_calendars_4_13_3(venue: str, day: date) -> None:
+    calendar = get_calendar(venue)
+    assert calendar.session(day) is None
+    assert day in calendar.closed_weekdays(day, day)
+
+
+@pytest.mark.parametrize(
+    "day",
+    [date(2021, 11, 18), date(2022, 11, 17), date(2023, 11, 16), date(2024, 11, 14)],
+)
+def test_krx_opens_and_closes_an_hour_late_on_the_college_exam_day(day: date) -> None:
+    seoul = ZoneInfo("Asia/Seoul")
+    session = get_calendar("XKRX").session(day)
+    assert session is not None and session.late_open
+    assert session.open == datetime.combine(day, time(10, 0), tzinfo=seoul)
+    assert session.close == datetime.combine(day, time(16, 30), tzinfo=seoul)
+
+
 def test_india_calendars_include_republic_day() -> None:
     for code in ("XBOM", "XNSE"):
         calendar = get_calendar(code)
@@ -249,11 +276,11 @@ def test_every_entry_point_refuses_dates_outside_the_data(call) -> None:  # type
 
 
 def test_the_first_and_last_covered_dates_are_answered() -> None:
-    """The snapshot runs from NYSE's session of 2007-01-03 to that of 2027-10-29."""
-    assert (XNYS.first_date, XNYS.last_date) == (date(2007, 1, 3), date(2027, 10, 29))
+    """The snapshot runs from NYSE's session of 2007-01-03 to that of 2027-11-19."""
+    assert (XNYS.first_date, XNYS.last_date) == (date(2007, 1, 3), date(2027, 11, 19))
     assert XNYS.is_session(XNYS.first_date) and XNYS.is_session(XNYS.last_date)
     assert [s.date for s in XNYS.sessions(XNYS.last_date, XNYS.last_date)] == [
-        date(2027, 10, 29)
+        date(2027, 11, 19)
     ]
 
 
