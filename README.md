@@ -223,7 +223,7 @@ uv run ruff check . && uv run ruff format --check . && uv run mypy
 uv run pytest --cov
 ```
 
-CI runs on Linux, macOS, and Windows for every supported Python version, with `mypy --strict`, a 90 percent coverage gate, a calendar differential test, performance budgets, a dependency audit, and a fresh-install smoke test.
+CI runs on Linux, macOS, and Windows for every supported Python version, with `mypy --strict`, a 90 percent coverage gate, a test run from the dependency versions `uv.lock` pins, a calendar differential test, performance budgets, a dependency audit, and a fresh-install smoke test.
 A release publishes only from a tag naming the package's version, and only after all of that passes on the tagged commit.
 CodeQL runs in its own workflow and is not part of that gate, so a tag can publish before CodeQL has analysed its commit.
 
